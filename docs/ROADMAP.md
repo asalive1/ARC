@@ -1,43 +1,17 @@
-# ProjectTemplate Roadmap
+# ARC Product Roadmap
 
-## Completed
+This roadmap is a proposal pending approval of the architecture package. It
+replaces the project-template roadmap; no product phase is implemented yet.
 
-### v1.0
-- VS Code Tasks
-- Project Status
-- Save Checkpoint
-- Build / Deploy
-- Backup To GitHub
-- Create Release
+See [the delivery plan](delivery-plan.md) for phase scope, gates, validation,
+and release workflow.
 
-### v1.1
-- Project Initialization
-- Automatic Project Name Configuration
-- README Updates
+## Proposed phases
 
-### v1.2
-- Project Types
-- Generic Template
-- Docker Template
-- DotNet Template
-- Node Template
-- Python Template
-
-### v1.3
-- Enhanced Project Status
-- Release Tracking
-- Commits Since Release
-
-## Future
-
-### v1.4
-- Automatic Project Creation
-
-### v1.5
-- Build Type Selection
-
-### v2.0
-- One-Command Project Provisioning
-
-### v3.0
-- VS Code Sidebar Integration
+0. Architecture and contracts
+1. Stateful vertical audio slice and local worker
+2. Zephyr Connect adapter and synthetic simulator
+3. Routing matrix, fan-out, presets, rollback, and concurrency
+4. Network transport expansion and platform adapters
+5. Signals, GPIO, Device Server integration, and automation
+6. Hardening, recovery, backup/restore, portability, and acceptance

@@ -2,7 +2,7 @@
 # Project Settings
 #################################################
 
-$ProjectName = "TestProject"
+$ProjectName = "CHANGE_ME"
 
 $GitBranch = "main"
 

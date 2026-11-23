@@ -1,9 +1,24 @@
-# Architecture
+# Architecture Review Package
 
-Purpose:
+**Status:** Design proposal; implementation is gated on approval.
 
-Components:
+The architecture is documented across the following required pre-code
+deliverables:
 
-Dependencies:
+- [System architecture](system-architecture.md)
+- [C4 context](c4-context.md) and [C4 containers](c4-container.md)
+- [Component design](component-design.md)
+- [Media pipeline design](media-pipeline-design.md) and
+  [Zephyr Connect adapter design](zc-adapter-design.md)
+- [Database ERD](database-erd.md)
+- [OpenAPI plan](openapi-plan.md)
+- [Security model](security-model.md)
+- [Test strategy](test-strategy.md)
+- [Risk register](risk-register.md)
+- [Assumptions](assumptions.md) and [open questions](open-questions.md)
+- [Delivery and Git plan](delivery-plan.md)
+- [Requirements traceability](traceability-matrix.md)
 
-Deployment:
+The source-of-truth hierarchy and material conflicts are recorded in the system
+architecture and open-questions documents. This package is not an implementation
+or an approval to begin coding.

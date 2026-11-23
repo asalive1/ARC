@@ -32,6 +32,8 @@ import {
   fetchLiveness,
   fetchSources,
   planRoute,
+  updateDestination as updateDestinationRequest,
+  updateSource as updateSourceRequest,
   validateDestination,
   validateSource,
   type DestinationMediaProfile,
@@ -74,13 +76,19 @@ export function App() {
   const [section, setSection] = useState<Section>("workspace");
   const [themeMode, setThemeMode] = useState<"dark" | "light">("dark");
   const [sourceName, setSourceName] = useState("");
+  const [editingSourceId, setEditingSourceId] = useState<string>();
   const [sourceKind, setSourceKind] =
-    useState<SourceMediaProfile["kind"]>("rtp_mp2t");
+    useState<SourceMediaProfile["kind"]>("srt_mpeg_ts");
   const [sourceDevice, setSourceDevice] = useState("hw:1,0");
+  const [sourceHost, setSourceHost] = useState("127.0.0.1");
   const [sourceBindAddress, setSourceBindAddress] = useState("0.0.0.0");
   const [sourcePort, setSourcePort] = useState("5000");
   const [sourcePayloadType, setSourcePayloadType] = useState("96");
+  const [sourceMode, setSourceMode] = useState<"caller" | "listener">(
+    "caller",
+  );
   const [destinationName, setDestinationName] = useState("");
+  const [editingDestinationId, setEditingDestinationId] = useState<string>();
   const [destinationKind, setDestinationKind] =
     useState<DestinationMediaProfile["kind"]>("srt_mpeg_ts");
   const [destinationAddress, setDestinationAddress] =
@@ -160,6 +168,40 @@ export function App() {
       await queryClient.invalidateQueries({ queryKey: ["destinations"] });
     },
   });
+  const updateSource = useMutation({
+    mutationFn: (input: {
+      id: string;
+      friendlyName: string;
+      profile: SourceMediaProfile;
+    }) =>
+      updateSourceRequest(
+        input.id,
+        input.friendlyName,
+        input.profile,
+        apiBaseUrl,
+      ),
+    onSuccess: async () => {
+      resetSourceForm();
+      await queryClient.invalidateQueries({ queryKey: ["sources"] });
+    },
+  });
+  const updateDestination = useMutation({
+    mutationFn: (input: {
+      id: string;
+      friendlyName: string;
+      profile: DestinationMediaProfile;
+    }) =>
+      updateDestinationRequest(
+        input.id,
+        input.friendlyName,
+        input.profile,
+        apiBaseUrl,
+      ),
+    onSuccess: async () => {
+      resetDestinationForm();
+      await queryClient.invalidateQueries({ queryKey: ["destinations"] });
+    },
+  });
   const sourceValidation = useMutation({
     mutationFn: (id: string) => validateSource(id, apiBaseUrl),
     onSuccess: async () =>
@@ -188,11 +230,103 @@ export function App() {
       (destination) => destination.id === destinationId,
     ) ?? destinations.data?.[0];
 
+  function beginEdit(record: SourceRecord | DestinationRecord) {
+    createSource.reset();
+    createDestination.reset();
+    updateSource.reset();
+    updateDestination.reset();
+
+    if ("sourceType" in record) {
+      setEditingSourceId(record.id);
+      setSourceName(record.friendlyName);
+      setSourceKind(record.configuration.kind);
+      if (record.configuration.kind === "alsa_l16") {
+        setSourceDevice(record.configuration.device);
+      } else if (record.configuration.kind === "srt_mpeg_ts") {
+        setSourceHost(record.configuration.host);
+        setSourcePort(String(record.configuration.port));
+        setSourceMode(record.configuration.mode);
+      } else {
+        setSourceBindAddress(record.configuration.bindAddress);
+        setSourcePort(String(record.configuration.port));
+        if (
+          record.configuration.kind === "rtp_l16" ||
+          record.configuration.kind === "rtp_l24"
+        ) {
+          setSourcePayloadType(String(record.configuration.payloadType));
+        }
+      }
+      return;
+    }
+
+    setEditingDestinationId(record.id);
+    setDestinationName(record.friendlyName);
+    setDestinationKind(record.configuration.kind);
+    setDestinationPort(String(record.configuration.port));
+    if (record.configuration.kind === "srt_mpeg_ts") {
+      setDestinationAddress(record.configuration.host);
+      setDestinationMode(record.configuration.mode);
+    } else {
+      setDestinationAddress(record.configuration.address);
+      setDestinationPayloadType(String(record.configuration.payloadType));
+    }
+  }
+
+  function cancelSourceEdit() {
+    resetSourceForm();
+    createSource.reset();
+    updateSource.reset();
+  }
+
+  function resetSourceForm() {
+    setEditingSourceId(undefined);
+    setSourceName("");
+    setSourceKind("srt_mpeg_ts");
+    setSourceDevice("hw:1,0");
+    setSourceHost("127.0.0.1");
+    setSourceBindAddress("0.0.0.0");
+    setSourcePort("5000");
+    setSourcePayloadType("96");
+    setSourceMode("caller");
+  }
+
+  function cancelDestinationEdit() {
+    resetDestinationForm();
+    createDestination.reset();
+    updateDestination.reset();
+  }
+
+  function resetDestinationForm() {
+    setEditingDestinationId(undefined);
+    setDestinationName("");
+    setDestinationKind("srt_mpeg_ts");
+    setDestinationAddress("127.0.0.1");
+    setDestinationPort("6000");
+    setDestinationPayloadType("96");
+    setDestinationMode("caller");
+  }
+
   function submitSource(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const profile: SourceMediaProfile = (() => {
       if (sourceKind === "alsa_l16") {
         return { kind: "alsa_l16", device: sourceDevice };
+      }
+      if (sourceKind === "srt_mpeg_ts") {
+        return {
+          kind: "srt_mpeg_ts",
+          host: sourceHost,
+          port: Number(sourcePort),
+          mode: sourceMode,
+        };
+      }
+      if (sourceKind === "rtp_l16") {
+        return {
+          kind: "rtp_l16",
+          bindAddress: sourceBindAddress,
+          port: Number(sourcePort),
+          payloadType: Number(sourcePayloadType),
+        };
       }
       if (sourceKind === "rtp_l24") {
         return {
@@ -208,7 +342,15 @@ export function App() {
         port: Number(sourcePort),
       };
     })();
-    createSource.mutate({ friendlyName: sourceName, profile });
+    if (editingSourceId) {
+      updateSource.mutate({
+        id: editingSourceId,
+        friendlyName: sourceName,
+        profile,
+      });
+    } else {
+      createSource.mutate({ friendlyName: sourceName, profile });
+    }
   }
 
   function submitDestination(event: FormEvent<HTMLFormElement>) {
@@ -229,7 +371,15 @@ export function App() {
         payloadType: Number(destinationPayloadType),
       };
     })();
-    createDestination.mutate({ friendlyName: destinationName, profile });
+    if (editingDestinationId) {
+      updateDestination.mutate({
+        id: editingDestinationId,
+        friendlyName: destinationName,
+        profile,
+      });
+    } else {
+      createDestination.mutate({ friendlyName: destinationName, profile });
+    }
   }
 
   function submitRoutePlan(event: FormEvent<HTMLFormElement>) {
@@ -483,9 +633,16 @@ export function App() {
                   loading={sources.isLoading}
                   error={sources.isError ? sources.error.message : ""}
                   records={sources.data ?? []}
-                  createError={
-                    createSource.isError ? createSource.error.message : ""
+                  saveError={
+                    createSource.isError
+                      ? createSource.error.message
+                      : updateSource.isError
+                        ? updateSource.error.message
+                        : ""
                   }
+                  editingId={editingSourceId}
+                  onEdit={beginEdit}
+                  onCancelEdit={cancelSourceEdit}
                   validationError={
                     sourceValidation.isError
                       ? sourceValidation.error.message
@@ -504,13 +661,17 @@ export function App() {
                   onProfileKindChange={(kind) => setSourceKind(kind)}
                   sourceDevice={sourceDevice}
                   onSourceDeviceChange={setSourceDevice}
+                  sourceHost={sourceHost}
+                  onSourceHostChange={setSourceHost}
                   sourceBindAddress={sourceBindAddress}
                   onSourceBindAddressChange={setSourceBindAddress}
                   sourcePort={sourcePort}
                   onSourcePortChange={setSourcePort}
                   sourcePayloadType={sourcePayloadType}
                   onSourcePayloadTypeChange={setSourcePayloadType}
-                  saving={createSource.isPending}
+                  sourceMode={sourceMode}
+                  onSourceModeChange={setSourceMode}
+                  saving={createSource.isPending || updateSource.isPending}
                 />
               )}
 
@@ -520,11 +681,16 @@ export function App() {
                   loading={destinations.isLoading}
                   error={destinations.isError ? destinations.error.message : ""}
                   records={destinations.data ?? []}
-                  createError={
+                  saveError={
                     createDestination.isError
                       ? createDestination.error.message
-                      : ""
+                      : updateDestination.isError
+                        ? updateDestination.error.message
+                        : ""
                   }
+                  editingId={editingDestinationId}
+                  onEdit={beginEdit}
+                  onCancelEdit={cancelDestinationEdit}
                   validationError={
                     destinationValidation.isError
                       ? destinationValidation.error.message
@@ -551,7 +717,9 @@ export function App() {
                   onDestinationPayloadTypeChange={setDestinationPayloadType}
                   destinationMode={destinationMode}
                   onDestinationModeChange={setDestinationMode}
-                  saving={createDestination.isPending}
+                  saving={
+                    createDestination.isPending || updateDestination.isPending
+                  }
                 />
               )}
 
@@ -837,7 +1005,10 @@ type ResourceWorkspaceProps =
       loading: boolean;
       error: string;
       records: SourceRecord[];
-      createError: string;
+      saveError: string;
+      editingId?: string;
+      onEdit: (record: SourceRecord | DestinationRecord) => void;
+      onCancelEdit: () => void;
       validationError: string;
       validatingId?: string;
       onValidate: (id: string) => void;
@@ -848,12 +1019,16 @@ type ResourceWorkspaceProps =
       onProfileKindChange: (kind: SourceMediaProfile["kind"]) => void;
       sourceDevice: string;
       onSourceDeviceChange: (value: string) => void;
+      sourceHost: string;
+      onSourceHostChange: (value: string) => void;
       sourceBindAddress: string;
       onSourceBindAddressChange: (value: string) => void;
       sourcePort: string;
       onSourcePortChange: (value: string) => void;
       sourcePayloadType: string;
       onSourcePayloadTypeChange: (value: string) => void;
+      sourceMode: "caller" | "listener";
+      onSourceModeChange: (value: "caller" | "listener") => void;
       saving: boolean;
     }
   | {
@@ -861,7 +1036,10 @@ type ResourceWorkspaceProps =
       loading: boolean;
       error: string;
       records: DestinationRecord[];
-      createError: string;
+      saveError: string;
+      editingId?: string;
+      onEdit: (record: SourceRecord | DestinationRecord) => void;
+      onCancelEdit: () => void;
       validationError: string;
       validatingId?: string;
       onValidate: (id: string) => void;
@@ -884,12 +1062,15 @@ type ResourceWorkspaceProps =
 function ResourceWorkspace(props: ResourceWorkspaceProps) {
   const isInput = props.kind === "input";
   const label = isInput ? "Input" : "Output";
-  const createLabel = isInput ? "Create input draft" : "Create output draft";
+  const actionLabel = props.editingId
+    ? `Save ${label.toLowerCase()} changes`
+    : `Create ${label.toLowerCase()} draft`;
   return (
     <Stack spacing={2.5}>
       <Alert severity="info">
-        New resources are saved as disabled drafts. Validation checks the saved
-        configuration; it does not start media or activate a route.
+        {props.editingId
+          ? "Saving creates a new disabled draft revision. Validate it before use; the previous revision is preserved."
+          : "New resources are saved as disabled drafts. Validation checks the saved configuration; it does not start media or activate a route."}
       </Alert>
       <Box
         sx={{
@@ -903,7 +1084,9 @@ function ResourceWorkspace(props: ResourceWorkspaceProps) {
           <CardContent>
             <Stack component="form" spacing={2} onSubmit={props.onSubmit}>
               <Typography variant="h6" component="h2">
-                Configure {label.toLowerCase()}
+                {props.editingId
+                  ? `Edit ${label.toLowerCase()}`
+                  : `Configure ${label.toLowerCase()}`}
               </Typography>
               <TextField
                 label="Friendly name"
@@ -917,14 +1100,29 @@ function ResourceWorkspace(props: ResourceWorkspaceProps) {
               ) : (
                 <DestinationFields {...props} />
               )}
-              {props.createError && (
+              {props.saveError && (
                 <Alert severity="error">
-                  {label} could not be created: {props.createError}
+                  {label} could not be saved: {props.saveError}
                 </Alert>
               )}
-              <Button type="submit" variant="contained" disabled={props.saving}>
-                {props.saving ? "Saving..." : createLabel}
-              </Button>
+              <Stack direction="row" spacing={1}>
+                <Button
+                  type="submit"
+                  variant="contained"
+                  disabled={props.saving}
+                >
+                  {props.saving ? "Saving..." : actionLabel}
+                </Button>
+                {props.editingId && (
+                  <Button
+                    type="button"
+                    disabled={props.saving}
+                    onClick={props.onCancelEdit}
+                  >
+                    Cancel
+                  </Button>
+                )}
+              </Stack>
             </Stack>
           </CardContent>
         </Card>
@@ -969,6 +1167,7 @@ function ResourceWorkspace(props: ResourceWorkspaceProps) {
                       kind={props.kind}
                       validating={props.validatingId === record.id}
                       onValidate={() => props.onValidate(record.id)}
+                      onEdit={() => props.onEdit(record)}
                     />
                   ))}
                 </Stack>
@@ -996,11 +1195,16 @@ function SourceFields(
           )
         }
       >
-        <MenuItem value="rtp_mp2t">RTP MPEG-TS</MenuItem>
+        <MenuItem value="srt_mpeg_ts">SRT MPEG-TS</MenuItem>
+        <MenuItem value="rtp_l16">RTP L16</MenuItem>
         <MenuItem value="rtp_l24">RTP L24</MenuItem>
-        <MenuItem value="alsa_l16">ALSA L16</MenuItem>
+        <MenuItem value="alsa_l16">ALSA</MenuItem>
+        {props.profileKind === "rtp_mp2t" && (
+          <MenuItem value="rtp_mp2t">Legacy RTP MPEG-TS</MenuItem>
+        )}
       </TextField>
-      {props.profileKind === "rtp_l24" && (
+      {(props.profileKind === "rtp_l16" ||
+        props.profileKind === "rtp_l24") && (
         <Typography variant="caption" color="text.secondary">
           48 kHz stereo linear PCM · dynamic RTP payload type
         </Typography>
@@ -1015,22 +1219,33 @@ function SourceFields(
       ) : (
         <>
           <TextField
-            label="Bind address"
-            value={props.sourceBindAddress}
-            onChange={(event) =>
-              props.onSourceBindAddressChange(event.target.value)
+            label={
+              props.profileKind === "srt_mpeg_ts" ? "SRT host" : "Bind address"
             }
+            value={
+              props.profileKind === "srt_mpeg_ts"
+                ? props.sourceHost
+                : props.sourceBindAddress
+            }
+            onChange={(event) => {
+              if (props.profileKind === "srt_mpeg_ts") {
+                props.onSourceHostChange(event.target.value);
+              } else {
+                props.onSourceBindAddressChange(event.target.value);
+              }
+            }}
             required
           />
           <TextField
-            label="UDP port"
+            label={props.profileKind === "srt_mpeg_ts" ? "SRT port" : "UDP port"}
             type="number"
             value={props.sourcePort}
             onChange={(event) => props.onSourcePortChange(event.target.value)}
             inputProps={{ min: 1, max: 65535 }}
             required
           />
-          {props.profileKind === "rtp_l24" && (
+          {(props.profileKind === "rtp_l16" ||
+            props.profileKind === "rtp_l24") && (
             <TextField
               label="RTP payload type"
               type="number"
@@ -1041,6 +1256,21 @@ function SourceFields(
               inputProps={{ min: 96, max: 127 }}
               required
             />
+          )}
+          {props.profileKind === "srt_mpeg_ts" && (
+            <TextField
+              select
+              label="SRT mode"
+              value={props.sourceMode}
+              onChange={(event) =>
+                props.onSourceModeChange(
+                  event.target.value as "caller" | "listener",
+                )
+              }
+            >
+              <MenuItem value="caller">Caller</MenuItem>
+              <MenuItem value="listener">Listener</MenuItem>
+            </TextField>
           )}
         </>
       )}
@@ -1123,11 +1353,13 @@ function ResourceRow({
   kind,
   validating,
   onValidate,
+  onEdit,
 }: {
   record: SourceRecord | DestinationRecord;
   kind: "input" | "output";
   validating: boolean;
   onValidate: () => void;
+  onEdit: () => void;
 }) {
   return (
     <Paper
@@ -1149,7 +1381,11 @@ function ResourceRow({
           {record.configuration.kind} · Revision {record.currentRevision}
         </Typography>
         <Stack direction="row" spacing={0.75} sx={{ mt: 0.75 }}>
-          <Chip size="small" label="Disabled" variant="outlined" />
+          <Chip
+            size="small"
+            label={record.desiredState === "disabled" ? "Disabled" : "Enabled"}
+            variant="outlined"
+          />
           <Chip
             size="small"
             label={
@@ -1162,17 +1398,28 @@ function ResourceRow({
           />
         </Stack>
       </Box>
-      {record.lifecycle === "draft" && (
-        <Button
-          size="small"
-          variant="outlined"
-          disabled={validating}
-          onClick={onValidate}
-          aria-label={`Validate ${kind} ${record.friendlyName}`}
-        >
-          {validating ? "Validating..." : "Validate"}
-        </Button>
-      )}
+      <Stack direction="row" spacing={0.5} flexShrink={0}>
+        {record.desiredState === "disabled" && (
+          <Button
+            size="small"
+            onClick={onEdit}
+            aria-label={`Edit ${kind} ${record.friendlyName}`}
+          >
+            Edit
+          </Button>
+        )}
+        {record.lifecycle === "draft" && (
+          <Button
+            size="small"
+            variant="outlined"
+            disabled={validating}
+            onClick={onValidate}
+            aria-label={`Validate ${kind} ${record.friendlyName}`}
+          >
+            {validating ? "Validating..." : "Validate"}
+          </Button>
+        )}
+      </Stack>
     </Paper>
   );
 }

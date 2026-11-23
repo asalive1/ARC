@@ -4,7 +4,19 @@ export interface Liveness {
 
 export type SourceMediaProfile =
   | { kind: "alsa_l16"; device: string }
+  | {
+      kind: "srt_mpeg_ts";
+      host: string;
+      port: number;
+      mode: "caller" | "listener";
+    }
   | { kind: "rtp_mp2t"; bindAddress: string; port: number }
+  | {
+      kind: "rtp_l16";
+      bindAddress: string;
+      port: number;
+      payloadType: number;
+    }
   | {
       kind: "rtp_l24";
       bindAddress: string;
@@ -44,8 +56,10 @@ export interface DestinationRecord
 export interface RoutePlan {
   mediaPath:
     | "alsa_l16_to_rtp_l16"
+    | "rtp_l16_to_rtp_l16"
     | "rtp_l24_to_rtp_l24"
-    | "rtp_mp2t_to_srt_mpeg_ts";
+    | "rtp_mp2t_to_srt_mpeg_ts"
+    | "srt_mpeg_ts_to_srt_mpeg_ts";
 }
 
 async function requestJson<T>(
@@ -108,6 +122,25 @@ export function createSource(
   );
 }
 
+export function updateSource(
+  sourceId: string,
+  friendlyName: string,
+  profile: SourceMediaProfile,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<SourceRecord> {
+  return requestJson(
+    `/sources/${encodeURIComponent(sourceId)}`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ friendlyName, profile }),
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
 export function validateSource(
   sourceId: string,
   baseUrl = "",
@@ -138,6 +171,25 @@ export function createDestination(
     "/destinations",
     {
       method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ friendlyName, profile }),
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function updateDestination(
+  destinationId: string,
+  friendlyName: string,
+  profile: DestinationMediaProfile,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<DestinationRecord> {
+  return requestJson(
+    `/destinations/${encodeURIComponent(destinationId)}`,
+    {
+      method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ friendlyName, profile }),
     },

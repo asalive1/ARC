@@ -10,6 +10,19 @@ pub enum DraftValidationError {
     Database(sqlx::Error),
 }
 
+#[derive(Debug)]
+pub enum ResourceUpdateError {
+    NotFound,
+    Enabled,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ResourceUpdateError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
 impl From<sqlx::Error> for DraftValidationError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error)
@@ -97,6 +110,70 @@ pub async fn list_sources(pool: &PgPool) -> Result<Vec<SourceRecord>, sqlx::Erro
     )
     .fetch_all(pool)
     .await
+}
+
+pub async fn update_source(
+    pool: &PgPool,
+    source_id: Uuid,
+    friendly_name: &str,
+    source_type: &str,
+    configuration: Value,
+) -> Result<SourceRecord, ResourceUpdateError> {
+    let mut transaction = pool.begin().await?;
+    let desired_state = sqlx::query_scalar::<_, String>(
+        "SELECT desired_state FROM sources WHERE id = $1 FOR UPDATE",
+    )
+    .bind(source_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(ResourceUpdateError::NotFound)?;
+
+    if desired_state != "disabled" {
+        return Err(ResourceUpdateError::Enabled);
+    }
+
+    let revision = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(revision), 0) + 1 FROM source_revisions WHERE source_id = $1",
+    )
+    .bind(source_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let revision_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO source_revisions (id, source_id, revision, lifecycle, configuration) \
+         VALUES ($1, $2, $3, 'draft', $4)",
+    )
+    .bind(revision_id)
+    .bind(source_id)
+    .bind(revision)
+    .bind(&configuration)
+    .execute(&mut *transaction)
+    .await?;
+
+    sqlx::query(
+        "UPDATE sources \
+         SET friendly_name = $2, source_type = $3, current_revision = $4, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(source_id)
+    .bind(friendly_name)
+    .bind(source_type)
+    .bind(revision)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(SourceRecord {
+        id: source_id,
+        friendly_name: friendly_name.to_owned(),
+        source_type: source_type.to_owned(),
+        desired_state,
+        current_revision: revision,
+        revision_id,
+        lifecycle: "draft".to_owned(),
+        configuration,
+    })
 }
 
 pub async fn validate_source_draft(
@@ -194,6 +271,71 @@ pub async fn list_destinations(pool: &PgPool) -> Result<Vec<DestinationRecord>, 
     .await
 }
 
+pub async fn update_destination(
+    pool: &PgPool,
+    destination_id: Uuid,
+    friendly_name: &str,
+    destination_type: &str,
+    configuration: Value,
+) -> Result<DestinationRecord, ResourceUpdateError> {
+    let mut transaction = pool.begin().await?;
+    let desired_state = sqlx::query_scalar::<_, String>(
+        "SELECT desired_state FROM destinations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(destination_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(ResourceUpdateError::NotFound)?;
+
+    if desired_state != "disabled" {
+        return Err(ResourceUpdateError::Enabled);
+    }
+
+    let revision = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(revision), 0) + 1 \
+         FROM destination_revisions WHERE destination_id = $1",
+    )
+    .bind(destination_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let revision_id = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO destination_revisions (id, destination_id, revision, lifecycle, configuration) \
+         VALUES ($1, $2, $3, 'draft', $4)",
+    )
+    .bind(revision_id)
+    .bind(destination_id)
+    .bind(revision)
+    .bind(&configuration)
+    .execute(&mut *transaction)
+    .await?;
+
+    sqlx::query(
+        "UPDATE destinations \
+         SET friendly_name = $2, destination_type = $3, current_revision = $4, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(destination_id)
+    .bind(friendly_name)
+    .bind(destination_type)
+    .bind(revision)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(DestinationRecord {
+        id: destination_id,
+        friendly_name: friendly_name.to_owned(),
+        destination_type: destination_type.to_owned(),
+        desired_state,
+        current_revision: revision,
+        revision_id,
+        lifecycle: "draft".to_owned(),
+        configuration,
+    })
+}
+
 pub async fn validate_destination_draft(
     pool: &PgPool,
     destination_id: Uuid,
@@ -259,6 +401,14 @@ mod tests {
             validate_destination_draft(&pool, Uuid::new_v4()).await,
             Err(DraftValidationError::NotFound)
         ));
+        assert!(matches!(
+            update_source(&pool, Uuid::new_v4(), "missing", "rtp_l24", json!({})).await,
+            Err(ResourceUpdateError::NotFound)
+        ));
+        assert!(matches!(
+            update_destination(&pool, Uuid::new_v4(), "missing", "rtp_l24", json!({})).await,
+            Err(ResourceUpdateError::NotFound)
+        ));
 
         let suffix = Uuid::new_v4();
         let source_name = format!("catalog-source-{suffix}");
@@ -298,6 +448,45 @@ mod tests {
         assert!(matches!(
             validate_source_draft(&pool, source.id).await,
             Err(DraftValidationError::NotDraft)
+        ));
+        let updated_source_configuration = json!({
+            "kind": "rtp_l24",
+            "bindAddress": "0.0.0.0",
+            "port": 5002,
+            "payloadType": 96
+        });
+        let updated_source = update_source(
+            &pool,
+            source.id,
+            "Updated RTP source",
+            "rtp_l24",
+            updated_source_configuration.clone(),
+        )
+        .await
+        .expect("editing a source creates a new revision");
+        assert_eq!(updated_source.id, source.id);
+        assert_eq!(updated_source.friendly_name, "Updated RTP source");
+        assert_eq!(updated_source.desired_state, "disabled");
+        assert_eq!(updated_source.current_revision, 2);
+        assert_ne!(updated_source.revision_id, source.revision_id);
+        assert_eq!(updated_source.lifecycle, "draft");
+        assert_eq!(updated_source.configuration, updated_source_configuration);
+        let prior_source_lifecycle: String = sqlx::query_scalar(
+            "SELECT lifecycle FROM source_revisions WHERE source_id = $1 AND revision = 1",
+        )
+        .bind(source.id)
+        .fetch_one(&pool)
+        .await
+        .expect("prior source revision remains available");
+        assert_eq!(prior_source_lifecycle, "validated");
+        sqlx::query("UPDATE sources SET desired_state = 'enabled' WHERE id = $1")
+            .bind(source.id)
+            .execute(&pool)
+            .await
+            .expect("source can be enabled for the update guard check");
+        assert!(matches!(
+            update_source(&pool, source.id, "Enabled source", "rtp_l24", json!({})).await,
+            Err(ResourceUpdateError::Enabled)
         ));
 
         let destination_name = format!("catalog-destination-{suffix}");
@@ -340,5 +529,66 @@ mod tests {
             validate_destination_draft(&pool, destination.id).await,
             Err(DraftValidationError::NotDraft)
         ));
+        let updated_destination_configuration = json!({
+            "kind": "rtp_l24",
+            "address": "127.0.0.1",
+            "port": 6002,
+            "payloadType": 97
+        });
+        let updated_destination = update_destination(
+            &pool,
+            destination.id,
+            "Updated RTP destination",
+            "rtp_l24",
+            updated_destination_configuration.clone(),
+        )
+        .await
+        .expect("editing a destination creates a new revision");
+        assert_eq!(updated_destination.id, destination.id);
+        assert_eq!(updated_destination.friendly_name, "Updated RTP destination");
+        assert_eq!(updated_destination.desired_state, "disabled");
+        assert_eq!(updated_destination.current_revision, 2);
+        assert_ne!(updated_destination.revision_id, destination.revision_id);
+        assert_eq!(updated_destination.lifecycle, "draft");
+        assert_eq!(
+            updated_destination.configuration,
+            updated_destination_configuration
+        );
+        let prior_destination_lifecycle: String = sqlx::query_scalar(
+            "SELECT lifecycle FROM destination_revisions \
+             WHERE destination_id = $1 AND revision = 1",
+        )
+        .bind(destination.id)
+        .fetch_one(&pool)
+        .await
+        .expect("prior destination revision remains available");
+        assert_eq!(prior_destination_lifecycle, "validated");
+        sqlx::query("UPDATE destinations SET desired_state = 'enabled' WHERE id = $1")
+            .bind(destination.id)
+            .execute(&pool)
+            .await
+            .expect("destination can be enabled for the update guard check");
+        assert!(matches!(
+            update_destination(
+                &pool,
+                destination.id,
+                "Enabled destination",
+                "rtp_l24",
+                json!({})
+            )
+            .await,
+            Err(ResourceUpdateError::Enabled)
+        ));
+
+        sqlx::query("DELETE FROM sources WHERE id = $1")
+            .bind(source.id)
+            .execute(&pool)
+            .await
+            .expect("test source and its revisions are removed");
+        sqlx::query("DELETE FROM destinations WHERE id = $1")
+            .bind(destination.id)
+            .execute(&pool)
+            .await
+            .expect("test destination and its revisions are removed");
     }
 }

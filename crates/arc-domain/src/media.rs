@@ -12,9 +12,19 @@ pub enum SourceMediaProfile {
     AlsaL16 {
         device: String,
     },
+    SrtMpegTs {
+        host: String,
+        port: u16,
+        mode: SrtMode,
+    },
     RtpMp2t {
         bind_address: IpAddr,
         port: u16,
+    },
+    RtpL16 {
+        bind_address: IpAddr,
+        port: u16,
+        payload_type: u8,
     },
     RtpL24 {
         bind_address: IpAddr,
@@ -57,15 +67,19 @@ pub enum DestinationMediaProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaPath {
     AlsaL16ToRtpL16,
+    RtpL16ToRtpL16,
     RtpL24ToRtpL24,
     RtpMp2tToSrtMpegTs,
+    SrtMpegTsToSrtMpegTs,
 }
 
 impl SourceMediaProfile {
     pub const fn adapter_id(&self) -> &'static str {
         match self {
             Self::AlsaL16 { .. } => "alsa_l16",
+            Self::SrtMpegTs { .. } => "srt_mpeg_ts",
             Self::RtpMp2t { .. } => "rtp_mp2t",
+            Self::RtpL16 { .. } => "rtp_l16",
             Self::RtpL24 { .. } => "rtp_l24",
         }
     }
@@ -85,8 +99,10 @@ impl MediaPath {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AlsaL16ToRtpL16 => "alsa_l16_to_rtp_l16",
+            Self::RtpL16ToRtpL16 => "rtp_l16_to_rtp_l16",
             Self::RtpL24ToRtpL24 => "rtp_l24_to_rtp_l24",
             Self::RtpMp2tToSrtMpegTs => "rtp_mp2t_to_srt_mpeg_ts",
+            Self::SrtMpegTsToSrtMpegTs => "srt_mpeg_ts_to_srt_mpeg_ts",
         }
     }
 }
@@ -104,7 +120,7 @@ impl fmt::Display for MediaProfileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::InvalidAlsaDevice => "ALSA device must not be empty",
-            Self::InvalidHost => "destination host must not be empty or contain whitespace",
+            Self::InvalidHost => "SRT host must not be empty or contain whitespace",
             Self::InvalidPort => "media endpoint port must be nonzero",
             Self::InvalidRtpPayloadType => {
                 "RTP audio payload type must be in the dynamic range 96..=127"
@@ -128,11 +144,17 @@ pub fn plan_media_path(
         (SourceMediaProfile::AlsaL16 { .. }, DestinationMediaProfile::RtpL16 { .. }) => {
             Ok(MediaPath::AlsaL16ToRtpL16)
         }
+        (SourceMediaProfile::RtpL16 { .. }, DestinationMediaProfile::RtpL16 { .. }) => {
+            Ok(MediaPath::RtpL16ToRtpL16)
+        }
         (SourceMediaProfile::RtpL24 { .. }, DestinationMediaProfile::RtpL24 { .. }) => {
             Ok(MediaPath::RtpL24ToRtpL24)
         }
         (SourceMediaProfile::RtpMp2t { .. }, DestinationMediaProfile::SrtMpegTs { .. }) => {
             Ok(MediaPath::RtpMp2tToSrtMpegTs)
+        }
+        (SourceMediaProfile::SrtMpegTs { .. }, DestinationMediaProfile::SrtMpegTs { .. }) => {
+            Ok(MediaPath::SrtMpegTsToSrtMpegTs)
         }
         _ => Err(MediaProfileError::UnsupportedConversion),
     }
@@ -144,13 +166,23 @@ pub fn validate_source_profile(source: &SourceMediaProfile) -> Result<(), MediaP
             Err(MediaProfileError::InvalidAlsaDevice)
         }
         SourceMediaProfile::AlsaL16 { .. } => Ok(()),
-        SourceMediaProfile::RtpMp2t { port: 0, .. } => Err(MediaProfileError::InvalidPort),
-        SourceMediaProfile::RtpMp2t { .. } => Ok(()),
-        SourceMediaProfile::RtpL24 { port: 0, .. } => Err(MediaProfileError::InvalidPort),
-        SourceMediaProfile::RtpL24 { payload_type, .. } if !(96..=127).contains(payload_type) => {
+        SourceMediaProfile::SrtMpegTs { port: 0, .. }
+        | SourceMediaProfile::RtpMp2t { port: 0, .. }
+        | SourceMediaProfile::RtpL16 { port: 0, .. }
+        | SourceMediaProfile::RtpL24 { port: 0, .. } => Err(MediaProfileError::InvalidPort),
+        SourceMediaProfile::SrtMpegTs { host, .. }
+            if host.trim().is_empty() || host.chars().any(char::is_whitespace) =>
+        {
+            Err(MediaProfileError::InvalidHost)
+        }
+        SourceMediaProfile::SrtMpegTs { .. } | SourceMediaProfile::RtpMp2t { .. } => Ok(()),
+        SourceMediaProfile::RtpL16 { payload_type, .. }
+        | SourceMediaProfile::RtpL24 { payload_type, .. }
+            if !(96..=127).contains(payload_type) =>
+        {
             Err(MediaProfileError::InvalidRtpPayloadType)
         }
-        SourceMediaProfile::RtpL24 { .. } => Ok(()),
+        SourceMediaProfile::RtpL16 { .. } | SourceMediaProfile::RtpL24 { .. } => Ok(()),
     }
 }
 
@@ -216,6 +248,25 @@ mod tests {
     }
 
     #[test]
+    fn plans_matching_rtp_l16_profiles() {
+        let source = SourceMediaProfile::RtpL16 {
+            bind_address: IpAddr::from([0, 0, 0, 0]),
+            port: 5004,
+            payload_type: 96,
+        };
+        let destination = DestinationMediaProfile::RtpL16 {
+            address: IpAddr::from([127, 0, 0, 1]),
+            port: 5006,
+            payload_type: 97,
+        };
+
+        assert_eq!(
+            plan_media_path(&source, &destination),
+            Ok(MediaPath::RtpL16ToRtpL16)
+        );
+    }
+
+    #[test]
     fn plans_matching_rtp_l24_profiles() {
         let source = SourceMediaProfile::RtpL24 {
             bind_address: IpAddr::from([0, 0, 0, 0]),
@@ -231,6 +282,25 @@ mod tests {
         assert_eq!(
             plan_media_path(&source, &destination),
             Ok(MediaPath::RtpL24ToRtpL24)
+        );
+    }
+
+    #[test]
+    fn plans_srt_mpeg_ts_input_to_output_as_pass_through() {
+        let source = SourceMediaProfile::SrtMpegTs {
+            host: "0.0.0.0".to_owned(),
+            port: 6000,
+            mode: SrtMode::Listener,
+        };
+        let destination = DestinationMediaProfile::SrtMpegTs {
+            host: "127.0.0.1".to_owned(),
+            port: 6002,
+            mode: SrtMode::Caller,
+        };
+
+        assert_eq!(
+            plan_media_path(&source, &destination),
+            Ok(MediaPath::SrtMpegTsToSrtMpegTs)
         );
     }
 
@@ -308,6 +378,29 @@ mod tests {
         assert_eq!(
             validate_destination_profile(&destination),
             Err(MediaProfileError::InvalidRtpPayloadType)
+        );
+    }
+
+    #[test]
+    fn validates_rtp_l16_payload_type_and_srt_input_host() {
+        let rtp_source = SourceMediaProfile::RtpL16 {
+            bind_address: IpAddr::from([0, 0, 0, 0]),
+            port: 5004,
+            payload_type: 33,
+        };
+        let srt_source = SourceMediaProfile::SrtMpegTs {
+            host: "invalid host".to_owned(),
+            port: 6000,
+            mode: SrtMode::Listener,
+        };
+
+        assert_eq!(
+            validate_source_profile(&rtp_source),
+            Err(MediaProfileError::InvalidRtpPayloadType)
+        );
+        assert_eq!(
+            validate_source_profile(&srt_source),
+            Err(MediaProfileError::InvalidHost)
         );
     }
 }

@@ -6,6 +6,8 @@ import {
   fetchLiveness,
   fetchSources,
   planRoute,
+  updateDestination,
+  updateSource,
   validateDestination,
   validateSource,
 } from "./api";
@@ -84,6 +86,37 @@ describe("catalog and route API", () => {
     expect(fetcher).toHaveBeenCalledWith("/api/v1/sources", undefined);
   });
 
+  it("updates a source by creating a new draft revision", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: "source-1" }), { status: 200 }),
+    );
+
+    await updateSource(
+      "source/1",
+      "Edited input",
+      { kind: "rtp_l24", bindAddress: "0.0.0.0", port: 5004, payloadType: 96 },
+      "http://arc-api:8080",
+      fetcher,
+    );
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://arc-api:8080/api/v1/sources/source%2F1",
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          friendlyName: "Edited input",
+          profile: {
+            kind: "rtp_l24",
+            bindAddress: "0.0.0.0",
+            port: 5004,
+            payloadType: 96,
+          },
+        }),
+      },
+    );
+  });
+
   it("creates destinations and plans routes", async () => {
     const fetcher = vi
       .fn<typeof fetch>()
@@ -116,6 +149,37 @@ describe("catalog and route API", () => {
       2,
       "/api/v1/routes/plan",
       expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("updates a destination", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ id: "destination-1" }), { status: 200 }),
+    );
+
+    await updateDestination(
+      "destination-1",
+      "Edited output",
+      { kind: "srt_mpeg_ts", host: "192.0.2.10", port: 6002, mode: "listener" },
+      "",
+      fetcher,
+    );
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/destinations/destination-1",
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          friendlyName: "Edited output",
+          profile: {
+            kind: "srt_mpeg_ts",
+            host: "192.0.2.10",
+            port: 6002,
+            mode: "listener",
+          },
+        }),
+      },
     );
   });
 

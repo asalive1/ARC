@@ -81,6 +81,38 @@ paths:
           $ref: "#/components/responses/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
+  /sources/{sourceId}:
+    put:
+      operationId: updateSource
+      summary: Edit a disabled source as a new draft revision
+      parameters:
+        - name: sourceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSourceRequest"
+      responses:
+        "200":
+          description: The updated source; previous revisions are preserved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Source"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          $ref: "#/components/responses/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
   /sources/{sourceId}/validate:
     post:
       operationId: validateSourceDraft
@@ -134,6 +166,38 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Destination"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /destinations/{destinationId}:
+    put:
+      operationId: updateDestination
+      summary: Edit a disabled destination as a new draft revision
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDestinationRequest"
+      responses:
+        "200":
+          description: The updated destination; previous revisions are preserved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Destination"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          $ref: "#/components/responses/ApiError"
         "422":
           $ref: "#/components/responses/ApiError"
         "500":
@@ -357,7 +421,7 @@ components:
         configuration:
           $ref: "#/components/schemas/DestinationMediaProfile"
     SourceMediaProfile:
-      description: RTP L24 uses 48 kHz stereo linear PCM and an endpoint-local dynamic payload type.
+      description: RTP L16/L24 use 48 kHz stereo linear PCM and endpoint-local dynamic payload types. RTP MP2T is retained for existing source records.
       oneOf:
         - type: object
           required: [kind, device]
@@ -367,6 +431,21 @@ components:
               const: alsa_l16
             device:
               type: string
+        - type: object
+          required: [kind, host, port, mode]
+          properties:
+            kind:
+              type: string
+              const: srt_mpeg_ts
+            host:
+              type: string
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+            mode:
+              type: string
+              enum: [caller, listener]
         - type: object
           required: [kind, bindAddress, port]
           properties:
@@ -379,6 +458,22 @@ components:
               type: integer
               minimum: 1
               maximum: 65535
+        - type: object
+          required: [kind, bindAddress, port, payloadType]
+          properties:
+            kind:
+              type: string
+              const: rtp_l16
+            bindAddress:
+              type: string
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+            payloadType:
+              type: integer
+              minimum: 96
+              maximum: 127
         - type: object
           required: [kind, bindAddress, port, payloadType]
           properties:
@@ -460,7 +555,7 @@ components:
         mediaPath:
           type: string
           enum:
-            [alsa_l16_to_rtp_l16, rtp_l24_to_rtp_l24, rtp_mp2t_to_srt_mpeg_ts]
+            [alsa_l16_to_rtp_l16, rtp_l16_to_rtp_l16, rtp_l24_to_rtp_l24, rtp_mp2t_to_srt_mpeg_ts, srt_mpeg_ts_to_srt_mpeg_ts]
     ApiError:
       type: object
       required: [code, message]
@@ -468,7 +563,7 @@ components:
         code:
           type: string
           enum:
-            [invalid_request, not_found, invalid_lifecycle, database_error, internal_error]
+            [invalid_request, not_found, invalid_lifecycle, resource_enabled, database_error, internal_error]
         message:
           type: string
     RouteProposal:

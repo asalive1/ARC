@@ -67,26 +67,27 @@ compensation outcomes.
 
 ## POC profiles and sequence
 
-The user selected the invoked prompt's Phase 1 adapter scope: ALSA and RTP
-inputs, RTP and SRT outputs, with RTP input -> SRT output as the first
-end-to-end demo. Preserve V6's technical requirements where they do not
-conflict, including PostgreSQL persistence, local worker assignment,
-health/events, and restart recovery. SRT output uses MPEG-TS per V6. The RTP
-payload profiles are recorded below; exact plugin packages and platform
-license choices remain open and must not be selected implicitly.
+Phase 1 source choices are SRT MPEG-TS, RTP L16, RTP L24, and ALSA (48 kHz
+stereo L16). Outputs remain RTP L16/L24 and SRT MPEG-TS. Preserve V6's other
+technical requirements, including PostgreSQL persistence, local worker
+assignment, health/events, and restart recovery. Exact plugin packages and
+platform license choices remain open and must not be selected implicitly.
 
-The user selected RTP MPEG-TS (MP2T, payload type 33) -> SRT MPEG-TS
-pass-through for the first demo. The ALSA -> RTP profile is 48 kHz stereo L16
-PCM; its dynamic RTP payload type is destination configuration, not a global
-constant. This avoids an audio encoder. The user approved LGPL GStreamer
+The original RTP MPEG-TS (MP2T, payload type 33) -> SRT MPEG-TS pass-through
+path remains supported for existing source records, but is no longer offered
+for new sources. ALSA -> RTP L16 uses 48 kHz stereo PCM with the RTP endpoint's
+dynamic payload type configured locally. The user approved LGPL GStreamer
 components and the MPL-2.0 SRT library for Phase 1, excluding GPL/AGPL
 components; the exact plugin and OS package closure still needs inventory.
 
-The user additionally selected RTP L24 audio profiles for both inputs and
-outputs using the existing 48 kHz stereo PCM baseline. The Phase 1 planner
-accepts RTP L24 -> RTP L24 only, with each endpoint's dynamic payload type
-configured independently. It does not imply L16/L24 conversion or an RTP L24
--> SRT path.
+The Phase 1 planner supports ALSA L16 -> RTP L16, RTP L16 -> RTP L16, RTP L24
+-> RTP L24, SRT MPEG-TS -> SRT MPEG-TS, and the retained RTP MP2T -> SRT MPEG-TS
+path. RTP L16/L24 endpoints configure their dynamic payload types
+independently. No L16/L24 conversion or cross-format SRT path is implied.
+
+Editing a disabled source or destination creates a new draft revision and
+preserves prior revisions. The updated resource remains disabled until its
+current draft is validated; enabled resources cannot be edited.
 
 Zephyr remains the V6 Phase 2 adapter: same-socket RTP demux, AAC-LC/ADTS
 decode, GPIO extraction, and synthetic simulation. Zephyr POC profile: 48 kHz

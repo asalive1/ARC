@@ -2,7 +2,7 @@
 # Project Settings
 #################################################
 
-$ProjectName = "CHANGE_ME"
+$ProjectName = "ARC"
 
 $GitBranch = "main"
 

@@ -4,10 +4,17 @@ export interface Liveness {
 
 export type SourceMediaProfile =
   | { kind: "alsa_l16"; device: string }
-  | { kind: "rtp_mp2t"; bindAddress: string; port: number };
+  | { kind: "rtp_mp2t"; bindAddress: string; port: number }
+  | {
+      kind: "rtp_l24";
+      bindAddress: string;
+      port: number;
+      payloadType: number;
+    };
 
 export type DestinationMediaProfile =
   | { kind: "rtp_l16"; address: string; port: number; payloadType: number }
+  | { kind: "rtp_l24"; address: string; port: number; payloadType: number }
   | {
       kind: "srt_mpeg_ts";
       host: string;
@@ -35,7 +42,10 @@ export interface DestinationRecord
 }
 
 export interface RoutePlan {
-  mediaPath: "alsa_l16_to_rtp_l16" | "rtp_mp2t_to_srt_mpeg_ts";
+  mediaPath:
+    | "alsa_l16_to_rtp_l16"
+    | "rtp_l24_to_rtp_l24"
+    | "rtp_mp2t_to_srt_mpeg_ts";
 }
 
 async function requestJson<T>(
@@ -98,6 +108,19 @@ export function createSource(
   );
 }
 
+export function validateSource(
+  sourceId: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<SourceRecord> {
+  return requestJson(
+    `/sources/${encodeURIComponent(sourceId)}/validate`,
+    { method: "POST" },
+    baseUrl,
+    fetcher,
+  );
+}
+
 export function fetchDestinations(
   baseUrl = "",
   fetcher: typeof fetch = globalThis.fetch,
@@ -118,6 +141,19 @@ export function createDestination(
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ friendlyName, profile }),
     },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function validateDestination(
+  destinationId: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<DestinationRecord> {
+  return requestJson(
+    `/destinations/${encodeURIComponent(destinationId)}/validate`,
+    { method: "POST" },
     baseUrl,
     fetcher,
   );

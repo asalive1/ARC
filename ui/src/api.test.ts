@@ -6,6 +6,8 @@ import {
   fetchLiveness,
   fetchSources,
   planRoute,
+  validateDestination,
+  validateSource,
 } from "./api";
 
 describe("fetchLiveness", () => {
@@ -117,6 +119,52 @@ describe("catalog and route API", () => {
     );
   });
 
+  it("plans a matching RTP L24 path", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ mediaPath: "rtp_l24_to_rtp_l24" }), {
+        status: 200,
+      }),
+    );
+
+    await expect(
+      planRoute(
+        {
+          kind: "rtp_l24",
+          bindAddress: "0.0.0.0",
+          port: 5004,
+          payloadType: 96,
+        },
+        {
+          kind: "rtp_l24",
+          address: "127.0.0.1",
+          port: 5006,
+          payloadType: 97,
+        },
+        "",
+        fetcher,
+      ),
+    ).resolves.toEqual({ mediaPath: "rtp_l24_to_rtp_l24" });
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/routes/plan",
+      expect.objectContaining({
+        body: JSON.stringify({
+          source: {
+            kind: "rtp_l24",
+            bindAddress: "0.0.0.0",
+            port: 5004,
+            payloadType: 96,
+          },
+          destination: {
+            kind: "rtp_l24",
+            address: "127.0.0.1",
+            port: 5006,
+            payloadType: 97,
+          },
+        }),
+      }),
+    );
+  });
+
   it("surfaces API errors for catalog operations", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       new Response("invalid request", { status: 422 }),
@@ -125,5 +173,26 @@ describe("catalog and route API", () => {
     await expect(
       createSource("Bad source", { kind: "alsa_l16", device: "hw:1,0" }, "", fetcher),
     ).rejects.toThrow("API request failed with HTTP 422");
+  });
+
+  it("validates source and destination drafts through their lifecycle endpoints", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "source-1" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "dest-1" }), { status: 200 }));
+
+    await validateSource("source/1", "http://arc-api:8080", fetcher);
+    await validateDestination("dest-1", "", fetcher);
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "http://arc-api:8080/api/v1/sources/source%2F1/validate",
+      { method: "POST" },
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/v1/destinations/dest-1/validate",
+      { method: "POST" },
+    );
   });
 });

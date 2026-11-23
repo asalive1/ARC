@@ -26,6 +26,7 @@ not necessarily before all documentation can be reviewed.
 | Q19 | What stable network-interface ID strategy should survive reboot, rename, Docker namespace, and OS differences? | Persisted interface selection must resolve correctly after restart. | **Blocking: network config contract** |
 | Q20 | Resolved: PostgreSQL 16 and SQLx 0.8.6 are the scaffold baseline. | Reproducible schema/bootstrap and CI use the locked migration runner and PostgreSQL 16 validation. | Resolved for Phase 0 scaffold |
 | Q21 | Resolved 2026-11-22: the first RTP -> SRT path uses RTP MPEG-TS (MP2T, payload type 33) -> SRT MPEG-TS pass-through; ALSA -> RTP uses 48 kHz stereo L16 PCM. | Defines the initial media formats without selecting an encoder. | Resolved for Phase 1 media profile |
+| Q22 | Resolved 2026-11-22: add 48 kHz stereo RTP L24 input and output profiles alongside existing formats; only matching RTP L24 -> RTP L24 is a supported planned path, with endpoint-local dynamic payload types. | Adds L24 without implying bit-depth conversion or changing the RTP MP2T -> SRT demo. | Resolved for Phase 1 profile scope |
 
 Resolve all questions marked blocking before their named gate; record decisions
 with owner/date and update the [assumptions](assumptions.md),

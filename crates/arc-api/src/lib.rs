@@ -2,10 +2,10 @@ use arc_domain::{
     plan_media_path, validate_destination_profile, validate_source_profile,
     DestinationMediaProfile, MediaProfileError, SourceMediaProfile,
 };
-use arc_infrastructure::catalog::{self, DestinationRecord, SourceRecord};
+use arc_infrastructure::catalog::{self, DestinationRecord, DraftValidationError, SourceRecord};
 use arc_infrastructure::postgres::PgPool;
 use axum::{
-    extract::Extension,
+    extract::{Extension, Path},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -13,12 +13,21 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 pub fn router() -> Router {
     Router::new()
         .route("/api/v1/health/live", get(liveness))
         .route("/api/v1/system/capabilities", get(capabilities))
         .route("/api/v1/routes/plan", post(plan_route))
+        .route(
+            "/api/v1/sources/{source_id}/validate",
+            post(validate_source_draft),
+        )
+        .route(
+            "/api/v1/destinations/{destination_id}/validate",
+            post(validate_destination_draft),
+        )
 }
 
 pub fn router_with_database(pool: PgPool) -> Router {
@@ -78,6 +87,16 @@ async fn list_sources(
         .map_err(|error| ApiError::database("list sources", error))
 }
 
+async fn validate_source_draft(
+    Path(source_id): Path<Uuid>,
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<SourceRecord>, ApiError> {
+    catalog::validate_source_draft(&pool, source_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::draft_validation)
+}
+
 async fn create_source(
     Extension(pool): Extension<PgPool>,
     Json(request): Json<CreateSourceRequest>,
@@ -106,6 +125,16 @@ async fn list_destinations(
         .await
         .map(Json)
         .map_err(|error| ApiError::database("list destinations", error))
+}
+
+async fn validate_destination_draft(
+    Path(destination_id): Path<Uuid>,
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<DestinationRecord>, ApiError> {
+    catalog::validate_destination_draft(&pool, destination_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::draft_validation)
 }
 
 async fn create_destination(
@@ -173,6 +202,22 @@ impl ApiError {
 
     fn invalid_media_profile(error: MediaProfileError) -> Self {
         Self::invalid_request(error.to_string())
+    }
+
+    fn draft_validation(error: DraftValidationError) -> Self {
+        match error {
+            DraftValidationError::NotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "not_found",
+                message: "The requested source or destination does not exist".to_owned(),
+            },
+            DraftValidationError::NotDraft => Self {
+                status: StatusCode::CONFLICT,
+                code: "invalid_lifecycle",
+                message: "Only draft resources can be validated".to_owned(),
+            },
+            DraftValidationError::Database(error) => Self::database("validate draft", error),
+        }
     }
 
     fn serialize_profile(error: serde_json::Error) -> Self {
@@ -304,6 +349,44 @@ mod tests {
         );
         let value: Value = serde_json::from_slice(&body).expect("response is JSON");
         assert_eq!(value["mediaPath"], "rtp_mp2t_to_srt_mpeg_ts");
+    }
+
+    #[tokio::test]
+    async fn route_planner_accepts_matching_rtp_l24_profiles() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source": {
+                                "kind": "rtp_l24",
+                                "bindAddress": "0.0.0.0",
+                                "port": 5004,
+                                "payloadType": 96
+                            },
+                            "destination": {
+                                "kind": "rtp_l24",
+                                "address": "127.0.0.1",
+                                "port": 5006,
+                                "payloadType": 97
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router handles request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let value: Value = serde_json::from_slice(&body).expect("response is JSON");
+        assert_eq!(value["mediaPath"], "rtp_l24_to_rtp_l24");
     }
 
     #[tokio::test]

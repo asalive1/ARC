@@ -3,6 +3,19 @@ use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
+#[derive(Debug)]
+pub enum DraftValidationError {
+    NotFound,
+    NotDraft,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for DraftValidationError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
 #[derive(Clone, Debug, FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceRecord {
@@ -86,6 +99,42 @@ pub async fn list_sources(pool: &PgPool) -> Result<Vec<SourceRecord>, sqlx::Erro
     .await
 }
 
+pub async fn validate_source_draft(
+    pool: &PgPool,
+    source_id: Uuid,
+) -> Result<SourceRecord, DraftValidationError> {
+    let mut transaction = pool.begin().await?;
+    let mut source = sqlx::query_as::<_, SourceRecord>(
+        "SELECT s.id, s.friendly_name, s.source_type, s.desired_state, \
+         s.current_revision, r.id AS revision_id, r.lifecycle, r.configuration \
+         FROM sources s \
+         JOIN source_revisions r \
+           ON r.source_id = s.id AND r.revision = s.current_revision \
+         WHERE s.id = $1 \
+         FOR UPDATE OF s, r",
+    )
+    .bind(source_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(DraftValidationError::NotFound)?;
+
+    if source.lifecycle != "draft" {
+        return Err(DraftValidationError::NotDraft);
+    }
+
+    sqlx::query(
+        "UPDATE source_revisions SET lifecycle = 'validated' \
+         WHERE id = $1 AND lifecycle = 'draft'",
+    )
+    .bind(source.revision_id)
+    .execute(&mut *transaction)
+    .await?;
+    source.lifecycle = "validated".to_owned();
+    transaction.commit().await?;
+
+    Ok(source)
+}
+
 pub async fn create_destination(
     pool: &PgPool,
     friendly_name: &str,
@@ -145,6 +194,42 @@ pub async fn list_destinations(pool: &PgPool) -> Result<Vec<DestinationRecord>, 
     .await
 }
 
+pub async fn validate_destination_draft(
+    pool: &PgPool,
+    destination_id: Uuid,
+) -> Result<DestinationRecord, DraftValidationError> {
+    let mut transaction = pool.begin().await?;
+    let mut destination = sqlx::query_as::<_, DestinationRecord>(
+        "SELECT d.id, d.friendly_name, d.destination_type, d.desired_state, \
+         d.current_revision, r.id AS revision_id, r.lifecycle, r.configuration \
+         FROM destinations d \
+         JOIN destination_revisions r \
+           ON r.destination_id = d.id AND r.revision = d.current_revision \
+         WHERE d.id = $1 \
+         FOR UPDATE OF d, r",
+    )
+    .bind(destination_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(DraftValidationError::NotFound)?;
+
+    if destination.lifecycle != "draft" {
+        return Err(DraftValidationError::NotDraft);
+    }
+
+    sqlx::query(
+        "UPDATE destination_revisions SET lifecycle = 'validated' \
+         WHERE id = $1 AND lifecycle = 'draft'",
+    )
+    .bind(destination.revision_id)
+    .execute(&mut *transaction)
+    .await?;
+    destination.lifecycle = "validated".to_owned();
+    transaction.commit().await?;
+
+    Ok(destination)
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -165,6 +250,15 @@ mod tests {
         migrate(&pool)
             .await
             .expect("SQLx applies the initial migration");
+
+        assert!(matches!(
+            validate_source_draft(&pool, Uuid::new_v4()).await,
+            Err(DraftValidationError::NotFound)
+        ));
+        assert!(matches!(
+            validate_destination_draft(&pool, Uuid::new_v4()).await,
+            Err(DraftValidationError::NotFound)
+        ));
 
         let suffix = Uuid::new_v4();
         let source_name = format!("catalog-source-{suffix}");
@@ -192,6 +286,19 @@ mod tests {
             .expect("sources can be listed")
             .iter()
             .any(|listed| listed.id == source.id && listed.revision_id == source.revision_id));
+        let validated_source = validate_source_draft(&pool, source.id)
+            .await
+            .expect("source draft transitions to validated");
+        assert_eq!(validated_source.lifecycle, "validated");
+        assert!(list_sources(&pool)
+            .await
+            .expect("sources can be listed after validation")
+            .iter()
+            .any(|listed| listed.id == source.id && listed.lifecycle == "validated"));
+        assert!(matches!(
+            validate_source_draft(&pool, source.id).await,
+            Err(DraftValidationError::NotDraft)
+        ));
 
         let destination_name = format!("catalog-destination-{suffix}");
         let destination_configuration = json!({
@@ -220,5 +327,18 @@ mod tests {
             .iter()
             .any(|listed| listed.id == destination.id
                 && listed.revision_id == destination.revision_id));
+        let validated_destination = validate_destination_draft(&pool, destination.id)
+            .await
+            .expect("destination draft transitions to validated");
+        assert_eq!(validated_destination.lifecycle, "validated");
+        assert!(list_destinations(&pool)
+            .await
+            .expect("destinations can be listed after validation")
+            .iter()
+            .any(|listed| listed.id == destination.id && listed.lifecycle == "validated"));
+        assert!(matches!(
+            validate_destination_draft(&pool, destination.id).await,
+            Err(DraftValidationError::NotDraft)
+        ));
     }
 }

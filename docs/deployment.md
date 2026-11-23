@@ -30,9 +30,9 @@ database volume.
   executable and OpenTelemetry export are not implemented; Compose does not
   claim to provide either.
 - The API can create and list disabled source/destination profile drafts and
-  plan compatibility for the supported Phase 1 media paths. The UI can create
-  those drafts and check route compatibility. It does not enable resources,
-  activate routes, or start a media pipeline.
+  validate drafts, and plan compatibility for the supported Phase 1 media
+  paths. The UI can configure/validate drafts and check route compatibility.
+  It does not enable resources, activate routes, or start a media pipeline.
 - Compose builds for the host's Docker platform. The Dockerfiles use
   multi-platform base images and avoid platform-specific media packages, but
   Linux AMD64/ARM64 release builds and Windows x86-64 builds have not yet been

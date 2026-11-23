@@ -81,6 +81,30 @@ paths:
           $ref: "#/components/responses/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
+  /sources/{sourceId}/validate:
+    post:
+      operationId: validateSourceDraft
+      summary: Validate a source draft
+      parameters:
+        - name: sourceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The source draft is now validated and remains disabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Source"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
   /destinations:
     get:
       operationId: listDestinations
@@ -111,6 +135,30 @@ paths:
               schema:
                 $ref: "#/components/schemas/Destination"
         "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /destinations/{destinationId}/validate:
+    post:
+      operationId: validateDestinationDraft
+      summary: Validate a destination draft
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The destination draft is now validated and remains disabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Destination"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
           $ref: "#/components/responses/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
@@ -279,7 +327,7 @@ components:
           format: uuid
         lifecycle:
           type: string
-          const: draft
+          enum: [draft, validated]
         configuration:
           $ref: "#/components/schemas/SourceMediaProfile"
     Destination:
@@ -305,10 +353,11 @@ components:
           format: uuid
         lifecycle:
           type: string
-          const: draft
+          enum: [draft, validated]
         configuration:
           $ref: "#/components/schemas/DestinationMediaProfile"
     SourceMediaProfile:
+      description: RTP L24 uses 48 kHz stereo linear PCM and an endpoint-local dynamic payload type.
       oneOf:
         - type: object
           required: [kind, device]
@@ -330,7 +379,24 @@ components:
               type: integer
               minimum: 1
               maximum: 65535
+        - type: object
+          required: [kind, bindAddress, port, payloadType]
+          properties:
+            kind:
+              type: string
+              const: rtp_l24
+            bindAddress:
+              type: string
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+            payloadType:
+              type: integer
+              minimum: 96
+              maximum: 127
     DestinationMediaProfile:
+      description: RTP L24 uses 48 kHz stereo linear PCM and an endpoint-local dynamic payload type.
       oneOf:
         - type: object
           required: [kind, address, port, payloadType]
@@ -338,6 +404,22 @@ components:
             kind:
               type: string
               const: rtp_l16
+            address:
+              type: string
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+            payloadType:
+              type: integer
+              minimum: 96
+              maximum: 127
+        - type: object
+          required: [kind, address, port, payloadType]
+          properties:
+            kind:
+              type: string
+              const: rtp_l24
             address:
               type: string
             port:
@@ -377,14 +459,16 @@ components:
       properties:
         mediaPath:
           type: string
-          enum: [alsa_l16_to_rtp_l16, rtp_mp2t_to_srt_mpeg_ts]
+          enum:
+            [alsa_l16_to_rtp_l16, rtp_l24_to_rtp_l24, rtp_mp2t_to_srt_mpeg_ts]
     ApiError:
       type: object
       required: [code, message]
       properties:
         code:
           type: string
-          enum: [invalid_request, database_error, internal_error]
+          enum:
+            [invalid_request, not_found, invalid_lifecycle, database_error, internal_error]
         message:
           type: string
     RouteProposal:

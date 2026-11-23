@@ -82,6 +82,12 @@ constant. This avoids an audio encoder. The user approved LGPL GStreamer
 components and the MPL-2.0 SRT library for Phase 1, excluding GPL/AGPL
 components; the exact plugin and OS package closure still needs inventory.
 
+The user additionally selected RTP L24 audio profiles for both inputs and
+outputs using the existing 48 kHz stereo PCM baseline. The Phase 1 planner
+accepts RTP L24 -> RTP L24 only, with each endpoint's dynamic payload type
+configured independently. It does not imply L16/L24 conversion or an RTP L24
+-> SRT path.
+
 Zephyr remains the V6 Phase 2 adapter: same-socket RTP demux, AAC-LC/ADTS
 decode, GPIO extraction, and synthetic simulation. Zephyr POC profile: 48 kHz
 stereo AAC-LC/ADTS; audio/GPIO SSRC and PT configured per channel; exact sender

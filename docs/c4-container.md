@@ -9,7 +9,7 @@ flowchart TB
     APP["Application services<br/>Use cases / policy / operations / reconciliation"]
     DOMAIN["Domain model<br/>Routes / endpoints / signals / workers"]
     DB[("PostgreSQL<br/>SQLx migrations")]
-    BUS["Versioned worker control/event channel<br/>Transport TBD"]
+    BUS["Versioned WebSocket/JSON worker control and event channel"]
     WORKER["ARC Worker Service<br/>Registration / scheduling agent / pipelines"]
     MEDIA["Isolated media pipelines<br/>GStreamer adapters"]
     IFACE["Host network / audio devices"]
@@ -43,10 +43,13 @@ flowchart TB
 | OTel collector | Receives/export telemetry | OTLP and deployment-configured receivers/exporters |
 
 API and worker can be colocated but are separate processes/containers and use
-the same versioned contracts used by future remote workers. The worker control
-transport is intentionally not fixed by the references; choose and document
-one during Phase 0. Device Server WebSocket JSON is specifically preferred for
-the plugin boundary.
+the same versioned contracts used by future remote workers. The approved
+worker transport is full-duplex WebSocket/JSON; the connection authenticates a
+service identity bound to the registered `workerId`. Credential provisioning
+is tracked separately in Q13. See the
+[worker control protocol](worker-control-protocol.md) for the frozen decision
+and details deferred to Phase 1. Device Server WebSocket JSON remains a
+separate plugin boundary.
 
 ## Trust boundaries
 

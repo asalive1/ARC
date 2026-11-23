@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.git
+**/node_modules
+**/target
+ui/dist
+Reference Docs
+docs
+test-fixtures
+device-server-plugin
+templates
+scripts

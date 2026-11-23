@@ -1,8 +1,9 @@
 # Test Strategy
 
 **Status:** Approved strategy; seven Rust tests, one explicit PostgreSQL 16
-SQLx migration test, and three UI tests pass. Full integration and acceptance
-coverage remains planned.
+SQLx migration test, and three UI tests pass. Compose smoke validation also
+passes for API/UI startup, UI-to-API proxying, startup migration, and non-root
+API execution. Broader integration and acceptance coverage remains planned.
 
 ## Test levels
 

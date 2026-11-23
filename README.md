@@ -22,12 +22,14 @@ Use VS Code Tasks:
 - Backup To GitHub
 - Create Release
 
+For the runnable local Phase 0 stack, follow the
+[Compose deployment guide](docs/deployment.md).
+
 ## Phase 0 validation
 
 The local toolchains may be run directly or through Docker:
 
 ```powershell
-cargo run -p arc-api
 cargo fmt --all -- --check
 cargo test --locked --workspace
 Set-Location ui
@@ -39,7 +41,8 @@ npm audit --audit-level=moderate
 
 PostgreSQL is the only supported database. The initial schema is in
 `database/migrations`; its execution path is implemented by the SQLx
-infrastructure crate.
+infrastructure crate and applied by the API at startup. Running the API
+directly requires `DATABASE_URL`; Compose configures it for the local database.
 
 ## Releases
 

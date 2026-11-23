@@ -72,8 +72,10 @@ licensing, health, events, and observability.
 **Media plane:** source receive/demultiplex, decode/pass-through, normalization,
 fan-out, encode/mux/transmit, signal extraction/generation, and GPIO transition
 detection. Workers own media sockets and discover host network interfaces.
-Control-to-worker commands and events use versioned contracts; API handlers
-never run media processing inline.
+Control-to-worker commands and events use authenticated, versioned WebSocket
+JSON as defined in the [worker protocol](worker-control-protocol.md); API
+handlers never run media processing inline. The browser event WebSocket remains
+read-only and separate from worker control.
 
 The V6 initial POC adapter inventory is Zephyr Connect RTP/UDP, generic RTP,
 SRT/MPEG-TS, UDP/MPEG-TS, HLS, Icecast AAC/MP3/Opus, and ALSA or Windows audio
@@ -87,7 +89,7 @@ policy, retry/recovery, and cue/metadata policy.
 
 ## 5. Runtime topology and deployment
 
-The POC topology is `arc-ui`, `arc-api`, `arc-worker`, `postgres`, and
+The target POC topology is `arc-ui`, `arc-api`, `arc-worker`, `postgres`, and
 `otel-collector`. API and worker may share a host, but remain separate logical
 services. `arc-worker` needs explicit access to host interfaces, multicast
 membership and statistics; Linux Docker host networking is an option where
@@ -95,6 +97,10 @@ required, not an implicit assumption. Document port exposure and platform
 limitations. PostgreSQL stores desired state and operational records, not
 audio samples, jitter buffers, decoder/encoder frames, socket buffers, or
 high-rate meter samples.
+
+The Phase 0 Compose stack currently runs only `arc-ui`, `arc-api`, and
+`postgres`. Worker and collector services are deferred until their executable
+runtime and telemetry export are implemented.
 
 The Device Server plugin is built and deployed independently on supported
 Linux/Windows hosts. A plugin endpoint is configured in ARC and communicates
@@ -170,9 +176,11 @@ pipelines, assignment counts, draining, and heartbeat age.
 ## 10. Implementation status
 
 The architecture package in [the index](ARCHITECTURE.md) was approved before
-implementation began. Phase 0 scaffolds the Rust workspace, API liveness service, foundational
-PostgreSQL schema, OpenAPI contract, media/worker ports, synthetic fixture area,
-and React UI health shell. Runtime media adapters, reconciliation,
-endpoint/routing UI, Docker deployment, and production authentication remain
-unimplemented; phase exit requires the validation and blocking decisions in
-the delivery plan and open-questions register.
+implementation began. Phase 0 scaffolds the Rust workspace, API liveness
+service, foundational PostgreSQL schema, OpenAPI contract, media/worker ports,
+synthetic fixture area, and React UI health shell. The local Compose stack
+builds and runs the API, UI, and PostgreSQL services. Runtime media adapters,
+the worker executable, telemetry export, reconciliation, endpoint/routing UI,
+and production authentication remain unimplemented; phase exit requires the
+validation and blocking decisions in the delivery plan and open-questions
+register.

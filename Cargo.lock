@@ -21,6 +21,7 @@ dependencies = [
 name = "arc-api"
 version = "0.1.0"
 dependencies = [
+ "arc-infrastructure",
  "axum",
  "serde_json",
  "tokio",

@@ -9,7 +9,7 @@ security review before deployment.
 |---|---|
 | Browser/integrator -> API | TLS in deployed environments; POC username/password and API keys; bounded requests/rate limits; CSRF-safe browser auth design; generic external errors |
 | Principal -> operation | Central authorization for UI/API/automation/plugin paths; least-privilege scopes; auditable decisions; locks and revisions do not replace authorization |
-| API -> worker | Authenticated service identity, protocol version, message size limits, generation fencing, capability validation, replay/idempotency handling |
+| API -> worker | Authenticated service identity bound to registered `workerId`, versioned WebSocket/JSON, message size limits, generation fencing, capability validation, replay/idempotency handling |
 | ARC -> Device Server plugin | Independently provisioned credentials, authenticated WebSocket JSON, version negotiation, allowlisted commands, reconnect/resnapshot, audit |
 | Worker -> network/device | Explicit interface/bind and device permissions; sender allowlists; least privilege; no implicit container/default interface |
 | Service -> PostgreSQL/telemetry | Secret-store references, restricted DB roles, encrypted transport where deployed, redacted logs/metrics |

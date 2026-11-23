@@ -1,4 +1,6 @@
-use sqlx::{migrate::Migrator, postgres::PgPoolOptions, PgPool};
+use sqlx::{migrate::Migrator, postgres::PgPoolOptions};
+
+pub use sqlx::PgPool;
 
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../database/migrations");
 

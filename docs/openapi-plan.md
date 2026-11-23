@@ -1,6 +1,6 @@
 # OpenAPI 3.1 Design Plan
 
-**Status:** Approved architecture baseline; contract scaffold in progress
+**Status:** Phase 1 profile-planning and source/destination catalog endpoints documented; full contract remains in progress
 **Base path:** `/api/v1`
 **Wire format:** JSON; OpenAPI 3.1 is the authoritative HTTP contract.
 

@@ -9,7 +9,7 @@ and release workflow.
 ## Proposed phases
 
 0. Architecture and contracts
-1. Stateful vertical audio slice and local worker
+1. ALSA/RTP-to-RTP/SRT stateful audio slice and local worker
 2. Zephyr Connect adapter and synthetic simulator
 3. Routing matrix, fan-out, presets, rollback, and concurrency
 4. Network transport expansion and platform adapters

@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arc-domain = { path = "../arc-domain" }
 arc-infrastructure = { path = "../arc-infrastructure" }
 axum.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

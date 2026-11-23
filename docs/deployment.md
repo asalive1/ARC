@@ -1,7 +1,7 @@
 # Local Compose Deployment
 
-This Compose stack is a Phase 0 development deployment of the runnable
-scaffold: PostgreSQL, the API, and the static UI. The API applies SQLx
+This Compose stack is a local development deployment of PostgreSQL, the API,
+and the operator UI. The API applies SQLx
 migrations before opening its HTTP listener. PostgreSQL data persists in the
 `postgres_data` named volume.
 
@@ -26,11 +26,13 @@ database volume.
 
 ## Scope and limitations
 
-- The API, UI, and PostgreSQL are the only runnable Phase 0 services. A worker
+- The API, UI, and PostgreSQL are the only runnable services. A worker
   executable and OpenTelemetry export are not implemented; Compose does not
   claim to provide either.
-- The API currently exposes scaffold health/capability routes. It does not yet
-  implement persistence-backed routing or media operations.
+- The API can create and list disabled source/destination profile drafts and
+  plan compatibility for the supported Phase 1 media paths. The UI can create
+  those drafts and check route compatibility. It does not enable resources,
+  activate routes, or start a media pipeline.
 - Compose builds for the host's Docker platform. The Dockerfiles use
   multi-platform base images and avoid platform-specific media packages, but
   Linux AMD64/ARM64 release builds and Windows x86-64 builds have not yet been

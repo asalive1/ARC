@@ -1,9 +1,10 @@
 # ARC - Audio Routing Controller
 
-ARC is an API-first audio routing and signal-control platform. The architecture
-package is approved, and Phase 0 scaffolding is in progress. The API liveness
-shell and UI health view run; media pipelines, persistence-backed services, and
-operator workflows are not implemented yet.
+ARC is an API-first audio routing and signal-control platform. The approved
+architecture and runnable Phase 0 scaffold are in place. The initial Phase 1
+slice persists disabled source/destination drafts, plans compatible media
+profiles, and provides an operator UI for those tasks. Pipeline activation,
+worker execution, and media transport are not implemented yet.
 
 ## Architecture review
 
@@ -22,7 +23,7 @@ Use VS Code Tasks:
 - Backup To GitHub
 - Create Release
 
-For the runnable local Phase 0 stack, follow the
+For the runnable local development stack, follow the
 [Compose deployment guide](docs/deployment.md).
 
 ## Phase 0 validation

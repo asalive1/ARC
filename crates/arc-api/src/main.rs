@@ -1,6 +1,6 @@
 use std::{env, error::Error, net::SocketAddr};
 
-use arc_api::router;
+use arc_api::router_with_database;
 use arc_infrastructure::postgres::{connect_postgres, migrate};
 use tokio::net::TcpListener;
 
@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(bind_address).await?;
 
     tracing::info!(%bind_address, "ARC API listening");
-    axum::serve(listener, router())
+    axum::serve(listener, router_with_database(database_pool.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     drop(database_pool);

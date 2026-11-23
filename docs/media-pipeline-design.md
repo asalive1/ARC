@@ -67,18 +67,27 @@ compensation outcomes.
 
 ## POC profiles and sequence
 
-V6 Phase 1 establishes a generic RTP source, RTP destination, null/test
-destination, one route, PostgreSQL persistence, local worker assignment,
-health/events, and restart recovery. Phase 2 adds Zephyr same-socket RTP
-demux, AAC-LC/ADTS decode, GPIO extraction, and synthetic simulation. Zephyr
-POC profile: 48 kHz stereo AAC-LC/ADTS; audio/GPIO SSRC and PT configured per
-channel; exact sender IP/UDP source-port; up to five channels; selected
-interface/bind address; bounded RTP reorder and ADTS reassembly; editable
-500 ms decoder delay. See [the adapter design](zc-adapter-design.md).
+The user selected the invoked prompt's Phase 1 adapter scope: ALSA and RTP
+inputs, RTP and SRT outputs, with RTP input -> SRT output as the first
+end-to-end demo. Preserve V6's technical requirements where they do not
+conflict, including PostgreSQL persistence, local worker assignment,
+health/events, and restart recovery. SRT output uses MPEG-TS per V6. The RTP
+payload profiles are recorded below; exact plugin packages and platform
+license choices remain open and must not be selected implicitly.
 
-Legacy prompt ordering also asks for ALSA input and SRT output in the initial
-slice. Treat that as a recorded acceptance-plan conflict, not an unreviewed
-change to V6 sequencing.
+The user selected RTP MPEG-TS (MP2T, payload type 33) -> SRT MPEG-TS
+pass-through for the first demo. The ALSA -> RTP profile is 48 kHz stereo L16
+PCM; its dynamic RTP payload type is destination configuration, not a global
+constant. This avoids an audio encoder. The user approved LGPL GStreamer
+components and the MPL-2.0 SRT library for Phase 1, excluding GPL/AGPL
+components; the exact plugin and OS package closure still needs inventory.
+
+Zephyr remains the V6 Phase 2 adapter: same-socket RTP demux, AAC-LC/ADTS
+decode, GPIO extraction, and synthetic simulation. Zephyr POC profile: 48 kHz
+stereo AAC-LC/ADTS; audio/GPIO SSRC and PT configured per channel; exact sender
+IP/UDP source-port; up to five channels; selected interface/bind address;
+bounded RTP reorder and ADTS reassembly; editable 500 ms decoder delay. See
+[the adapter design](zc-adapter-design.md).
 
 ## Capacity and portability
 

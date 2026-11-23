@@ -21,8 +21,10 @@ dependencies = [
 name = "arc-api"
 version = "0.1.0"
 dependencies = [
+ "arc-domain",
  "arc-infrastructure",
  "axum",
+ "serde",
  "serde_json",
  "tokio",
  "tower",
@@ -55,8 +57,11 @@ dependencies = [
 name = "arc-infrastructure"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sqlx",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

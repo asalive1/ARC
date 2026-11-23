@@ -79,3 +79,11 @@ locked manifests and include image SBOM/license data for the exact Linux
 AMD64, Linux ARM64, and Windows x86-64 artifacts. Resolve the codec/plugin
 license question in [open questions](open-questions.md) before selecting media
 dependencies.
+
+The user approved LGPL GStreamer components and the official
+[Haivision SRT license](https://github.com/Haivision/srt/blob/master/LICENSE)
+is MPL-2.0 for Phase 1, excluding GPL/AGPL components. GStreamer describes its framework and newly written plugins as
+LGPL in its
+[licensing FAQ](https://github.com/GStreamer/gstreamer/blob/main/subprojects/gst-docs/markdown/frequently-asked-questions/licensing.md).
+The exact plugin and OS package closure still needs per-target inventory before
+release. These dependencies have not yet been added to the build.

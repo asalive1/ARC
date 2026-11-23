@@ -2,7 +2,10 @@ openapi: 3.1.0
 info:
   title: ARC API
   version: 1.0.0
-  description: Initial contract skeleton for the ARC Phase 0 foundation.
+  description: Phase 1 media profile planning and catalog API.
+  license:
+    name: MIT OR Apache-2.0
+    identifier: MIT OR Apache-2.0
 servers:
   - url: /api/v1
 paths:
@@ -55,31 +58,81 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/SourceCollection"
+                type: array
+                items:
+                  $ref: "#/components/schemas/Source"
     post:
       operationId: createSource
       summary: Create a disabled source draft
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SourceDraft"
+              $ref: "#/components/schemas/CreateSourceRequest"
       responses:
         "201":
           description: Source draft created.
-          headers:
-            ETag:
-              schema:
-                type: string
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Source"
-        "400":
-          $ref: "#/components/responses/Problem"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /destinations:
+    get:
+      operationId: listDestinations
+      summary: List configured destinations
+      responses:
+        "200":
+          description: Destination collection.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Destination"
+    post:
+      operationId: createDestination
+      summary: Create a disabled destination draft
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDestinationRequest"
+      responses:
+        "201":
+          description: Destination draft created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Destination"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /routes/plan:
+    post:
+      operationId: planRoute
+      summary: Plan a route using a supported Phase 1 media path
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoutePlanRequest"
+      responses:
+        "200":
+          description: The compatible media path.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoutePlan"
+        "422":
+          $ref: "#/components/responses/ApiError"
   /routes:
     get:
       operationId: listRoutes
@@ -117,14 +170,6 @@ paths:
         "400":
           $ref: "#/components/responses/Problem"
 components:
-  parameters:
-    IdempotencyKey:
-      name: Idempotency-Key
-      in: header
-      required: false
-      schema:
-        type: string
-        maxLength: 255
   responses:
     Problem:
       description: Request or domain error.
@@ -132,6 +177,12 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+    ApiError:
+      description: Invalid request or catalog failure.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
   schemas:
     Liveness:
       type: object
@@ -185,42 +236,157 @@ components:
         linkSpeedBitsPerSecond:
           type: integer
           minimum: 0
-    SourceDraft:
+    CreateSourceRequest:
       type: object
-      required: [friendlyName, sourceType, configuration]
+      required: [friendlyName, profile]
       properties:
         friendlyName:
           type: string
           minLength: 1
-          maxLength: 200
+          maxLength: 120
+        profile:
+          $ref: "#/components/schemas/SourceMediaProfile"
+    CreateDestinationRequest:
+      type: object
+      required: [friendlyName, profile]
+      properties:
+        friendlyName:
+          type: string
+          minLength: 1
+          maxLength: 120
+        profile:
+          $ref: "#/components/schemas/DestinationMediaProfile"
+    Source:
+      type: object
+      required:
+        [id, friendlyName, sourceType, desiredState, currentRevision, revisionId, lifecycle, configuration]
+      properties:
+        id:
+          type: string
+          format: uuid
+        friendlyName:
+          type: string
         sourceType:
           type: string
+        desiredState:
+          type: string
+          const: disabled
+        currentRevision:
+          type: integer
+          minimum: 1
+        revisionId:
+          type: string
+          format: uuid
+        lifecycle:
+          type: string
+          const: draft
         configuration:
-          type: object
-          additionalProperties: true
-    Source:
-      allOf:
-        - $ref: "#/components/schemas/SourceDraft"
+          $ref: "#/components/schemas/SourceMediaProfile"
+    Destination:
+      type: object
+      required:
+        [id, friendlyName, destinationType, desiredState, currentRevision, revisionId, lifecycle, configuration]
+      properties:
+        id:
+          type: string
+          format: uuid
+        friendlyName:
+          type: string
+        destinationType:
+          type: string
+        desiredState:
+          type: string
+          const: disabled
+        currentRevision:
+          type: integer
+          minimum: 1
+        revisionId:
+          type: string
+          format: uuid
+        lifecycle:
+          type: string
+          const: draft
+        configuration:
+          $ref: "#/components/schemas/DestinationMediaProfile"
+    SourceMediaProfile:
+      oneOf:
         - type: object
-          required: [id, revision, desiredState]
+          required: [kind, device]
           properties:
-            id:
+            kind:
               type: string
-              format: uuid
-            revision:
+              const: alsa_l16
+            device:
+              type: string
+        - type: object
+          required: [kind, bindAddress, port]
+          properties:
+            kind:
+              type: string
+              const: rtp_mp2t
+            bindAddress:
+              type: string
+            port:
               type: integer
               minimum: 1
-            desiredState:
+              maximum: 65535
+    DestinationMediaProfile:
+      oneOf:
+        - type: object
+          required: [kind, address, port, payloadType]
+          properties:
+            kind:
               type: string
-              enum: [disabled, enabled]
-    SourceCollection:
+              const: rtp_l16
+            address:
+              type: string
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+            payloadType:
+              type: integer
+              minimum: 96
+              maximum: 127
+        - type: object
+          required: [kind, host, port, mode]
+          properties:
+            kind:
+              type: string
+              const: srt_mpeg_ts
+            host:
+              type: string
+            port:
+              type: integer
+              minimum: 1
+              maximum: 65535
+            mode:
+              type: string
+              enum: [caller, listener]
+    RoutePlanRequest:
       type: object
-      required: [items]
+      required: [source, destination]
       properties:
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/Source"
+        source:
+          $ref: "#/components/schemas/SourceMediaProfile"
+        destination:
+          $ref: "#/components/schemas/DestinationMediaProfile"
+    RoutePlan:
+      type: object
+      required: [mediaPath]
+      properties:
+        mediaPath:
+          type: string
+          enum: [alsa_l16_to_rtp_l16, rtp_mp2t_to_srt_mpeg_ts]
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [invalid_request, database_error, internal_error]
+        message:
+          type: string
     RouteProposal:
       type: object
       required: [sourceId, destinationId]

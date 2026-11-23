@@ -1,6 +1,6 @@
 # Risk Register
 
-**Status:** Draft for approval
+**Status:** Approved baseline; risks remain open as listed
 Likelihood/impact are preliminary qualitative ratings, not measured values.
 
 | ID | Risk | L/I | Mitigation / evidence required | Owner / gate |

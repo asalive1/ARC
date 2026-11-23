@@ -1,6 +1,7 @@
 # PostgreSQL Database ERD
 
-**Status:** Draft for approval
+**Status:** Approved architecture baseline; initial migration and SQLx runner
+validated; repository and upgrade/recovery coverage remains planned
 **Database:** PostgreSQL only; SQLx migrations are the schema-versioning
 mechanism. SQLite and a multi-database abstraction are out of scope.
 
@@ -188,7 +189,11 @@ erDiagram
   additional normalized tables based on reviewed retention and ownership
   decisions; see [open questions](open-questions.md).
 
-Migrations must add indexes for foreign keys, resource/revision lookups,
+The Phase 0 migration scaffold is in `database/migrations/0001_initial.sql`;
+it has been applied to PostgreSQL 16, including current-revision foreign keys
+and route cardinality validation; the SQLx migrator test also passes against a
+disposable PostgreSQL 16 database. Upgrade/recovery paths still require
+integration tests. Migrations must add indexes for foreign keys, resource/revision lookups,
 operation state, lease expiry, and idempotency uniqueness; use transactions and
 test both clean installation and upgrade paths. JSONB is for adapter-specific
 configuration, not core relational invariants.

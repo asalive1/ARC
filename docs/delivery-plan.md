@@ -1,12 +1,12 @@
 # Delivery Plan and Git Strategy
 
-**Status:** Proposed; all phases are unstarted and subject to approval.
+**Status:** Phase 0 in progress; Phases 1-6 are unstarted.
 
 ## Phase gates
 
 | Phase | Deliverable scope | Exit evidence |
 |---|---|---|
-| 0 - Architecture and contracts | Approve architecture; decide blockers; define workspace/crate boundaries, PostgreSQL schema/migrations, OpenAPI skeleton, media/worker protocols, capability model, synthetic fixtures, CI and deployment scaffolding | Approved documents; versioned contracts; clean DB migration; test harness; Compose topology; license/target inventory |
+| 0 - Architecture and contracts | Approve architecture; decide blockers; define workspace/crate boundaries, PostgreSQL schema/migrations, OpenAPI skeleton, media/worker protocols, capability model, synthetic fixtures, CI and deployment scaffolding | Approved documents; versioned contracts; clean DB migration; test harness; Compose topology; license/target inventory. Seven Rust tests, one SQLx/PostgreSQL 16 migration test, three UI tests/build, OpenAPI validation, schema/constraint checks, and npm audit pass. Compose topology, license/target inventory, and phase exit review remain incomplete. |
 | 1 - Stateful audio slice | PostgreSQL; API/UI; source/destination lifecycle; generic RTP source; RTP and null/test destinations; one route; local worker registration, scheduler/assignment, health/events and restart recovery | API/UI/E2E RTP route; worker placement/drain/recovery tests; Docker validation and demo |
 | 2 - Zephyr Connect | Same-port audio/GPIO demux; parser, bounded ADTS reassembly, AAC decode, baseline/state, API/UI profile, simulator and fixtures | Five-channel synthetic suite/soak; live sender; real output; timing evidence; mock plus native plugin path as available |
 | 3 - Routing expansion | Virtualized 64x64 matrix; fan-out; replace; multi-route operations; presets/salvos; take/immediate; locks, concurrency, undo/rollback | UI/API multi-route demos, failure/rollback/concurrency tests, restart recovery |

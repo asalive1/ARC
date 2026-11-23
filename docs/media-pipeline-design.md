@@ -1,6 +1,6 @@
 # Media Pipeline Design
 
-**Status:** Draft for approval
+**Status:** Approved architecture baseline
 
 ## Abstraction boundary
 

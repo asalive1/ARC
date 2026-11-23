@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/arc-domain",
+    "crates/arc-application",
+    "crates/arc-infrastructure",
+    "crates/arc-api",
+    "crates/arc-worker",
+    "crates/arc-shared",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["serde", "v4"] }

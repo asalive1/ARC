@@ -1,20 +1,20 @@
 # Requirements Traceability Matrix
 
-**Status:** Design baseline only. No requirements in this matrix are implemented.
-Module names and endpoints are proposed contract locations.
+**Status:** Updated during Phase 0. Scaffold-only rows are called out explicitly;
+runtime acceptance requirements remain unimplemented.
 
 | ID | Mandatory requirement | Domain / application module | API contract | UI surface | Test case | Acceptance demonstration | Status |
 |---|---|---|---|---|---|---|---|
-| T01 | Four layers; control/media separation | `domain`, `application`, `infrastructure`, `presentation` | N/A | N/A | Dependency-boundary/architecture test | API and worker operate as distinct services | Not implemented |
-| T02 | PostgreSQL only; SQLx migrations | Repository adapter / schema | `/system`, health | System status | Clean install, upgrade, restart | Desired state restored from PostgreSQL | Not implemented |
+| T01 | Four layers; control/media separation | `domain`, `application`, `infrastructure`, `presentation` | N/A | N/A | Dependency-boundary/architecture test | API and worker operate as distinct services | Workspace crate boundaries scaffolded and compile-tested; no architecture test |
+| T02 | PostgreSQL only; SQLx migrations | Repository adapter / schema | `/system`, health | System status | Clean install, upgrade, restart | Desired state restored from PostgreSQL | Migration, constraints, and SQLx runner validated on PostgreSQL 16; upgrade/recovery tests pending |
 | T03 | Durable source/destination revisions | Source and destination services | `/sources`, `/destinations`, revision actions | Endpoint editors | Revision, ETag, rollback tests | Configure and reactivate endpoint | Not implemented |
 | T04 | Explicit network-interface inventory/selection | Worker network inventory | `GET /network/interfaces` | Interface selectors | Discovery, invalid/stale ID, multicast tests | Bind media to selected host interface | Not implemented |
-| T05 | Worker abstraction and local registration | Worker registry | Worker service contract; `/workers` | Worker status | Registration/heartbeat/capability tests | Pipeline assigned through local scheduler | Not implemented |
-| T06 | Capability- and capacity-aware placement | Placement/admission services | `/workers`, operation result | Placement/waiting details | Compatible/incompatible/waiting tests | Structured placement or waiting result | Not implemented |
+| T05 | Worker abstraction and local registration | Worker registry | Worker service contract; `/workers` | Worker status | Registration/heartbeat/capability tests | Pipeline assigned through local scheduler | Worker types and registry port scaffolded |
+| T06 | Capability- and capacity-aware placement | Placement/admission services | `/workers`, operation result | Placement/waiting details | Compatible/incompatible/waiting tests | Structured placement or waiting result | Capability rejection model and focused unit tests pass; scheduler not implemented |
 | T07 | Assignment generations and reconciliation | Assignment/reconciler | `/operations`, worker protocol | Operation/route status | Stale generation, worker-loss recovery | Rebuild desired pipeline after worker restart | Not implemented |
 | T08 | Drain and safe-to-stop lifecycle | Worker lifecycle | Worker drain operation | Worker drain panel | Reject assignments during drain; remaining assignment blocks stop | Local worker drain demo | Not implemented |
 | T09 | Generic RTP source to RTP destination and null sink | Source/destination adapters, route service | `/sources`, `/destinations`, `/routes` | Endpoint editor and route view | RTP integration/media tests | Phase 1 RTP end-to-end slice | Not implemented |
-| T10 | GStreamer behind framework-neutral interfaces | Media adapters | `/capabilities` | Capability/format display | Compile/dependency boundary; adapter tests | Swap/select compatible adapter without domain changes | Not implemented |
+| T10 | GStreamer behind framework-neutral interfaces | Media adapters | `/capabilities` | Capability/format display | Compile/dependency boundary; adapter tests | Swap/select compatible adapter without domain changes | Framework-neutral ports scaffolded; no GStreamer adapter |
 | T11 | Per-pipeline failure isolation and fan-out | Pipeline manager/route service | Route operations/statistics | Crosspoint grid/health | Failed/slow branch does not block sibling | One source to multiple destinations | Not implemented |
 | T12 | Desired/observed route state, revisions, replace | Routing domain/application | `/routes`, ETag/If-Match | Crosspoint grid/detail | Revision conflict, replacement, recovery | Route change and post-restart reconciliation | Not implemented |
 | T13 | Best-effort and atomic multi-route operations/rollback | Operation manager | `/operations`, route batch actions | Batch progress/result | Partial failure and compensation | Batch apply, inspect, rollback | Not implemented |
@@ -26,7 +26,7 @@ Module names and endpoints are proposed contract locations.
 | T19 | Normalized signals, mappings, SCTE-35 support | Signal engine | `/signals`, `/mappings` | Signal/mapping editor | Parser/mapping and timing tests | Signal mapped to output action | Not implemented |
 | T20 | Device Server separate plugin, versioned protocol | Plugin adapter/protocol crate | Device connection/config API | Device integration status | Auth/version/reconnect/state snapshot | Native plugin receives GPIO/crosspoint action | Not implemented |
 | T21 | Automation listener separate from media/API | Automation command service | Listener protocol plus REST | Listener configuration/status | API-key/IP/rate/audit tests | Automation route/GPO command demo | Not implemented |
-| T22 | REST OpenAPI 3.1, revisions, idempotency, operations | API/application | `/api/v1/*` | UI uses same services | Contract, retry, ETag, problem tests | OpenAPI docs and API workflow | Not implemented |
+| T22 | REST OpenAPI 3.1, revisions, idempotency, operations | API/application | `/api/v1/*` | UI uses same services | Contract, retry, ETag, problem tests | OpenAPI docs and API workflow | OpenAPI skeleton validates; liveness/capability route tests pass; remaining contract unimplemented |
 | T23 | Read-only WebSocket events, snapshot/replay | Event application/adapter | `GET /bootstrap`, `WS /events` | Live matrix/health updates | Reconnect, replay, dedupe, snapshot tests | Reconnect UI without stale state | Not implemented |
 | T24 | Auth, scopes, secret references, audit | Security/application | Auth/key/secret/audit endpoints | Login/admin/security panels | Unauthorized, redaction, key revoke tests | Authorized operation with audit record | Not implemented |
 | T25 | OpenTelemetry, structured logs, metrics, tracing, health | Observability adapters | Health/metrics endpoints | Health dashboard | Span/log/metric smoke tests | Follow operation across API and worker | Not implemented |

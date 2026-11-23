@@ -1,6 +1,6 @@
 # Component Design
 
-**Status:** Draft for approval
+**Status:** Approved architecture baseline
 
 ## Component map
 

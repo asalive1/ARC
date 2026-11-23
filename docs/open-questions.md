@@ -6,7 +6,7 @@ not necessarily before all documentation can be reviewed.
 | ID | Question / decision needed | Why it matters | Blocking gate |
 |---|---|---|---|
 | Q1 | Approve V6's Phase 1 generic RTP->RTP/null slice, or retain the invoked prompt's ALSA/RTP->RTP/SRT demo? Confirm when Zephyr enters the acceptance sequence. | Changes scope, adapter order, and the first end-to-end demonstration. | **Blocking: implementation/Phase 1 baseline** |
-| Q2 | Does the explicit approval-before-code gate in the invoked prompt control over V6's "continue implementation" wording after document generation? | Conflicting execution instructions. This package conservatively stops at the approval gate. | **Blocking: implementation authorization** |
+| Q2 | Resolved: user approved the architecture package and Phase 0 implementation on 2026-11-22. | The invoked prompt's approval gate has been satisfied for Phase 0; later phases still require their normal gates. | Resolved for Phase 0 |
 | Q3 | Provide/confirm audio and GPIO SSRC pairs for each of the five Zephyr channels. | V6 forbids assuming channel 1 identity applies to other channels. | **Blocking: live Zephyr acceptance** |
 | Q4 | Provide actual Zephyr sender IP/source-port, interface/VLAN, port/channel inventory, and live test schedule. | Needed for exact sender validation and end-to-end acceptance. | **Blocking: live Zephyr acceptance** |
 | Q5 | Which real network destination is the final Zephyr demo target: RTP (default), SRT MPEG-TS, or UDP MPEG-TS? | Required real output and test environment. | **Blocking: integrated acceptance** |

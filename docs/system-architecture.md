@@ -1,6 +1,6 @@
 # ARC System Architecture
 
-**Status:** Draft for approval
+**Status:** Approved baseline; Phase 0 implementation in progress
 **Date:** 2026-11-22
 **Scope:** Production-oriented POC architecture; no production code is authorized
 by this document.
@@ -167,9 +167,12 @@ operation events. Avoid secrets and high-cardinality identifiers in metric
 labels. Expose stable semantics for worker capacity, queue pressure, unplaced
 pipelines, assignment counts, draining, and heartbeat age.
 
-## 10. Approval gate and implementation status
+## 10. Implementation status
 
-All required documents in [the architecture package](ARCHITECTURE.md) are
-proposals. No application source, migrations, UI, Docker deployment, or API
-implementation has been created. Obtain review/approval of the architecture
-package and resolve blocking questions before implementation begins.
+The architecture package in [the index](ARCHITECTURE.md) was approved before
+implementation began. Phase 0 scaffolds the Rust workspace, API liveness service, foundational
+PostgreSQL schema, OpenAPI contract, media/worker ports, synthetic fixture area,
+and React UI health shell. Runtime media adapters, reconciliation,
+endpoint/routing UI, Docker deployment, and production authentication remain
+unimplemented; phase exit requires the validation and blocking decisions in
+the delivery plan and open-questions register.

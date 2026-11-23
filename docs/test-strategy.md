@@ -1,6 +1,8 @@
 # Test Strategy
 
-**Status:** Draft for approval; tests are planned, not currently implemented.
+**Status:** Approved strategy; seven Rust tests, one explicit PostgreSQL 16
+SQLx migration test, and three UI tests pass. Full integration and acceptance
+coverage remains planned.
 
 ## Test levels
 
@@ -50,7 +52,9 @@ identity-change scenarios where test infrastructure allows. It is test tooling,
 not an authority for unconfirmed provider behavior.
 
 Use disposable PostgreSQL instances matching supported major versions for
-migration-upgrade, repository constraints, rollback, and persistence tests.
+migration-upgrade, repository constraints, rollback, and persistence tests. The
+ignored SQLx migration test is run explicitly with `DATABASE_URL` pointed at a
+disposable empty database; it has been run successfully against PostgreSQL 16.
 Exercise API idempotency and `If-Match` conflicts and verify UI uses the same
 domain rules as external clients.
 

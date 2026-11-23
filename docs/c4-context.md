@@ -1,6 +1,6 @@
 # C4 Context - ARC
 
-**Status:** Draft for approval
+**Status:** Approved architecture baseline
 
 ```mermaid
 flowchart LR

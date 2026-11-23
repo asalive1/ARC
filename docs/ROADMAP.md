@@ -1,7 +1,7 @@
 # ARC Product Roadmap
 
-This roadmap is a proposal pending approval of the architecture package. It
-replaces the project-template roadmap; no product phase is implemented yet.
+Phase 0 is in progress following architecture approval. This roadmap replaces
+the project-template roadmap; no product phase is complete yet.
 
 See [the delivery plan](delivery-plan.md) for phase scope, gates, validation,
 and release workflow.

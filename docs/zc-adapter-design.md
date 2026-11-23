@@ -1,6 +1,6 @@
 # Zephyr Connect RTP Adapter Design
 
-**Status:** Draft for approval; protocol profile values follow Master Prompt V6
+**Status:** Approved architecture baseline; protocol profile values follow Master Prompt V6
 and must not be generalized to unverified provider variants.
 
 ## Adapter boundary

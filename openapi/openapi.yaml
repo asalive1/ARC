@@ -1,0 +1,290 @@
+openapi: 3.1.0
+info:
+  title: ARC API
+  version: 1.0.0
+  description: Initial contract skeleton for the ARC Phase 0 foundation.
+servers:
+  - url: /api/v1
+paths:
+  /health/live:
+    get:
+      operationId: getLiveness
+      summary: Check whether the API process is alive
+      responses:
+        "200":
+          description: The API process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Liveness"
+  /system/capabilities:
+    get:
+      operationId: getSystemCapabilities
+      summary: Read API and registered worker capabilities
+      responses:
+        "200":
+          description: Capability snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Capabilities"
+  /network/interfaces:
+    get:
+      operationId: listNetworkInterfaces
+      summary: List interfaces discovered by registered workers
+      responses:
+        "200":
+          description: Discovered interface inventory.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/NetworkInterface"
+  /sources:
+    get:
+      operationId: listSources
+      summary: List configured sources
+      responses:
+        "200":
+          description: Source collection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceCollection"
+    post:
+      operationId: createSource
+      summary: Create a disabled source draft
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceDraft"
+      responses:
+        "201":
+          description: Source draft created.
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Source"
+        "400":
+          $ref: "#/components/responses/Problem"
+  /routes:
+    get:
+      operationId: listRoutes
+      summary: List desired and observed route state
+      responses:
+        "200":
+          description: Route collection.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Route"
+  /routes/validate:
+    post:
+      operationId: validateRoute
+      summary: Validate a proposed route without applying it
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RouteProposal"
+      responses:
+        "200":
+          description: Validation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationResult"
+        "400":
+          $ref: "#/components/responses/Problem"
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 255
+  responses:
+    Problem:
+      description: Request or domain error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    Liveness:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: alive
+    Capabilities:
+      type: object
+      required: [apiVersion, workers]
+      properties:
+        apiVersion:
+          type: string
+        workers:
+          type: array
+          items:
+            type: object
+            required: [workerId, state, capabilities]
+            properties:
+              workerId:
+                type: string
+                format: uuid
+              state:
+                type: string
+              capabilities:
+                type: object
+                additionalProperties: true
+    NetworkInterface:
+      type: object
+      required: [stableId, name, addresses, linkUp, administrativeUp, multicastCapable]
+      properties:
+        stableId:
+          type: string
+        name:
+          type: string
+        addresses:
+          type: array
+          items:
+            type: string
+            format: ip-address
+        mtu:
+          type: integer
+          minimum: 1
+        linkUp:
+          type: boolean
+        administrativeUp:
+          type: boolean
+        multicastCapable:
+          type: boolean
+        linkSpeedBitsPerSecond:
+          type: integer
+          minimum: 0
+    SourceDraft:
+      type: object
+      required: [friendlyName, sourceType, configuration]
+      properties:
+        friendlyName:
+          type: string
+          minLength: 1
+          maxLength: 200
+        sourceType:
+          type: string
+        configuration:
+          type: object
+          additionalProperties: true
+    Source:
+      allOf:
+        - $ref: "#/components/schemas/SourceDraft"
+        - type: object
+          required: [id, revision, desiredState]
+          properties:
+            id:
+              type: string
+              format: uuid
+            revision:
+              type: integer
+              minimum: 1
+            desiredState:
+              type: string
+              enum: [disabled, enabled]
+    SourceCollection:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Source"
+    RouteProposal:
+      type: object
+      required: [sourceId, destinationId]
+      properties:
+        sourceId:
+          type: string
+          format: uuid
+        destinationId:
+          type: string
+          format: uuid
+        expectedRouteRevision:
+          type: integer
+          minimum: 0
+    Route:
+      type: object
+      required: [destinationId, desiredState, observedState, revision]
+      properties:
+        destinationId:
+          type: string
+          format: uuid
+        sourceId:
+          type: string
+          format: uuid
+        desiredState:
+          type: string
+        observedState:
+          type: string
+        revision:
+          type: integer
+          minimum: 0
+    ValidationResult:
+      type: object
+      required: [valid, errors, warnings]
+      properties:
+        valid:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: string
+        warnings:
+          type: array
+          items:
+            type: string
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        arcCode:
+          type: string
+        correlationId:
+          type: string
+          format: uuid

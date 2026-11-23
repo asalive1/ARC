@@ -1,6 +1,6 @@
 # Security Model
 
-**Status:** Draft for approval; threat model and implementation details require
+**Status:** Approved architecture baseline; threat model and implementation details require
 security review before deployment.
 
 ## Trust boundaries and controls

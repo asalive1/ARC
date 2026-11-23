@@ -1,6 +1,6 @@
 # Assumptions Register
 
-**Status:** Draft for approval. Items marked provisional require confirmation
+**Status:** Approved baseline. Items marked provisional require confirmation
 or validation; none should be silently converted into a product guarantee.
 
 | ID | Assumption | Basis / status | Consequence if false |

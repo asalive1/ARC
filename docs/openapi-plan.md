@@ -1,6 +1,6 @@
 # OpenAPI 3.1 Design Plan
 
-**Status:** Draft for approval
+**Status:** Approved architecture baseline; contract scaffold in progress
 **Base path:** `/api/v1`
 **Wire format:** JSON; OpenAPI 3.1 is the authoritative HTTP contract.
 
@@ -41,8 +41,9 @@
 | Backup/restore | Create/export and restore as asynchronous, auditable operations |
 | Licensing | Status/capability response and administration where enabled; details remain subject to product decision |
 
-Specific paths are proposals; generate and validate the full OpenAPI document
-before implementation. Zephyr APIs must support disabled draft, validation,
+Specific paths are proposals. `openapi/openapi.yaml` is a Phase 0 skeleton, not
+the full API contract; expand and validate it before implementing those
+operations. Zephyr APIs must support disabled draft, validation,
 socket probe, revision apply, lifecycle, detected sender/identities/format,
 GPIO mask/pin state, heartbeat/continuity, recent transitions, and sanitized
 diagnostics.

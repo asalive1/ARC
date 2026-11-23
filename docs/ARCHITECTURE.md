@@ -1,6 +1,6 @@
 # Architecture Review Package
 
-**Status:** Design proposal; implementation is gated on approval.
+**Status:** Approved for Phase 0; implementation is in progress.
 
 The architecture is documented across the following required pre-code
 deliverables:
@@ -20,5 +20,5 @@ deliverables:
 - [Requirements traceability](traceability-matrix.md)
 
 The source-of-truth hierarchy and material conflicts are recorded in the system
-architecture and open-questions documents. This package is not an implementation
-or an approval to begin coding.
+architecture and open-questions documents. Implementation status is tracked in
+the delivery plan and traceability matrix.

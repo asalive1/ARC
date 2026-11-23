@@ -1,6 +1,6 @@
 # C4 Containers - ARC POC
 
-**Status:** Draft for approval
+**Status:** Approved architecture baseline
 
 ```mermaid
 flowchart TB

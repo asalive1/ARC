@@ -1,0 +1,13 @@
+[package]
+name = "arc-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-application = { path = "../arc-application" }
+arc-domain = { path = "../arc-domain" }
+arc-shared = { path = "../arc-shared" }
+chrono.workspace = true
+serde.workspace = true
+uuid.workspace = true

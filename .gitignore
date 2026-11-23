@@ -1,0 +1,7 @@
+/target/
+**/target/
+ui/node_modules/
+ui/dist/
+.env
+.env.*
+!.env.example

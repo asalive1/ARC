@@ -26,18 +26,25 @@ import {
 } from "@mui/material";
 
 import {
+  ApiRequestError,
+  cancelAssignment as cancelAssignmentRequest,
   createDestination as createDestinationRequest,
   createSource as createSourceRequest,
   fetchDestinations,
   fetchLiveness,
+  fetchPipelineAssignment,
   fetchSources,
   planRoute,
+  planRouteAssignment,
+  startAssignment as startAssignmentRequest,
+  stopAssignment as stopAssignmentRequest,
   updateDestination as updateDestinationRequest,
   updateSource as updateSourceRequest,
   validateDestination,
   validateSource,
   type DestinationMediaProfile,
   type DestinationRecord,
+  type PlanRouteAssignmentInput,
   type RoutePlan,
   type SourceMediaProfile,
   type SourceRecord,
@@ -71,6 +78,21 @@ const sectionDescriptions: Record<Section, string> = {
   admin: "Workspace appearance and service status.",
 };
 
+function createPipelineId(): string {
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join("-");
+}
+
 export function App() {
   const queryClient = useQueryClient();
   const [section, setSection] = useState<Section>("workspace");
@@ -99,6 +121,8 @@ export function App() {
     useState<"caller" | "listener">("caller");
   const [sourceId, setSourceId] = useState("");
   const [destinationId, setDestinationId] = useState("");
+  const [assignmentRequest, setAssignmentRequest] =
+    useState<PlanRouteAssignmentInput>();
 
   const theme = useMemo(
     () =>
@@ -616,6 +640,8 @@ export function App() {
                   destinations={destinations.data ?? []}
                   selectedSourceId={selectedSource?.id ?? ""}
                   selectedDestinationId={selectedDestination?.id ?? ""}
+                  assignmentRequest={assignmentRequest}
+                  onAssignmentRequestChange={setAssignmentRequest}
                   onSourceChange={setSourceId}
                   onDestinationChange={setDestinationId}
                   onPlan={submitRoutePlan}
@@ -751,7 +777,7 @@ export function App() {
           >
             <Typography variant="caption">ARC · Phase 1 preview</Typography>
             <Typography variant="caption">
-              Local development · Media execution not active
+              Assignment media status is shown in the workspace
             </Typography>
           </Box>
         </Box>
@@ -812,6 +838,8 @@ function WorkspaceView({
   destinations,
   selectedSourceId,
   selectedDestinationId,
+  assignmentRequest,
+  onAssignmentRequestChange,
   onSourceChange,
   onDestinationChange,
   onPlan,
@@ -823,6 +851,10 @@ function WorkspaceView({
   destinations: DestinationRecord[];
   selectedSourceId: string;
   selectedDestinationId: string;
+  assignmentRequest: PlanRouteAssignmentInput | undefined;
+  onAssignmentRequestChange: (
+    request: PlanRouteAssignmentInput | undefined,
+  ) => void;
   onSourceChange: (id: string) => void;
   onDestinationChange: (id: string) => void;
   onPlan: (event: FormEvent<HTMLFormElement>) => void;
@@ -838,12 +870,205 @@ function WorkspaceView({
   const selectedDestination = destinations.find(
     (destination) => destination.id === selectedDestinationId,
   );
+  const queryClient = useQueryClient();
+  const activePipelineId = assignmentRequest?.pipelineId;
   const resultMatchesSelection =
     selectedSource !== undefined &&
     selectedDestination !== undefined &&
     routePlan.variables !== undefined &&
     JSON.stringify(routePlan.variables.source) === JSON.stringify(selectedSource.configuration) &&
     JSON.stringify(routePlan.variables.destination) === JSON.stringify(selectedDestination.configuration);
+  const assignmentPlan = useMutation({
+    mutationFn: (input: PlanRouteAssignmentInput) =>
+      planRouteAssignment(input, apiBaseUrl),
+    onSuccess: (result, input) =>
+      onAssignmentRequestChange(result.assignment ? input : undefined),
+  });
+  const pipelineAssignment = useQuery({
+    queryKey: ["pipeline-assignment", activePipelineId],
+    queryFn: () => {
+      if (!activePipelineId) {
+        throw new Error("Pipeline ID is required to fetch an assignment");
+      }
+      return fetchPipelineAssignment(activePipelineId, apiBaseUrl);
+    },
+    enabled:
+      activePipelineId !== undefined &&
+      !assignmentPlan.isPending &&
+      (assignmentPlan.isIdle ||
+        assignmentPlan.isError ||
+        assignmentPlan.data?.assignment != null),
+    refetchInterval: (query) =>
+      query.state.data?.observedState === "starting" ||
+      query.state.data?.observedState === "stopping"
+        ? 1500
+        : false,
+  });
+  const start = useMutation({
+    mutationFn: (input: {
+      pipelineId: string;
+      assignmentId: string;
+      generation: number;
+    }) =>
+      startAssignmentRequest(input.assignmentId, input.generation, apiBaseUrl),
+    onSuccess: async (snapshot, input) => {
+      queryClient.setQueryData(
+        ["pipeline-assignment", input.pipelineId],
+        snapshot,
+      );
+      await invalidateResourceRecords();
+    },
+    onError: async (_error, input) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["pipeline-assignment", input.pipelineId],
+        }),
+        invalidateResourceRecords(),
+      ]);
+    },
+  });
+  const stop = useMutation({
+    mutationFn: (input: {
+      pipelineId: string;
+      assignmentId: string;
+      generation: number;
+    }) =>
+      stopAssignmentRequest(input.assignmentId, input.generation, apiBaseUrl),
+    onSuccess: async (snapshot, input) => {
+      queryClient.setQueryData(
+        ["pipeline-assignment", input.pipelineId],
+        snapshot,
+      );
+      await invalidateResourceRecords();
+    },
+    onError: async (_error, input) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["pipeline-assignment", input.pipelineId],
+        }),
+        invalidateResourceRecords(),
+      ]);
+    },
+  });
+  const cancel = useMutation({
+    mutationFn: (input: {
+      pipelineId: string;
+      assignmentId: string;
+      generation: number;
+    }) =>
+      cancelAssignmentRequest(
+        input.assignmentId,
+        input.generation,
+        apiBaseUrl,
+      ),
+    onSuccess: async (_result, input) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["pipeline-assignment", input.pipelineId],
+        }),
+        invalidateResourceRecords(),
+      ]);
+    },
+    onError: async (_error, input) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["pipeline-assignment", input.pipelineId],
+        }),
+        invalidateResourceRecords(),
+      ]);
+    },
+  });
+  const assignmentVariables =
+    assignmentPlan.variables ?? assignmentRequest;
+  const assignmentPlanMatchesSelection =
+    selectedSource !== undefined &&
+    selectedDestination !== undefined &&
+    assignmentVariables !== undefined &&
+    assignmentVariables.sourceId === selectedSource.id &&
+    assignmentVariables.sourceRevision === selectedSource.currentRevision &&
+    assignmentVariables.destinationId === selectedDestination.id &&
+    assignmentVariables.destinationRevision ===
+      selectedDestination.currentRevision;
+  const assignmentPlanResult = assignmentPlanMatchesSelection
+    ? assignmentPlan.data
+    : undefined;
+  const currentAssignment =
+    activePipelineId !== undefined &&
+    pipelineAssignment.data?.assignment.pipelineId === activePipelineId
+      ? pipelineAssignment.data
+      : undefined;
+  const currentAssignmentIsTerminal =
+    currentAssignment !== undefined &&
+    ((currentAssignment.desiredState === "stopped" &&
+      currentAssignment.observedState === "stopped") ||
+      (currentAssignment.desiredState === "cancelled" &&
+        currentAssignment.observedState === "cancelled"));
+  const assignmentNotFound =
+    pipelineAssignment.error instanceof ApiRequestError &&
+    pipelineAssignment.error.status === 404;
+  const assignmentStatusUnknown =
+    activePipelineId !== undefined &&
+    pipelineAssignment.isError &&
+    !assignmentNotFound &&
+    assignmentPlan.data?.state !== "unavailable";
+  const canCreateAssignment =
+    selectedSource?.lifecycle === "validated" &&
+    selectedDestination?.lifecycle === "validated" &&
+    !assignmentPlan.isPending &&
+    (activePipelineId === undefined ||
+      assignmentPlan.data?.state === "unavailable" ||
+      !pipelineAssignment.isFetching) &&
+    !assignmentStatusUnknown &&
+    (!currentAssignment || currentAssignmentIsTerminal) &&
+    (assignmentPlanResult?.assignment == null ||
+      currentAssignmentIsTerminal);
+
+  const lifecycleActionPending =
+    start.isPending || stop.isPending || cancel.isPending;
+
+  async function invalidateResourceRecords() {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["sources"] }),
+      queryClient.invalidateQueries({ queryKey: ["destinations"] }),
+    ]);
+  }
+
+  function submitAssignment() {
+    if (
+      !selectedSource ||
+      !selectedDestination ||
+      selectedSource.lifecycle !== "validated" ||
+      selectedDestination.lifecycle !== "validated"
+    ) {
+      return;
+    }
+
+    const previousAttempt =
+      assignmentPlan.variables ?? assignmentRequest;
+    const retryingSamePlan =
+      !currentAssignmentIsTerminal &&
+      previousAttempt?.sourceId === selectedSource.id &&
+      previousAttempt.sourceRevision === selectedSource.currentRevision &&
+      previousAttempt.destinationId === selectedDestination.id &&
+      previousAttempt.destinationRevision ===
+        selectedDestination.currentRevision;
+    const pipelineId = retryingSamePlan && previousAttempt
+      ? previousAttempt.pipelineId
+      : createPipelineId();
+    const idempotencyKey = retryingSamePlan && previousAttempt
+      ? previousAttempt.idempotencyKey
+      : createPipelineId();
+    const input = {
+      pipelineId,
+      idempotencyKey,
+      sourceId: selectedSource.id,
+      sourceRevision: selectedSource.currentRevision,
+      destinationId: selectedDestination.id,
+      destinationRevision: selectedDestination.currentRevision,
+    };
+    onAssignmentRequestChange(input);
+    assignmentPlan.mutate(input);
+  }
 
   return (
     <Stack spacing={2.5}>
@@ -868,11 +1093,11 @@ function WorkspaceView({
               />
             </Stack>
             <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-              Crosspoint routing will be available when route activation and
-              worker execution are implemented.
+            The multi-route crosspoint editor remains planned. Create and
+            manage a single validated assignment below.
             </Typography>
           </Box>
-          <Chip label="Inactive · no routes applied" size="small" />
+          <Chip label="Matrix editor planned" size="small" />
         </Stack>
         <Box
           role="img"
@@ -1027,6 +1252,224 @@ function WorkspaceView({
           </Stack>
         </CardContent>
       </Card>
+
+      <Card>
+        <CardContent>
+          <Stack spacing={2}>
+            <Box>
+              <Typography variant="h6" component="h2">
+                Worker assignment
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Reserve capacity for the selected validated input and output,
+                then Start or Stop it; unstarted assignments can be cancelled.
+                Planning alone does not start media.
+              </Typography>
+            </Box>
+            {(selectedSource?.lifecycle !== "validated" ||
+              selectedDestination?.lifecycle !== "validated") && (
+              <Alert severity="info">
+                Validate the selected input and output before assigning a
+                worker.
+              </Alert>
+            )}
+            {selectedSource && selectedDestination && (
+              <Button
+                variant="contained"
+                onClick={submitAssignment}
+                disabled={!canCreateAssignment}
+              >
+                {assignmentPlan.isPending
+                  ? "Assigning…"
+                  : assignmentPlanResult?.state === "unavailable"
+                    ? "Retry worker assignment"
+                    : "Reserve worker and plan"}
+              </Button>
+            )}
+            {assignmentPlan.isError && assignmentPlanMatchesSelection && (
+              <Alert
+                severity="error"
+                action={
+                  <Button
+                    color="inherit"
+                    size="small"
+                    onClick={() => void pipelineAssignment.refetch()}
+                  >
+                    Check status
+                  </Button>
+                }
+              >
+                Assignment request failed: {assignmentPlan.error.message}.{" "}
+                {currentAssignment
+                  ? "A persisted assignment was found and loaded."
+                  : "The same pipeline ID is being checked for a committed assignment."}
+                {pipelineAssignment.isError
+                  ? ` Lookup failed: ${pipelineAssignment.error.message}`
+                  : ""}
+              </Alert>
+            )}
+            {assignmentPlanResult?.state === "unavailable" && (
+              <Alert severity="warning">
+                No eligible worker could be assigned.
+                {assignmentPlanResult.rejections.length > 0
+                  ? ` ${assignmentPlanResult.rejections
+                      .map(
+                        (rejection) =>
+                          `${rejection.workerId}: ${rejection.reason}`,
+                      )
+                      .join("; ")}`
+                  : " Check worker readiness and available capacity before retrying."}
+              </Alert>
+            )}
+            {activePipelineId !== undefined &&
+              pipelineAssignment.isError &&
+              !assignmentPlan.isError &&
+              assignmentPlanResult?.assignment == null && (
+                <Alert
+                  severity={assignmentStatusUnknown ? "error" : "info"}
+                  action={
+                    <Button
+                      color="inherit"
+                      size="small"
+                      onClick={() => void pipelineAssignment.refetch()}
+                    >
+                      Check status
+                    </Button>
+                  }
+                >
+                  Could not confirm pipeline {activePipelineId}:{" "}
+                  {pipelineAssignment.error.message}.{" "}
+                  {assignmentStatusUnknown
+                    ? "New assignments are blocked until status is confirmed."
+                    : "Check status; if no assignment exists, retry using this pipeline ID."}
+                </Alert>
+              )}
+            {assignmentPlanResult?.assignment && !currentAssignment && (
+              <Alert
+                severity={
+                  pipelineAssignment.isError ? "error" : "info"
+                }
+              >
+                {pipelineAssignment.isError
+                  ? `Could not read assignment status: ${pipelineAssignment.error.message}`
+                  : "Assignment created; loading its current status…"}
+              </Alert>
+            )}
+            {currentAssignment && (
+              <Stack spacing={1.5}>
+                {!assignmentPlanMatchesSelection && (
+                  <Alert severity="info">
+                    This assignment uses its pinned route revisions, which
+                    differ from the currently selected profiles. Stop it before
+                    creating another assignment.
+                  </Alert>
+                )}
+                <Alert
+                  severity={
+                    currentAssignment.observedState === "running"
+                      ? "success"
+                      : currentAssignment.observedState === "failed"
+                        ? "error"
+                        : "info"
+                  }
+                >
+                  Assignment {currentAssignment.assignment.id} · generation{" "}
+                  {currentAssignment.assignment.generation} · worker{" "}
+                  {currentAssignment.assignment.workerId}
+                  <br />
+                  Desired: {currentAssignment.desiredState} · Observed:{" "}
+                  {currentAssignment.observedState}
+                </Alert>
+                {pipelineAssignment.isError && (
+                  <Alert severity="error">
+                    Assignment refresh failed: {pipelineAssignment.error.message}
+                  </Alert>
+                )}
+                {start.isError &&
+                  start.variables?.pipelineId === activePipelineId && (
+                    <Alert severity="error">
+                      Start request failed: {start.error.message}. The displayed
+                      state is refreshed before retrying.
+                    </Alert>
+                  )}
+                {stop.isError &&
+                  stop.variables?.pipelineId === activePipelineId && (
+                    <Alert severity="error">
+                      Stop request failed: {stop.error.message}. Capacity remains
+                      reserved until the worker acknowledges Stop.
+                    </Alert>
+                  )}
+                {cancel.isError &&
+                  cancel.variables?.pipelineId === activePipelineId && (
+                    <Alert severity="error">
+                      Cancel request failed: {cancel.error.message}.
+                    </Alert>
+                  )}
+                <Stack direction="row" spacing={1}>
+                  {(currentAssignment.desiredState === "planned" ||
+                    (currentAssignment.desiredState === "running" &&
+                      currentAssignment.observedState === "starting")) && (
+                    <Button
+                      variant="contained"
+                      disabled={lifecycleActionPending}
+                      onClick={() =>
+                        start.mutate({
+                          pipelineId: currentAssignment.assignment.pipelineId,
+                          assignmentId: currentAssignment.assignment.id,
+                          generation: currentAssignment.assignment.generation,
+                        })
+                      }
+                    >
+                      {currentAssignment.observedState === "starting"
+                        ? "Retry Start"
+                        : "Start"}
+                    </Button>
+                  )}
+                  {(currentAssignment.desiredState === "running" ||
+                    (currentAssignment.desiredState === "stopped" &&
+                      currentAssignment.observedState === "stopping")) && (
+                    <Button
+                      variant="outlined"
+                      color="warning"
+                      disabled={lifecycleActionPending}
+                      onClick={() =>
+                        stop.mutate({
+                          pipelineId: currentAssignment.assignment.pipelineId,
+                          assignmentId: currentAssignment.assignment.id,
+                          generation: currentAssignment.assignment.generation,
+                        })
+                      }
+                    >
+                      {currentAssignment.observedState === "stopping"
+                        ? "Retry Stop"
+                        : "Stop"}
+                    </Button>
+                  )}
+                  {currentAssignment.desiredState === "planned" &&
+                    currentAssignment.observedState === "not_started" && (
+                      <Button
+                        variant="outlined"
+                        color="error"
+                        disabled={lifecycleActionPending}
+                        onClick={() =>
+                          cancel.mutate({
+                            pipelineId:
+                              currentAssignment.assignment.pipelineId,
+                            assignmentId: currentAssignment.assignment.id,
+                            generation:
+                              currentAssignment.assignment.generation,
+                          })
+                        }
+                      >
+                        Cancel unstarted assignment
+                      </Button>
+                    )}
+                </Stack>
+              </Stack>
+            )}
+          </Stack>
+        </CardContent>
+      </Card>
     </Stack>
   );
 }
@@ -1102,7 +1545,7 @@ function ResourceWorkspace(props: ResourceWorkspaceProps) {
       <Alert severity="info">
         {props.editingId
           ? "Saving creates a new disabled draft revision. Validate it before use; the previous revision is preserved."
-          : "New resources are saved as disabled drafts. Validation checks the saved configuration; it does not start media or activate a route."}
+          : "New resources are saved as disabled drafts. Validation checks the saved configuration but does not start media. Starting an assignment enables its input and output; they stay enabled while an active assignment uses them and are disabled after the last such assignment stops."}
       </Alert>
       <Box
         sx={{
@@ -1423,7 +1866,7 @@ function ResourceRow({
             label={
               record.lifecycle === "draft"
                 ? "Draft"
-                : `${record.lifecycle} · inactive`
+                : `${record.lifecycle} · ${record.desiredState}`
             }
             color={record.lifecycle === "draft" ? "default" : "success"}
             variant="outlined"

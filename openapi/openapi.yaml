@@ -245,6 +245,204 @@ paths:
                 $ref: "#/components/schemas/RoutePlan"
         "422":
           $ref: "#/components/responses/ApiError"
+  /routes/plan-assignment:
+    post:
+      operationId: planRouteAssignment
+      summary: Reserve capacity and create a revision-pinned planned assignment
+      description: This control-plane operation checks worker eligibility and capacity, then atomically persists a reservation and planned assignment. It does not activate or execute the route. Worker heartbeats must be no older than the server-controlled 30-second limit. Retries with the same Idempotency-Key and request body replay the original result for 24 hours; reusing a key with a different body returns 409.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: A non-nil client-generated UUID retained for 24 hours to safely replay this planning request.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanRouteAssignmentRequest"
+      responses:
+        "200":
+          description: The assignment was planned, or no eligible worker had capacity. An unavailable result creates no reservation or assignment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanRouteAssignmentResult"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          description: A requested endpoint revision is stale or unvalidated, the pipeline already has an assignment, or the Idempotency-Key was reused with a different request body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /pipelines/{pipelineId}/assignment:
+    get:
+      operationId: getPipelineAssignment
+      summary: Read the latest assignment generation for a pipeline
+      description: Returns assignment identity, pinned route snapshot, and current desired/observed states, including cancelled assignments for uncertain-outcome reconciliation.
+      parameters:
+        - name: pipelineId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The latest assignment generation for the pipeline.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssignmentSnapshot"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /assignments/{assignmentId}/cancel:
+    post:
+      operationId: cancelUnstartedAssignment
+      summary: Cancel an unstarted planned assignment
+      description: Requires the assignment generation as a fencing check. Only planned assignments still observed as not_started can be cancelled; cancellation atomically releases the capacity reservation. It does not stop running media or disable resources used by another active assignment.
+      parameters:
+        - name: assignmentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelAssignmentRequest"
+      responses:
+        "200":
+          description: The unstarted assignment was cancelled and its reservation released.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CancelAssignmentResult"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          description: The assignment is no longer in the requested generation or is not unstarted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /assignments/{assignmentId}/start:
+    post:
+      operationId: startPlannedAssignment
+      summary: Start a revision-pinned planned assignment
+      description: Requires the exact assignment generation. This lifecycle action atomically persists the starting state and enables the pinned source and destination before dispatching a Start command built from the stored route snapshot. Repeating the request for an already-running assignment is idempotent.
+      parameters:
+        - name: assignmentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartAssignmentRequest"
+      responses:
+        "200":
+          description: The worker acknowledged the Start command and the assignment is running, or it was already running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssignmentSnapshot"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          description: The generation or lifecycle state does not permit starting the assignment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "503":
+          description: The worker is unavailable. The assignment remains retryable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "504":
+          description: The worker did not acknowledge the command before timeout; inspect the assignment snapshot before retrying.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /assignments/{assignmentId}/stop:
+    post:
+      operationId: stopAssignment
+      summary: Stop a running assignment
+      description: Requires the exact assignment generation. This lifecycle action persists stopped/stopping before dispatching Stop. Source and destination resources remain enabled while stopping; after worker acknowledgement, resources unused by other active assignments are disabled in the same transaction that releases capacity. Failed or uncertain dispatch leaves the assignment retryable in stopping. Repeating Stop for a stopping assignment reuses the same command identity.
+      parameters:
+        - name: assignmentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StopAssignmentRequest"
+      responses:
+        "200":
+          description: The worker acknowledged Stop and the reservation was released, or the assignment was already stopped.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssignmentSnapshot"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          description: The generation or lifecycle state does not permit stopping the assignment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/responses/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "503":
+          description: The worker is unavailable. The assignment remains in stopping with its reservation held so Stop can be retried.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/responses/ApiError"
+        "504":
+          description: The worker did not acknowledge before timeout. The assignment remains in stopping with its reservation held.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
   /routes:
     get:
       operationId: listRoutes
@@ -382,7 +580,8 @@ components:
           type: string
         desiredState:
           type: string
-          const: disabled
+          enum: [disabled, enabled]
+          description: Enabled while at least one active assignment uses the resource.
         currentRevision:
           type: integer
           minimum: 1
@@ -408,7 +607,8 @@ components:
           type: string
         desiredState:
           type: string
-          const: disabled
+          enum: [disabled, enabled]
+          description: Enabled while at least one active assignment uses the resource.
         currentRevision:
           type: integer
           minimum: 1
@@ -558,6 +758,186 @@ components:
             [alsa_l16_to_rtp_l16, rtp_l16_to_rtp_l16, rtp_l24_to_rtp_l24, rtp_mp2t_to_srt_mpeg_ts, srt_mpeg_ts_to_srt_mpeg_ts]
         estimate:
           $ref: "#/components/schemas/RouteResourceEstimate"
+    PlanRouteAssignmentRequest:
+      type: object
+      required: [pipelineId, sourceId, sourceRevision, destinationId, destinationRevision]
+      properties:
+        pipelineId:
+          type: string
+          format: uuid
+          description: Stable client-generated ID for this pipeline. A duplicate pipeline ID with a different idempotency key remains a conflict; use the same key to replay a request after an uncertain outcome.
+        sourceId:
+          type: string
+          format: uuid
+        sourceRevision:
+          type: integer
+          minimum: 1
+          description: Expected current source revision; stale revisions are rejected.
+        destinationId:
+          type: string
+          format: uuid
+        destinationRevision:
+          type: integer
+          minimum: 1
+          description: Expected current destination revision; stale revisions are rejected.
+    PlanRouteAssignmentResult:
+      type: object
+      required: [state, mediaPath, estimate, assignment, rejections]
+      properties:
+        state:
+          type: string
+          enum: [planned, unavailable]
+        mediaPath:
+          type: string
+          enum:
+            [alsa_l16_to_rtp_l16, rtp_l16_to_rtp_l16, rtp_l24_to_rtp_l24, rtp_mp2t_to_srt_mpeg_ts, srt_mpeg_ts_to_srt_mpeg_ts]
+        estimate:
+          $ref: "#/components/schemas/RouteResourceEstimate"
+        assignment:
+          oneOf:
+            - $ref: "#/components/schemas/PlannedAssignment"
+            - type: "null"
+        rejections:
+          type: array
+          items:
+            $ref: "#/components/schemas/WorkerRejection"
+    PlannedAssignment:
+      type: object
+      required: [id, pipelineId, workerId, generation, reservationId, requirements, route]
+      properties:
+        id:
+          type: string
+          format: uuid
+        pipelineId:
+          type: string
+          format: uuid
+        workerId:
+          type: string
+          format: uuid
+        generation:
+          type: integer
+          minimum: 1
+        reservationId:
+          type: string
+          format: uuid
+        requirements:
+          type: object
+          additionalProperties: true
+        route:
+          oneOf:
+            - $ref: "#/components/schemas/PlannedRouteConfig"
+            - type: "null"
+    PlannedRouteConfig:
+      type: object
+      required: [sourceId, sourceRevision, destinationId, destinationRevision, mediaPath, configuration]
+      properties:
+        sourceId:
+          type: string
+          format: uuid
+        sourceRevision:
+          type: integer
+          minimum: 1
+        destinationId:
+          type: string
+          format: uuid
+        destinationRevision:
+          type: integer
+          minimum: 1
+        mediaPath:
+          type: string
+        configuration:
+          type: object
+          additionalProperties: true
+    AssignmentSnapshot:
+      type: object
+      required: [assignment, desiredState, observedState]
+      properties:
+        assignment:
+          $ref: "#/components/schemas/PlannedAssignment"
+        desiredState:
+          type: string
+          description: Controller-desired lifecycle state, such as planned, running or cancelled.
+        observedState:
+          type: string
+          description: Latest worker-observed lifecycle state, such as not_started, starting, running or cancelled.
+    CancelAssignmentRequest:
+      type: object
+      required: [generation]
+      properties:
+        generation:
+          type: integer
+          minimum: 1
+          description: Exact generation to cancel; stale generations are rejected.
+    CancelAssignmentResult:
+      type: object
+      required: [assignmentId, generation, state]
+      properties:
+        assignmentId:
+          type: string
+          format: uuid
+        generation:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+          const: cancelled
+    StartAssignmentRequest:
+      type: object
+      required: [generation]
+      properties:
+        generation:
+          type: integer
+          minimum: 1
+          description: Exact assignment generation to start; stale generations are rejected.
+    StopAssignmentRequest:
+      type: object
+      required: [generation]
+      properties:
+        generation:
+          type: integer
+          minimum: 1
+          description: Exact assignment generation to stop; stale generations are rejected.
+    WorkerRejection:
+      type: object
+      required: [workerId, reason]
+      properties:
+        workerId:
+          type: string
+          format: uuid
+        reason:
+          oneOf:
+            - type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  enum: [worker_not_accepting, heartbeat_expired, heartbeat_in_future]
+            - type: object
+              required: [code, details]
+              properties:
+                code:
+                  type: string
+                  const: missing_capabilities
+                details:
+                  type: array
+                  items:
+                    type: string
+            - type: object
+              required: [code, details]
+              properties:
+                code:
+                  type: string
+                  const: insufficient_capacity
+                details:
+                  type: object
+                  required: [required, available]
+                  properties:
+                    required:
+                      type: integer
+                      minimum: 0
+                    available:
+                      type: integer
+                      minimum: 0
     RouteResourceEstimate:
       type: object
       description: Provisional, uncalibrated estimate; not proof of available capacity. Null payload rates are unknown and known rates exclude protocol overhead.
@@ -582,7 +962,7 @@ components:
         code:
           type: string
           enum:
-            [invalid_request, not_found, invalid_lifecycle, resource_enabled, database_error, internal_error]
+            [invalid_request, not_found, invalid_lifecycle, resource_enabled, database_error, internal_error, stale_route_revision, source_not_validated, destination_not_validated, assignment_conflict, reservation_conflict, invalid_route_revision, invalid_media_profile, invalid_reservation, invalid_pipeline_id]
         message:
           type: string
     RouteProposal:

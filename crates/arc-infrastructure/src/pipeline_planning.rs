@@ -4,29 +4,56 @@ use arc_domain::{
     WorkerRejection,
 };
 use chrono::Duration;
-use sqlx::PgPool;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::{types::Json, FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    assignments::{PgAssignments, PlannedAssignment},
+    assignments::{PgAssignments, PlannedAssignment, PlannedRouteConfig},
     capacity_reservations::{reserve_in_transaction, ReservationDecision},
     worker_registry::error_with,
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PlannedPipeline {
     pub estimate: PipelineEstimate,
     pub assignment: PlannedAssignment,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum PipelinePlanningDecision {
     Planned(PlannedPipeline),
-    Unavailable { rejections: Vec<WorkerRejection> },
+    Unavailable {
+        estimate: PipelineEstimate,
+        rejections: Vec<WorkerRejection>,
+    },
 }
 
 pub struct PgPipelinePlanner {
     pool: PgPool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteRevision {
+    pub source_id: Uuid,
+    pub source_revision: i64,
+    pub destination_id: Uuid,
+    pub destination_revision: i64,
+}
+
+#[derive(FromRow)]
+struct StoredEndpoint {
+    current_revision: i64,
+    lifecycle: String,
+    adapter_id: String,
+    configuration: Value,
+}
+
+#[derive(FromRow)]
+struct IdempotencyRecord {
+    request: Json<Value>,
+    response: Json<PipelinePlanningDecision>,
 }
 
 impl PgPipelinePlanner {
@@ -37,19 +64,138 @@ impl PgPipelinePlanner {
     pub async fn plan(
         &self,
         pipeline_id: Uuid,
-        source: &SourceMediaProfile,
-        destination: &DestinationMediaProfile,
+        route: RouteRevision,
         max_heartbeat_age: Duration,
     ) -> PortResult<PipelinePlanningDecision> {
-        let estimate = estimate_pipeline_requirements(source, destination)
-            .map_err(|error| error_with("invalid_media_profile", error))?;
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(|error| error_with("database_error", error))?;
+        let decision = self
+            .plan_in_transaction(&mut transaction, pipeline_id, route, max_heartbeat_age)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        Ok(decision)
+    }
+
+    pub async fn plan_with_idempotency_key(
+        &self,
+        idempotency_key: Uuid,
+        pipeline_id: Uuid,
+        route: RouteRevision,
+        max_heartbeat_age: Duration,
+    ) -> PortResult<PipelinePlanningDecision> {
+        if idempotency_key.is_nil() {
+            return Err(error_with(
+                "invalid_idempotency_key",
+                "idempotency key must not be nil",
+            ));
+        }
+
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(idempotency_key.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        sqlx::query("DELETE FROM route_plan_idempotency WHERE expires_at <= clock_timestamp()")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+
+        let request = json!({
+            "pipelineId": pipeline_id,
+            "sourceId": route.source_id,
+            "sourceRevision": route.source_revision,
+            "destinationId": route.destination_id,
+            "destinationRevision": route.destination_revision,
+        });
+        if let Some(record) = sqlx::query_as::<_, IdempotencyRecord>(
+            "SELECT request, response FROM route_plan_idempotency \
+             WHERE idempotency_key = $1 FOR UPDATE",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| error_with("database_error", error))?
+        {
+            if record.request.0 != request {
+                return Err(error_with(
+                    "idempotency_key_reused",
+                    "idempotency key was already used for a different planning request",
+                ));
+            }
+            let decision = record.response.0;
+            transaction
+                .commit()
+                .await
+                .map_err(|error| error_with("database_error", error))?;
+            return Ok(decision);
+        }
+
+        let decision = self
+            .plan_in_transaction(&mut transaction, pipeline_id, route, max_heartbeat_age)
+            .await?;
+        sqlx::query(
+            "INSERT INTO route_plan_idempotency \
+             (idempotency_key, request, response, expires_at) \
+             VALUES ($1, $2, $3, clock_timestamp() + INTERVAL '24 hours')",
+        )
+        .bind(idempotency_key)
+        .bind(Json(request))
+        .bind(Json(&decision))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| error_with("database_error", error))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        Ok(decision)
+    }
+
+    async fn plan_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        pipeline_id: Uuid,
+        route: RouteRevision,
+        max_heartbeat_age: Duration,
+    ) -> PortResult<PipelinePlanningDecision> {
+        if route.source_id.is_nil()
+            || route.destination_id.is_nil()
+            || route.source_revision <= 0
+            || route.destination_revision <= 0
+        {
+            return Err(error_with(
+                "invalid_route_revision",
+                "source and destination IDs and positive revisions are required",
+            ));
+        }
+        let source = load_source(transaction, route).await?;
+        let destination = load_destination(transaction, route).await?;
+        let estimate = estimate_pipeline_requirements(&source, &destination)
+            .map_err(|error| error_with("invalid_media_profile", error))?;
+        let route_config = PlannedRouteConfig {
+            source_id: route.source_id,
+            source_revision: route.source_revision,
+            destination_id: route.destination_id,
+            destination_revision: route.destination_revision,
+            media_path: estimate.media_path.as_str().to_owned(),
+            configuration: json!({
+                "source": source,
+                "destination": destination,
+            }),
+        };
         let decision = match reserve_in_transaction(
-            &mut transaction,
+            transaction,
             pipeline_id,
             &estimate.requirements,
             max_heartbeat_age,
@@ -58,10 +204,11 @@ impl PgPipelinePlanner {
         {
             ReservationDecision::Reserved(reservation) => {
                 let assignment = PgAssignments::plan_in_transaction(
-                    &mut transaction,
+                    transaction,
                     reservation.id,
                     &estimate.requirements,
                     max_heartbeat_age,
+                    Some(&route_config),
                 )
                 .await?;
                 PipelinePlanningDecision::Planned(PlannedPipeline {
@@ -70,15 +217,100 @@ impl PgPipelinePlanner {
                 })
             }
             ReservationDecision::Unavailable { rejections } => {
-                PipelinePlanningDecision::Unavailable { rejections }
+                PipelinePlanningDecision::Unavailable {
+                    estimate,
+                    rejections,
+                }
             }
         };
-        transaction
-            .commit()
-            .await
-            .map_err(|error| error_with("database_error", error))?;
         Ok(decision)
     }
+}
+
+async fn load_source(
+    transaction: &mut Transaction<'_, Postgres>,
+    route: RouteRevision,
+) -> PortResult<SourceMediaProfile> {
+    let row: StoredEndpoint = sqlx::query_as(
+        "SELECT s.current_revision, r.lifecycle, s.source_type AS adapter_id, r.configuration \
+         FROM sources s JOIN source_revisions r \
+           ON r.source_id = s.id AND r.revision = s.current_revision \
+         WHERE s.id = $1 FOR SHARE OF s, r",
+    )
+    .bind(route.source_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| error_with("database_error", error))?
+    .ok_or_else(|| {
+        error_with(
+            "source_not_found",
+            "source or its current revision does not exist",
+        )
+    })?;
+    if row.current_revision != route.source_revision {
+        return Err(error_with(
+            "stale_route_revision",
+            "source has changed since this route was selected",
+        ));
+    }
+    if !matches!(row.lifecycle.as_str(), "validated" | "active") {
+        return Err(error_with(
+            "source_not_validated",
+            "source revision must be validated before planning",
+        ));
+    }
+    let profile: SourceMediaProfile = serde_json::from_value(row.configuration)
+        .map_err(|error| error_with("invalid_source_record", error))?;
+    if profile.adapter_id() != row.adapter_id {
+        return Err(error_with(
+            "invalid_source_record",
+            "source adapter does not match its stored profile",
+        ));
+    }
+    Ok(profile)
+}
+
+async fn load_destination(
+    transaction: &mut Transaction<'_, Postgres>,
+    route: RouteRevision,
+) -> PortResult<DestinationMediaProfile> {
+    let row: StoredEndpoint = sqlx::query_as(
+        "SELECT d.current_revision, r.lifecycle, d.destination_type AS adapter_id, r.configuration \
+         FROM destinations d JOIN destination_revisions r \
+           ON r.destination_id = d.id AND r.revision = d.current_revision \
+         WHERE d.id = $1 FOR SHARE OF d, r",
+    )
+    .bind(route.destination_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| error_with("database_error", error))?
+    .ok_or_else(|| {
+        error_with(
+            "destination_not_found",
+            "destination or its current revision does not exist",
+        )
+    })?;
+    if row.current_revision != route.destination_revision {
+        return Err(error_with(
+            "stale_route_revision",
+            "destination has changed since this route was selected",
+        ));
+    }
+    if !matches!(row.lifecycle.as_str(), "validated" | "active") {
+        return Err(error_with(
+            "destination_not_validated",
+            "destination revision must be validated before planning",
+        ));
+    }
+    let profile: DestinationMediaProfile = serde_json::from_value(row.configuration)
+        .map_err(|error| error_with("invalid_destination_record", error))?;
+    if profile.adapter_id() != row.adapter_id {
+        return Err(error_with(
+            "invalid_destination_record",
+            "destination adapter does not match its stored profile",
+        ));
+    }
+    Ok(profile)
 }
 
 #[cfg(test)]
@@ -94,6 +326,7 @@ mod tests {
 
     use crate::{
         capacity_reservations::PgCapacityReservations,
+        catalog,
         postgres::{connect_postgres, migrate},
         worker_registry::PgWorkerRegistry,
     };
@@ -137,25 +370,68 @@ mod tests {
         worker.state = WorkerState::Accepting;
         registry.heartbeat(worker).await.unwrap();
         let address = IpAddr::from([127, 0, 0, 1]);
-        let source = SourceMediaProfile::RtpL16 {
+        let source_profile = SourceMediaProfile::RtpL16 {
             bind_address: address,
             port: 5000,
             payload_type: 96,
         };
-        let destination = DestinationMediaProfile::RtpL16 {
+        let destination_profile = DestinationMediaProfile::RtpL16 {
             address,
             port: 5002,
             payload_type: 96,
         };
+        let source_record = catalog::create_source(
+            &pool,
+            "Planning source",
+            source_profile.adapter_id(),
+            serde_json::to_value(&source_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let source_record = catalog::validate_source_draft(&pool, source_record.id)
+            .await
+            .unwrap();
+        let destination_record = catalog::create_destination(
+            &pool,
+            "Planning destination",
+            destination_profile.adapter_id(),
+            serde_json::to_value(&destination_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let destination_record = catalog::validate_destination_draft(&pool, destination_record.id)
+            .await
+            .unwrap();
+        let route = RouteRevision {
+            source_id: source_record.id,
+            source_revision: source_record.current_revision,
+            destination_id: destination_record.id,
+            destination_revision: destination_record.current_revision,
+        };
         let age = Duration::seconds(60);
-        let invalid = SourceMediaProfile::RtpL16 {
+        let invalid_profile = SourceMediaProfile::RtpL16 {
             bind_address: address,
             port: 0,
             payload_type: 96,
         };
+        let invalid_source = catalog::create_source(
+            &pool,
+            "Invalid source",
+            invalid_profile.adapter_id(),
+            serde_json::to_value(&invalid_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        catalog::validate_source_draft(&pool, invalid_source.id)
+            .await
+            .unwrap();
+        let invalid_route = RouteRevision {
+            source_id: invalid_source.id,
+            ..route
+        };
         assert_eq!(
             planner
-                .plan(Uuid::new_v4(), &invalid, &destination, age)
+                .plan(Uuid::new_v4(), invalid_route, age)
                 .await
                 .unwrap_err()
                 .code,
@@ -163,11 +439,23 @@ mod tests {
         );
         assert_eq!(
             planner
-                .plan(Uuid::nil(), &source, &destination, age)
+                .plan(Uuid::nil(), route, age)
                 .await
                 .unwrap_err()
                 .code,
             "invalid_reservation"
+        );
+        let stale_route = RouteRevision {
+            source_revision: route.source_revision + 1,
+            ..route
+        };
+        assert_eq!(
+            planner
+                .plan(Uuid::new_v4(), stale_route, age)
+                .await
+                .unwrap_err()
+                .code,
+            "stale_route_revision"
         );
 
         let conflicted_pipeline = Uuid::new_v4();
@@ -184,7 +472,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             planner
-                .plan(conflicted_pipeline, &source, &destination, age)
+                .plan(conflicted_pipeline, route, age)
                 .await
                 .unwrap_err()
                 .code,
@@ -207,16 +495,16 @@ mod tests {
         let first_pipeline = Uuid::new_v4();
         let second_pipeline = Uuid::new_v4();
         let (first, second) = tokio::join!(
-            planner.plan(first_pipeline, &source, &destination, age),
-            planner.plan(second_pipeline, &source, &destination, age),
+            planner.plan(first_pipeline, route, age),
+            planner.plan(second_pipeline, route, age),
         );
         let planned = match (first.unwrap(), second.unwrap()) {
             (
                 PipelinePlanningDecision::Planned(plan),
-                PipelinePlanningDecision::Unavailable { rejections },
+                PipelinePlanningDecision::Unavailable { rejections, .. },
             )
             | (
-                PipelinePlanningDecision::Unavailable { rejections },
+                PipelinePlanningDecision::Unavailable { rejections, .. },
                 PipelinePlanningDecision::Planned(plan),
             ) => {
                 assert!(matches!(
@@ -236,6 +524,20 @@ mod tests {
             planned.estimate.requirements
         );
         assert_eq!(planned.assignment.generation, 1);
+        assert_eq!(
+            planned.assignment.route,
+            Some(PlannedRouteConfig {
+                source_id: route.source_id,
+                source_revision: route.source_revision,
+                destination_id: route.destination_id,
+                destination_revision: route.destination_revision,
+                media_path: "rtp_l16_to_rtp_l16".to_owned(),
+                configuration: json!({
+                    "source": source_profile,
+                    "destination": destination_profile,
+                }),
+            })
+        );
         let reconnected = PgAssignments::new(connect_postgres(&url).await.unwrap());
         assert_eq!(
             reconnected.list_planned().await.unwrap(),
@@ -245,20 +547,54 @@ mod tests {
             reservations.list_active().await.unwrap()[0].id,
             planned.assignment.reservation_id
         );
+        let updated_source_profile = SourceMediaProfile::RtpL16 {
+            bind_address: address,
+            port: 5010,
+            payload_type: 96,
+        };
+        let updated_source = catalog::update_source(
+            &pool,
+            source_record.id,
+            "Planning source",
+            updated_source_profile.adapter_id(),
+            serde_json::to_value(&updated_source_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let updated_source = catalog::validate_source_draft(&pool, updated_source.id)
+            .await
+            .unwrap();
+        assert_eq!(updated_source.current_revision, route.source_revision + 1);
+        assert_eq!(
+            reconnected.list_planned().await.unwrap()[0].route,
+            planned.assignment.route
+        );
         assert_eq!(
             planner
-                .plan(planned.assignment.pipeline_id, &source, &destination, age)
+                .plan(planned.assignment.pipeline_id, route, age)
                 .await
                 .unwrap_err()
                 .code,
-            "reservation_conflict"
+            "stale_route_revision"
         );
         assignments
             .cancel_unstarted(planned.assignment.id, planned.assignment.generation)
             .await
             .unwrap();
+        assert_eq!(
+            planner
+                .plan(planned.assignment.pipeline_id, route, age)
+                .await
+                .unwrap_err()
+                .code,
+            "stale_route_revision"
+        );
+        let updated_route = RouteRevision {
+            source_revision: updated_source.current_revision,
+            ..route
+        };
         let replacement = match planner
-            .plan(planned.assignment.pipeline_id, &source, &destination, age)
+            .plan(planned.assignment.pipeline_id, updated_route, age)
             .await
             .unwrap()
         {
@@ -272,8 +608,8 @@ mod tests {
             .unwrap();
         let duplicate_pipeline = Uuid::new_v4();
         let (one, two) = tokio::join!(
-            planner.plan(duplicate_pipeline, &source, &destination, age),
-            planner.plan(duplicate_pipeline, &source, &destination, age),
+            planner.plan(duplicate_pipeline, updated_route, age),
+            planner.plan(duplicate_pipeline, updated_route, age),
         );
         let duplicate = match (one, two) {
             (Ok(PipelinePlanningDecision::Planned(plan)), Err(error))
@@ -289,10 +625,60 @@ mod tests {
             .cancel_unstarted(duplicate.assignment.id, duplicate.assignment.generation)
             .await
             .unwrap();
+
+        let idempotency_key = Uuid::new_v4();
+        let idempotent_pipeline = Uuid::new_v4();
+        let (one, two) = tokio::join!(
+            planner.plan_with_idempotency_key(
+                idempotency_key,
+                idempotent_pipeline,
+                updated_route,
+                age,
+            ),
+            planner.plan_with_idempotency_key(
+                idempotency_key,
+                idempotent_pipeline,
+                updated_route,
+                age,
+            ),
+        );
+        let replayed = match (one.unwrap(), two.unwrap()) {
+            (
+                PipelinePlanningDecision::Planned(first),
+                PipelinePlanningDecision::Planned(second),
+            ) => {
+                assert_eq!(first, second);
+                first
+            }
+            other => panic!("expected both idempotent calls to replay, got {other:?}"),
+        };
+        assert_eq!(reservations.list_active().await.unwrap().len(), 1);
+        let changed_route = RouteRevision {
+            destination_revision: updated_route.destination_revision + 1,
+            ..updated_route
+        };
+        assert_eq!(
+            planner
+                .plan_with_idempotency_key(
+                    idempotency_key,
+                    idempotent_pipeline,
+                    changed_route,
+                    age,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "idempotency_key_reused"
+        );
+        assignments
+            .cancel_unstarted(replayed.assignment.id, replayed.assignment.generation)
+            .await
+            .unwrap();
+
         registry.begin_drain(worker_id).await.unwrap();
         assert!(matches!(
-            planner.plan(Uuid::new_v4(), &source, &destination, age).await.unwrap(),
-            PipelinePlanningDecision::Unavailable { rejections }
+            planner.plan(Uuid::new_v4(), updated_route, age).await.unwrap(),
+            PipelinePlanningDecision::Unavailable { rejections, .. }
                 if matches!(rejections[0].reason, PlacementRejection::WorkerNotAccepting)
         ));
         assert!(reservations.list_active().await.unwrap().is_empty());
@@ -308,6 +694,17 @@ mod tests {
             .unwrap();
         sqlx::query("DELETE FROM workers WHERE id = $1")
             .bind(worker_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sources WHERE id IN ($1, $2)")
+            .bind(source_record.id)
+            .bind(invalid_source.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM destinations WHERE id = $1")
+            .bind(destination_record.id)
             .execute(&pool)
             .await
             .unwrap();

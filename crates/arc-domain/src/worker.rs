@@ -95,7 +95,8 @@ pub struct PipelineRequirements {
     pub capacity_units: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "code", content = "details", rename_all = "snake_case")]
 pub enum PlacementRejection {
     WorkerNotAccepting,
     HeartbeatExpired,
@@ -104,7 +105,8 @@ pub enum PlacementRejection {
     InsufficientCapacity { required: u32, available: u32 },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerRejection {
     pub worker_id: Uuid,
     pub reason: PlacementRejection,

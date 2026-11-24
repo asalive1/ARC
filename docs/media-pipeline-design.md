@@ -85,9 +85,32 @@ The Phase 1 planner supports ALSA L16 -> RTP L16, RTP L16 -> RTP L16, RTP L24
 path. RTP L16/L24 endpoints configure their dynamic payload types
 independently. No L16/L24 conversion or cross-format SRT path is implied.
 
+The worker's `arc-gstreamer` adapter now builds those five paths from the
+typed, revision-pinned source and destination profiles; it does not accept
+arbitrary GStreamer launch strings. It verifies the planned requirements
+against the stored profiles, checks assignment generations during lifecycle
+operations, and reports GStreamer state and bus errors through `MediaPipeline`.
+Worker readiness advertises only adapter factories present in the runtime image.
+ALSA is opt-in because it also requires host audio-device access.
+
+The automated media-plane loopback test sends RTP MP2T (payload type 33) into
+the adapter, passes its seven MPEG-TS packets to a local SRT listener, and
+verifies that the original bytes arrive unchanged. SRT output sinks disable
+asynchronous preroll while retaining clock synchronization so a live pipeline
+can start before its first input packet. This validates the adapter path only;
+API/UI-to-worker orchestration and deployed-network acceptance remain open.
+
 Editing a disabled source or destination creates a new draft revision and
 preserves prior revisions. The updated resource remains disabled until its
 current draft is validated; enabled resources cannot be edited.
+
+Starting an assignment atomically enables its pinned source and destination
+before dispatch. Resources remain enabled while a pipeline is starting, running,
+or stopping. After worker Stop acknowledgement, each resource is disabled only
+when no other active assignment references it; unstarted plans do not enable
+resources. A known pre-dispatch Start failure resets the assignment and disables
+unused resources, while uncertain worker outcomes keep the resources enabled
+until reconciliation or acknowledged Stop.
 
 Zephyr remains the V6 Phase 2 adapter: same-socket RTP demux, AAC-LC/ADTS
 decode, GPIO extraction, and synthetic simulation. Zephyr POC profile: 48 kHz
@@ -113,10 +136,11 @@ the necessary stream properties. Unknown is represented as `None`, not zero;
 actual network use, including a network-backed ALSA device, may be higher.
 
 These are deterministic POC placeholders, not measured capacity limits or
-proof that a worker or network can safely carry a stream. Network bandwidth,
-memory, transport overhead, and variable stream costs are not admitted yet;
-the estimator is not connected to route activation. Calibrate resource costs
-and add the missing dimensions before real media admission. Advertise actual
+proof that a worker or network can safely carry a stream. Their provisional
+units feed worker placement and reservation, but network bandwidth, memory,
+transport overhead, and variable stream costs are not admitted yet. Calibrate
+resource costs and add the missing dimensions before relying on estimates for
+real media admission. Advertise actual
 GStreamer elements/codecs, audio backends, platform, architecture, and hardware
 acceleration per worker. Linux x86-64/ARM64 Docker and Windows x86-64 are
 targets subject to explicit plugin/codec availability and license validation.

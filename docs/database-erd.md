@@ -1,7 +1,8 @@
 # PostgreSQL Database ERD
 
-**Status:** Approved architecture baseline; initial migration and SQLx runner
-validated; repository and upgrade/recovery coverage remains planned
+**Status:** Approved architecture baseline; migrations 0001-0005 and SQLx
+runner validated; PostgreSQL worker-fencing integration tests pass; full
+recovery coverage remains planned
 **Database:** PostgreSQL only; SQLx migrations are the schema-versioning
 mechanism. SQLite and a multi-database abstraction are out of scope.
 
@@ -17,6 +18,10 @@ erDiagram
     WORKER ||--o{ PIPELINE_ASSIGNMENT : owns
     WORKER ||--o{ WORKER_CAPACITY_RESERVATION : reserves
     WORKER_CAPACITY_RESERVATION o|--o| PIPELINE_ASSIGNMENT : supports
+    WORKER ||--o{ WORKER_ASSIGNMENT_FENCE : fences
+    PIPELINE_ASSIGNMENT ||--o{ WORKER_ASSIGNMENT_FENCE : identifies
+    WORKER ||--o{ WORKER_COMMAND_LEDGER : executes
+    PIPELINE_ASSIGNMENT ||--o{ WORKER_COMMAND_LEDGER : identifies
     PIPELINE_ASSIGNMENT ||--o{ OPERATION : advances
     OPERATION ||--o{ OPERATION_ITEM : contains
     PRINCIPAL ||--o{ AUDIT_RECORD : acts
@@ -131,6 +136,12 @@ erDiagram
       timestamptz lease_expires_at
       uuid reservation_id FK
       jsonb requirements
+      uuid source_id FK
+      bigint source_revision FK
+      uuid destination_id FK
+      bigint destination_revision FK
+      text media_path
+      jsonb route_configuration
     }
     WORKER_CAPACITY_RESERVATION {
       uuid id PK
@@ -140,6 +151,23 @@ erDiagram
       text state
       timestamptz created_at
       timestamptz released_at
+    }
+    WORKER_ASSIGNMENT_FENCE {
+      uuid pipeline_id PK
+      uuid worker_id FK
+      uuid assignment_id FK
+      bigint generation
+      timestamptz updated_at
+    }
+    WORKER_COMMAND_LEDGER {
+      uuid command_id PK
+      uuid worker_id FK
+      uuid pipeline_id
+      uuid assignment_id FK
+      bigint generation
+      text status
+      timestamptz created_at
+      timestamptz completed_at
     }
     OPERATION {
       uuid id PK
@@ -193,6 +221,10 @@ erDiagram
 - Assignments carry desired/observed states, worker lease and monotonically
   increasing generation. Worker heartbeat/capacity telemetry is not an
   unbounded durable time series; retain only operationally useful snapshots.
+- Worker assignment fences persist the latest generation observed by the
+  command store; the command ledger persists command identity and completion
+  state. Incomplete commands remain retryable and require idempotent handlers;
+  ledger retention and full restart reconciliation remain open.
 - Operations are durable for recovery and clients; operation items record
   independent batch outcomes. Idempotency keys are scoped and expire by
   operation class. Audit payloads are redacted and append-only by application
@@ -204,9 +236,10 @@ erDiagram
 
 The Phase 0 migration scaffold is in `database/migrations/0001_initial.sql`;
 it has been applied to PostgreSQL 16, including current-revision foreign keys
-and route cardinality validation; the SQLx migrator test also passes against a
-disposable PostgreSQL 16 database. Upgrade/recovery paths still require
-integration tests. Migrations must add indexes for foreign keys, resource/revision lookups,
+and route cardinality validation. Migration 0005 adds the worker assignment
+fence and command ledger; its PostgreSQL tests cover persistence across store
+instances, completed-command deduplication, and concurrent generation updates.
+Broader upgrade/recovery paths still require integration tests. Migrations must add indexes for foreign keys, resource/revision lookups,
 operation state, lease expiry, and idempotency uniqueness; use transactions and
 test both clean installation and upgrade paths. JSONB is for adapter-specific
 configuration, not core relational invariants.

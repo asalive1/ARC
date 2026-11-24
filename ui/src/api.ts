@@ -67,6 +67,52 @@ export interface RoutePlan {
   };
 }
 
+export interface PlannedAssignment {
+  id: string;
+  pipelineId: string;
+  workerId: string;
+  generation: number;
+}
+
+export interface AssignmentSnapshot {
+  assignment: PlannedAssignment;
+  desiredState: string;
+  observedState: string;
+}
+
+export interface CancelAssignmentResult {
+  assignmentId: string;
+  generation: number;
+  state: "cancelled";
+}
+
+export interface PlanRouteAssignmentResult {
+  state: "planned" | "unavailable";
+  mediaPath: RoutePlan["mediaPath"];
+  estimate: NonNullable<RoutePlan["estimate"]>;
+  assignment: PlannedAssignment | null;
+  rejections: { workerId: string; reason: string }[];
+}
+
+export interface PlanRouteAssignmentRequest {
+  pipelineId: string;
+  sourceId: string;
+  sourceRevision: number;
+  destinationId: string;
+  destinationRevision: number;
+}
+
+export interface PlanRouteAssignmentInput extends PlanRouteAssignmentRequest {
+  idempotencyKey: string;
+}
+
+export class ApiRequestError extends Error {
+  constructor(readonly status: number) {
+    super(`API request failed with HTTP ${status}`);
+    this.name = "ApiRequestError";
+  }
+}
+
 async function requestJson<T>(
   path: string,
   init: RequestInit | undefined,
@@ -75,7 +121,7 @@ async function requestJson<T>(
 ): Promise<T> {
   const response = await fetcher(`${baseUrl}/api/v1${path}`, init);
   if (!response.ok) {
-    throw new Error(`API request failed with HTTP ${response.status}`);
+    throw new ApiRequestError(response.status);
   }
   return (await response.json()) as T;
 }
@@ -266,6 +312,107 @@ export async function planRoute(
       egressPayloadBitsPerSecond: estimate.egressPayloadBitsPerSecond,
     },
   };
+}
+
+export function planRouteAssignment(
+  input: PlanRouteAssignmentInput,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<PlanRouteAssignmentResult> {
+  const { idempotencyKey, ...request } = input;
+  return requestJson(
+    "/routes/plan-assignment",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(request),
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function fetchPipelineAssignment(
+  pipelineId: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<AssignmentSnapshot> {
+  return requestJson(
+    `/pipelines/${encodeURIComponent(pipelineId)}/assignment`,
+    undefined,
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function startAssignment(
+  assignmentId: string,
+  generation: number,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<AssignmentSnapshot> {
+  return postAssignmentLifecycle(
+    "start",
+    assignmentId,
+    generation,
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function stopAssignment(
+  assignmentId: string,
+  generation: number,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<AssignmentSnapshot> {
+  return postAssignmentLifecycle(
+    "stop",
+    assignmentId,
+    generation,
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function cancelAssignment(
+  assignmentId: string,
+  generation: number,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<CancelAssignmentResult> {
+  return requestJson(
+    `/assignments/${encodeURIComponent(assignmentId)}/cancel`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ generation }),
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
+function postAssignmentLifecycle(
+  action: "start" | "stop",
+  assignmentId: string,
+  generation: number,
+  baseUrl: string,
+  fetcher: typeof fetch,
+): Promise<AssignmentSnapshot> {
+  return requestJson(
+    `/assignments/${encodeURIComponent(assignmentId)}/${action}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ generation }),
+    },
+    baseUrl,
+    fetcher,
+  );
 }
 
 function isMediaPath(value: unknown): value is RoutePlan["mediaPath"] {

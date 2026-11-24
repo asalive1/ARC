@@ -114,6 +114,9 @@ publish capabilities and state, accept commands, and reconcile snapshots.
   automation numbers, worker registrations/assignments/generations, operation
   records, idempotency results, audit records, auth/key metadata, and event
   replay checkpoints where required.
+- Source and destination `desired_state` follows assignment lifecycle: Start
+  enables the pinned resources before dispatch, and acknowledged Stop disables
+  each resource only after its last active assignment releases it.
 - **Reconstructable observed state:** worker/pipeline health, capabilities,
   active media flow, interface inventory, and live statistics. Refresh from
   workers/devices; never mistake an observation for user intent.
@@ -176,11 +179,17 @@ pipelines, assignment counts, draining, and heartbeat age.
 ## 10. Implementation status
 
 The architecture package in [the index](ARCHITECTURE.md) was approved before
-implementation began. Phase 0 scaffolds the Rust workspace, API liveness
-service, foundational PostgreSQL schema, OpenAPI contract, media/worker ports,
-synthetic fixture area, and React UI health shell. The local Compose stack
-builds and runs the API, UI, and PostgreSQL services. Runtime media adapters,
-the worker executable, telemetry export, reconciliation, endpoint/routing UI,
-and production authentication remain unimplemented; phase exit requires the
-validation and blocking decisions in the delivery plan and open-questions
-register.
+implementation began. The Rust workspace, API, PostgreSQL schema, OpenAPI
+contract, media/worker ports, synthetic fixture area, and React UI are in
+place. Phase 1 now includes profile planning, durable assignments and fences,
+API worker command dispatch, a worker executable, and a typed GStreamer
+adapter. The default Compose stack runs the API, UI, and PostgreSQL; an
+opt-in worker profile adds the worker. A generation-checked assignment Start action dispatches its persisted route
+snapshot and records running state after acknowledgement. Assignment Stop
+dispatches a fenced command, retains capacity until worker acknowledgement, and
+then releases the reservation atomically and disables resources not used by
+another active assignment. The operator UI can reserve and control a validated
+single-route assignment. Multi-route matrix editing, telemetry export,
+reconciliation, broader endpoint/routing administration, and production
+authentication remain unimplemented; phase exit requires the validation and
+blocking decisions in the delivery plan and open-questions register.

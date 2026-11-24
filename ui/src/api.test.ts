@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  cancelAssignment,
   createDestination,
   createSource,
+  fetchPipelineAssignment,
   fetchLiveness,
   fetchSources,
   planRoute,
+  planRouteAssignment,
+  startAssignment,
+  stopAssignment,
   updateDestination,
   updateSource,
   validateDestination,
@@ -279,6 +284,152 @@ describe("catalog and route API", () => {
         ingressPayloadBitsPerSecond: null,
         egressPayloadBitsPerSecond: 1536000,
       },
+    });
+  });
+
+  describe("assignment API", () => {
+    it("plans a capacity-reserving assignment with pinned endpoint revisions", async () => {
+      const planned = {
+        state: "planned",
+        mediaPath: "rtp_mp2t_to_srt_mpeg_ts",
+        estimate: {
+          capacityUnits: 2,
+          ingressPayloadBitsPerSecond: null,
+          egressPayloadBitsPerSecond: null,
+        },
+        assignment: {
+          id: "assignment-1",
+          pipelineId: "pipeline-1",
+          workerId: "worker-1",
+          generation: 1,
+        },
+        rejections: [],
+      };
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(JSON.stringify(planned), { status: 200 }),
+      );
+
+      await expect(
+        planRouteAssignment(
+          {
+            pipelineId: "pipeline-1",
+            idempotencyKey: "6e474805-5c0c-4d7b-b4a2-985c15f825b7",
+            sourceId: "source-1",
+            sourceRevision: 3,
+            destinationId: "destination-1",
+            destinationRevision: 4,
+          },
+          "http://arc-api:8080",
+          fetcher,
+        ),
+      ).resolves.toEqual(planned);
+      expect(fetcher).toHaveBeenCalledWith(
+        "http://arc-api:8080/api/v1/routes/plan-assignment",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "Idempotency-Key": "6e474805-5c0c-4d7b-b4a2-985c15f825b7",
+          },
+          body: JSON.stringify({
+            pipelineId: "pipeline-1",
+            sourceId: "source-1",
+            sourceRevision: 3,
+            destinationId: "destination-1",
+            destinationRevision: 4,
+          }),
+        },
+      );
+    });
+
+    it("looks up an assignment and sends generation-fenced lifecycle requests", async () => {
+      const snapshot = {
+        assignment: {
+          id: "assignment-1",
+          pipelineId: "pipeline/1",
+          workerId: "worker-1",
+          generation: 7,
+        },
+        desiredState: "running",
+        observedState: "running",
+      };
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(snapshot), { status: 200 }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(snapshot), { status: 200 }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(snapshot), { status: 200 }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              assignmentId: "assignment/1",
+              generation: 7,
+              state: "cancelled",
+            }),
+            { status: 200 },
+          ),
+        );
+
+      await expect(
+        fetchPipelineAssignment("pipeline/1", "", fetcher),
+      ).resolves.toEqual(snapshot);
+      await startAssignment("assignment/1", 7, "", fetcher);
+      await stopAssignment("assignment/1", 7, "", fetcher);
+      await expect(
+        cancelAssignment("assignment/1", 7, "", fetcher),
+      ).resolves.toEqual({
+        assignmentId: "assignment/1",
+        generation: 7,
+        state: "cancelled",
+      });
+
+      expect(fetcher).toHaveBeenNthCalledWith(
+        1,
+        "/api/v1/pipelines/pipeline%2F1/assignment",
+        undefined,
+      );
+      expect(fetcher).toHaveBeenNthCalledWith(
+        2,
+        "/api/v1/assignments/assignment%2F1/start",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: 7 }),
+        },
+      );
+      expect(fetcher).toHaveBeenNthCalledWith(
+        3,
+        "/api/v1/assignments/assignment%2F1/stop",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: 7 }),
+        },
+      );
+      expect(fetcher).toHaveBeenNthCalledWith(
+        4,
+        "/api/v1/assignments/assignment%2F1/cancel",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation: 7 }),
+        },
+      );
+    });
+
+    it("preserves HTTP status for assignment lookup errors", async () => {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response("not found", { status: 404 }),
+      );
+
+      await expect(
+        fetchPipelineAssignment("missing-pipeline", "", fetcher),
+      ).rejects.toMatchObject({ status: 404 });
     });
   });
 

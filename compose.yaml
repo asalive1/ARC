@@ -22,12 +22,35 @@ services:
     environment:
       ARC_API_BIND_ADDRESS: 0.0.0.0:8080
       DATABASE_URL: postgres://arc:${ARC_POSTGRES_PASSWORD:?Set ARC_POSTGRES_PASSWORD in .env}@postgres:5432/arc
+      ARC_WORKER_CREDENTIALS_JSON: ${ARC_WORKER_CREDENTIALS_JSON:-}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "127.0.0.1:${ARC_API_PORT:-8080}:8080"
     restart: unless-stopped
+
+  worker:
+    profiles:
+      - worker
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.worker
+    environment:
+      ARC_WORKER_ID: ${ARC_WORKER_ID:-}
+      ARC_WORKER_NAME: ${ARC_WORKER_NAME:-arc-worker-local}
+      ARC_WORKER_CONTROL_ENDPOINT: ${ARC_WORKER_CONTROL_ENDPOINT:-}
+      ARC_WORKER_CONTROL_TOKEN: ${ARC_WORKER_CONTROL_TOKEN:-}
+      ARC_WORKER_CAPACITY_UNITS: ${ARC_WORKER_CAPACITY_UNITS:-2}
+      ARC_WORKER_ENABLE_ALSA: ${ARC_WORKER_ENABLE_ALSA:-false}
+      DATABASE_URL: postgres://arc:${ARC_POSTGRES_PASSWORD:?Set ARC_POSTGRES_PASSWORD in .env}@postgres:5432/arc
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: unless-stopped
+    stop_grace_period: 20s
 
   ui:
     build:

@@ -2,10 +2,13 @@
 
 ARC is an API-first audio routing and signal-control platform. The approved
 architecture and runnable Phase 0 scaffold are in place. The initial Phase 1
-slice persists disabled source/destination drafts, plans compatible media
-profiles, validates draft configurations, and provides an operator UI for
-those tasks. Pipeline activation, worker execution, and media transport are not
-implemented yet.
+slice persists source/destination drafts, plans compatible media profiles, and
+validates draft configurations. The operator UI can now reserve a worker for a
+validated single route, Start or Stop it, or cancel it before it starts. An
+opt-in worker profile provides the worker command client and GStreamer adapter.
+Assignment Start/Stop now coordinates source and destination enabled state with
+worker acknowledgements. Multi-route editing and end-to-end deployed media
+transport remain outstanding.
 
 ## Architecture review
 

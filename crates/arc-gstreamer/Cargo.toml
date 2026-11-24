@@ -1,0 +1,21 @@
+[package]
+name = "arc-gstreamer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-application = { path = "../arc-application" }
+arc-domain = { path = "../arc-domain" }
+async-trait.workspace = true
+chrono.workspace = true
+gstreamer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+gstreamer-app.workspace = true
+tokio.workspace = true

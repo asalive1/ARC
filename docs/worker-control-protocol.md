@@ -1,21 +1,57 @@
 # Worker Control Protocol
 
-**Status:** Transport decision approved; runtime contract is not yet implemented.
+**Status:** The provider-backed credential verifier, local-only JSON environment provider, conditional API executable wiring, TLS-gated WebSocket session, PostgreSQL-backed command dispatcher, worker WebSocket client, generation-gated Start/Stop handlers, GStreamer media adapter, and opt-in worker Compose profile are implemented. The UI supports a validated single-route assignment lifecycle; multi-route/resource lifecycle UI and production secret stores remain incomplete.
 
 ## Decision
 
 API-to-worker control and worker observations use a full-duplex WebSocket
 connection carrying versioned JSON messages. Each connection is authenticated
 as a worker service identity and bound to that worker's registered `workerId`.
-Credential provisioning and rotation remain subject to
-[Q13](open-questions.md).
+The selected credential strategy is per-worker bearer credentials resolved
+through the existing `SecretProvider` abstraction. A deployment must use TLS
+for this connection. Concrete provider adapters, provisioning and rotation
+remain subject to [Q13](open-questions.md).
+
+The infrastructure authenticator resolves each credential from
+`workers/{workerId}/control-token`, compares bearer values in constant time,
+and returns generic rejection details. Provider failures are logged without
+credential contents and reported as an authentication-service failure.
+
+For a local POC, `LocalWorkerSecretProvider` loads
+`ARC_WORKER_CREDENTIALS_JSON` at API startup. The value is a JSON object mapping
+canonical worker UUIDs to 64-character hexadecimal bearer tokens. Generate
+tokens with a cryptographically secure random source, keep the value out of
+source control and logs, and restart the API to apply credential changes. This
+environment-backed adapter is not a production secret store.
+
+Workers initiate WSS to `GET /api/v1/workers/control`. The upgrade request
+carries `Authorization: Bearer <token>` and `X-Worker-ID`. TLS terminates at a
+trusted reverse proxy or ingress, which must overwrite `X-Forwarded-Proto` with
+`https`; the API must only be reachable from that trusted network. The API
+rejects requests without that marker as defense in depth. Do not log the
+Authorization header.
+
+After upgrade, the worker sends a JSON hello such as
+`{"kind":"hello","protocolVersion":1,"workerId":"<worker-uuid>"}` within five
+seconds. The API verifies that the version and identity match the authenticated
+request, then replies with a `welcome` message containing the protocol version
+and worker ID. The current message and frame limit is 64 KiB. This limit and
+the five-second hello timeout are initial implementation defaults, not a
+final transport capacity decision.
+
+When `ARC_WORKER_CREDENTIALS_JSON` is nonempty and valid, the API executable
+composes the local provider with the authenticated route. When it is absent or
+empty, the worker route is not registered. Compose accepts this setting for the
+API and provides an opt-in worker profile, but requires an independently
+configured trusted WSS ingress; it does not add a TLS proxy or development CA.
 
 ## Versioned envelopes
 
 The shared Rust crate defines the protocol-v1 envelopes:
 
 - `WorkerCommandEnvelope<T>` carries `protocolVersion`, `commandId`,
-  `assignmentId`, `generation`, and a typed payload from API to worker.
+  authenticated `workerId`, `pipelineId`, `assignmentId`, `generation`, and a
+  typed payload from API to worker.
 - `WorkerEventEnvelope<T>` carries `protocolVersion`, `eventId`, `workerId`,
   optional `assignmentId` and `generation`, and a typed payload from worker to
   API.
@@ -23,6 +59,57 @@ The shared Rust crate defines the protocol-v1 envelopes:
 Fields use camelCase JSON names. Every message must include the supported
 protocol version. A peer must explicitly reject an unsupported version; it
 must not silently interpret or downgrade it.
+
+The worker crate provides a transport-independent command gate. It validates
+the protocol version, nonnil identities, positive generation and equality
+between the envelope `workerId` and the authenticated session identity. It
+then uses an `AssignmentGenerationStore` to atomically fence older generations
+and completed command IDs before calling a command handler. Incomplete
+commands can be retried after restart; handlers must therefore be idempotent
+by `commandId`. `PgAssignmentGenerationStore` persists the observed assignment
+generation and command ledger in PostgreSQL (migration 0005), with transactional
+generation updates and completed-command deduplication tested across store
+instances. The API dispatcher validates/fences a command before sending it,
+serializes dispatches for a pipeline within one API process, and marks a command
+complete only after a correlated `command_ack` with outcome `completed`. The
+worker crate's receiver applies the same generation gate before invoking its
+injected handler. It returns `completed` only after the handler succeeds and the
+durable store marks the command complete; an already completed duplicate also
+returns `completed` without invoking the handler. A stale command returns
+`stale` with `currentGeneration` and never reaches the handler. The API treats
+that as a dispatch error and does not mark the command complete. An
+unacknowledged command remains retryable; a generation first becomes known when
+a command reaches the store, so the store alone cannot reject an older command
+before a newer generation has been observed. Session replacement and
+per-pipeline serialization are process-local, and ledger retention is not
+bounded.
+
+The acknowledgement message uses the normal camelCase envelope fields:
+`kind`, `protocolVersion`, `workerId`, `commandId`, and `outcome`. A stale
+acknowledgement also includes `currentGeneration`. The dispatcher accepts
+`kind: "command_ack"` with `outcome: "completed"` or `"stale"`. The worker
+client sends the authenticated worker ID and bearer credential, verifies the
+welcome identity and protocol version, and bounds messages and frames to 64 KiB.
+Plaintext `ws://` is rejected except when explicitly enabled for an IP loopback
+endpoint. Its typed command payloads currently support `start` with a
+`PipelineSpecification` and `stop`; Start validates the pipeline ID and
+generation, then calls the injected `MediaPipeline`'s `prepare` and `start`
+methods, while Stop calls `stop`. A successful acknowledgement is emitted only
+after the injected operation and durable completion both succeed. The worker
+executable injects the `arc-gstreamer` adapter, which converts typed route
+snapshots to supported GStreamer graphs, observes pipeline state and bus errors,
+and advertises only installed plugin capabilities. The worker registers and
+heartbeats through PostgreSQL and reconnects its authenticated control session
+with bounded backoff. `POST /api/v1/routes/plan-assignment` continues to create
+a plan without executing it. `POST /api/v1/assignments/{assignmentId}/start`
+is the explicit lifecycle action: it verifies the generation, persists the
+starting state, and dispatches a Start command containing the assignment's
+revision-pinned route snapshot. The assignment becomes running only after the
+worker acknowledges completion. Repeating Start for a running assignment is
+idempotent; an unavailable worker leaves the plan retryable.
+Initial dispatcher limits are 16 queued commands per session and a 30-second
+completion-acknowledgement timeout. Queue saturation, session loss, or timeout
+returns an error and leaves the command retryable.
 
 ## Registry and placement foundations
 
@@ -35,9 +122,10 @@ rejected. Heartbeats require the registered ID, stable name, platform and
 architecture, and cannot clear controller-owned drain states. A new registry
 instance can read the stored worker records.
 
-The adapter is not connected to a worker service or network endpoint. It does
-not authenticate callers, implement reconnect/session fencing, complete drain,
-or reconcile assignments. Heartbeat capacity is a reported snapshot, not an
+The worker executable now registers and heartbeats through this adapter and
+reports `ready` only while its authenticated control session is connected.
+The adapter still does not authenticate database callers, complete drain, or
+reconcile assignments. Heartbeat capacity is a reported snapshot, not an
 authoritative assignment ledger.
 
 The domain exposes a deterministic, read-only worker selection function. It
@@ -108,18 +196,57 @@ assignment planning fails after reservation, the transaction rolls back both.
 Concurrent planners use the same worker-row locking as admission; cancellation
 of an unstarted plan releases its reservation.
 
-The planner does not persist source/destination profiles or route revisions,
-and is not exposed as a route activation API. A database connection failure
-during commit can leave the outcome unknown; callers must inspect persisted
-state before retrying rather than assuming failure means rollback.
+The planner persists exact source and destination revision references with the
+media path and configuration snapshot on the assignment. Revision foreign keys
+keep the referenced history intact, and row locks plus expected-current-
+revision checks reject plans racing with endpoint edits. Only validated or
+active revisions may be planned.
 
-This is control-plane preparation only: no worker commands are dispatched,
-and no running pipeline is implied. Worker-side generation enforcement,
-authenticated sessions, dispatch state, stop acknowledgement, leases and
-restart reconciliation are not implemented. Before sending commands, the
-runtime must make dispatch and cancellation mutually safe, and before
-releasing running capacity it must obtain stop acknowledgement or establish
-effective fencing.
+`POST /api/v1/routes/plan-assignment` exposes this planning operation
+separately from `POST /api/v1/routes/plan`, which remains a non-reserving
+compatibility and estimate check. The request names a client-generated
+pipeline ID and expected source and destination revisions. Heartbeat freshness
+is fixed by the server to a 30-second maximum; clients cannot relax it. The
+response reports `planned` with the assignment and pinned revisions, or
+`unavailable` with ordered, per-worker rejection reasons and no assignment or
+reservation. `GET /api/v1/pipelines/{pipelineId}/assignment` returns the
+latest generation and its desired/observed states, including cancelled
+assignments. Clients can use this to reconcile an uncertain planning or
+cancellation commit rather than assuming a connection failure means rollback.
+`POST /api/v1/assignments/{assignmentId}/cancel` requires the exact generation
+and atomically cancels only a `planned`, `not_started` assignment while
+releasing its reservation. It cannot stop a running pipeline. Planning requests
+require a non-nil UUID `Idempotency-Key`. The same key and request body replay
+the original planned or unavailable result for 24 hours; reusing a key with a
+different body returns a conflict. The key is distinct from the stable pipeline
+ID, so a new key continues through the existing assignment-generation and
+duplicate-pipeline rules.
+
+`POST /api/v1/assignments/{assignmentId}/stop` requires the exact generation
+and only accepts assignments that have entered the running lifecycle.
+The generation-checked Start and Stop endpoints dispatch commands for planned
+assignments. Start uses the persisted route snapshot and records `running` only
+after worker acknowledgement. Stop first records desired `stopped` and observed
+`stopping`; it retains the reservation until acknowledgement, then atomically
+records `stopped` and releases capacity. An unavailable worker, timeout, or
+stale acknowledgement leaves the assignment retryable in `stopping` with its
+reservation held. Retrying Stop uses a stable command identity, and an
+already-stopped assignment is returned without another dispatch.
+
+The operator UI can create and control a single validated route assignment.
+Starting an assignment enables its pinned source and destination; they remain
+enabled while the worker is starting, running, or stopping. After acknowledged
+Stop, each resource is disabled only when no other active assignment uses it.
+Planning alone does not start media, and workers must independently fence
+generations before executing commands.
+
+The WebSocket session sends versioned command envelopes and receives correlated
+completion acknowledgements; it still rejects binary frames and does not
+process worker events. The worker executable runs the WebSocket client and
+registers Start/Stop media handlers. Cross-process session leases and restart
+reconciliation remain unimplemented. Workers independently fence generations
+before executing commands; API-side dispatch alone does not make stale
+in-flight work safe.
 
 ## Drain request foundation
 
@@ -137,8 +264,6 @@ are required before a future implementation can make that determination.
 
 ## Not frozen by this decision
 
-Phase 1 will define the WebSocket endpoint, connection initiator, handshake
-payload, credential mechanism, heartbeat/lease behavior, reconnect policy,
-message-size limits, and concrete command/event payload schemas. The Phase 0
-API does not expose a worker WebSocket endpoint, and the worker crate is not
-yet an executable service.
+Phase 1 still needs to define cross-process heartbeat/lease behavior,
+connection limits, production secret-provider adapters, command/event payload
+schemas, and restart reconciliation.

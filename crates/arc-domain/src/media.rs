@@ -66,7 +66,8 @@ pub enum DestinationMediaProfile {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MediaPath {
     AlsaL16ToRtpL16,
     RtpL16ToRtpL16,
@@ -162,7 +163,8 @@ pub fn plan_media_path(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PipelineEstimate {
     pub media_path: MediaPath,
     pub requirements: PipelineRequirements,

@@ -14,13 +14,32 @@
 - Added PostgreSQL-backed atomic capacity reservations; worker dispatch and media execution remain planned.
 - Added generation-numbered planned assignments with reservation protection and safe cancellation of unstarted plans.
 - Added persistent worker drain requests that prevent new reservations and plans without discarding existing commitments.
+- Added provider-backed per-worker bearer credential verification; deployment-specific secret stores and credential lifecycle remain open.
+- Added an injectable TLS-gated worker WebSocket hello/welcome session; command and event handling remains disabled.
+- Added a local-only JSON environment secret provider and conditional API startup wiring for the worker route.
 - Added a reservation-aware, advisory PostgreSQL implementation of the worker scheduler interface.
 - Added provisional, deterministic requirement estimates for supported Phase 1 media paths.
 - Exposed provisional route estimates in the planning API and compatibility view without reserving capacity.
 - Added an internal transaction that reserves capacity and creates a planned assignment together.
+- Persisted endpoint revision references and immutable route configuration snapshots with planned assignments.
+- Exposed revision-pinned, capacity-reserving planning through `POST /api/v1/routes/plan-assignment`; retained `/routes/plan` as a non-reserving compatibility check.
+- Added assignment lookup by pipeline and generation-fenced cancellation of unstarted plans; cancellation releases its reservation atomically.
+- Added worker/pipeline identities to command envelopes and a transport-independent worker command gate for generation fencing and completed-command deduplication.
+- Added PostgreSQL-backed worker assignment fences and a durable command ledger, with integration coverage for persistence, duplicate completion, and concurrent generation updates.
+- Connected the authenticated worker WebSocket session to a bounded command dispatcher with per-pipeline serialization, session replacement, and completion-acknowledged durable command handling.
+- Added a worker-side transport-independent command receiver that gates generations before handler invocation and returns completed or stale acknowledgements.
+- Added a worker WebSocket client with bounded messages, TLS-by-default endpoint validation, welcome verification, and generation-gated Start/Stop handlers using the injected media pipeline interface.
+- Added the `arc-gstreamer` adapter for supported Phase 1 paths, a worker executable with PostgreSQL registration/heartbeat and control reconnect, and an opt-in Compose worker profile.
+- Added a live GStreamer RTP MPEG-TS-to-SRT loopback test that verifies the original transport-stream payload reaches an SRT listener.
+- Added a generation-checked Start lifecycle endpoint that dispatches the persisted route snapshot to the assigned worker and records running state only after acknowledgement.
+- Added a generation-checked Stop lifecycle endpoint that retains capacity until worker acknowledgement, then atomically marks the assignment stopped and releases its reservation.
+- Added assignment-managed source/destination enablement: Start enables route resources, while acknowledged Stop or cancellation disables resources with no other active assignment.
+- Added operator UI controls to reserve a worker for a validated single-route assignment, inspect its lifecycle, and issue generation-fenced Start/Stop or cancel an unstarted assignment.
+- Added PostgreSQL-backed 24-hour replay for planning requests using a required Idempotency-Key, with key/body mismatch conflicts.
 
 ### Changed
 - README and roadmap now describe ARC rather than the project template.
 - API startup now requires PostgreSQL, applies SQLx migrations, and keeps its non-container bind address loopback-only.
 
 ### Fixed
+- Prevented SRT output sinks from blocking live pipeline startup while waiting for preroll; clock synchronization remains enabled.

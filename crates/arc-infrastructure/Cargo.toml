@@ -12,6 +12,8 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+subtle.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

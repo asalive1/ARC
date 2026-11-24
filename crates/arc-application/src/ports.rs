@@ -14,6 +14,22 @@ pub struct PortError {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerCommandIdentity {
+    pub command_id: Uuid,
+    pub worker_id: Uuid,
+    pub pipeline_id: Uuid,
+    pub assignment_id: Uuid,
+    pub generation: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandFenceDecision {
+    Process,
+    Duplicate,
+    Stale { current_generation: i64 },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdapterConfiguration {
@@ -177,6 +193,23 @@ pub trait StateRepository: Send + Sync {
 #[async_trait]
 pub trait SecretProvider: Send + Sync {
     async fn resolve_reference(&self, reference: &str) -> PortResult<String>;
+}
+
+#[async_trait]
+pub trait WorkerAuthenticator: Send + Sync {
+    async fn authenticate(&self, worker_id: Uuid, bearer_token: &str) -> PortResult<()>;
+}
+
+#[async_trait]
+pub trait AssignmentGenerationStore: Send + Sync {
+    /// Atomically reject stale generations and identify completed commands.
+    async fn begin_command(
+        &self,
+        command: WorkerCommandIdentity,
+    ) -> PortResult<CommandFenceDecision>;
+
+    /// Mark successful work complete; an incomplete command remains retryable.
+    async fn complete_command(&self, command_id: Uuid) -> PortResult<()>;
 }
 
 #[async_trait]

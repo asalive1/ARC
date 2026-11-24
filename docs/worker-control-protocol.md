@@ -100,7 +100,11 @@ executable injects the `arc-gstreamer` adapter, which converts typed route
 snapshots to supported GStreamer graphs, observes pipeline state and bus errors,
 and advertises only installed plugin capabilities. The worker registers and
 heartbeats through PostgreSQL and reconnects its authenticated control session
-with bounded backoff. `POST /api/v1/routes/plan-assignment` continues to create
+with bounded backoff. After a session receives a matching Welcome, a later
+disconnect resets the reconnect delay to one second; repeated pre-welcome
+connection failures continue exponential backoff up to 30 seconds. Loopback
+worker test clients send `X-Forwarded-Proto: https` alongside the authenticated
+worker identity and bearer credential. `POST /api/v1/routes/plan-assignment` continues to create
 a plan without executing it. `POST /api/v1/assignments/{assignmentId}/start`
 is the explicit lifecycle action: it verifies the generation, persists the
 starting state, and dispatches a Start command containing the assignment's

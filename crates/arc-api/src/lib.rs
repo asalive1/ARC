@@ -968,7 +968,7 @@ mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         env,
-        net::{IpAddr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         sync::{Arc, Mutex},
     };
 
@@ -987,7 +987,11 @@ mod tests {
         worker_fencing::PgAssignmentGenerationStore,
         worker_registry::PgWorkerRegistry,
     };
-    use arc_worker::CommandDispatchResult;
+    use arc_gstreamer::GstreamerMediaPipeline;
+    use arc_worker::{
+        CommandDispatchResult, WorkerControlClient, WorkerControlClientConfig,
+    };
+    use gstreamer_app::AppSink;
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -2075,6 +2079,284 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["code"], "stale_route_revision");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database and GStreamer plugins; set DATABASE_URL and run ignored tests"]
+    async fn api_dispatch_controls_a_live_rtp_to_srt_media_pipeline() {
+        use gstreamer::prelude::*;
+
+        let url = env::var("DATABASE_URL").expect("DATABASE_URL is set");
+        let pool = connect_postgres(&url).await.expect("database connects");
+        migrate(&pool).await.expect("database migrates");
+        gstreamer::init().expect("GStreamer initializes");
+
+        let loopback = Ipv4Addr::LOCALHOST;
+        let rtp_reservation =
+            UdpSocket::bind((loopback, 0)).expect("RTP source port reserves");
+        let rtp_port = rtp_reservation
+            .local_addr()
+            .expect("RTP source port is available")
+            .port();
+        let srt_reservation =
+            UdpSocket::bind((loopback, 0)).expect("SRT listener port reserves");
+        let srt_port = srt_reservation
+            .local_addr()
+            .expect("SRT listener port is available")
+            .port();
+        drop((rtp_reservation, srt_reservation));
+
+        let worker_id = Uuid::new_v4();
+        let mut worker = Worker {
+            id: worker_id,
+            stable_name: format!("api-media-{worker_id}"),
+            version: "0.1.0".to_owned(),
+            state: WorkerState::Registering,
+            capabilities: WorkerCapabilities {
+                platform: Some(Platform::Linux),
+                architecture: Some(Architecture::X86_64),
+                source_adapters: BTreeSet::from(["rtp_mp2t".to_owned()]),
+                destination_adapters: BTreeSet::from(["srt_mpeg_ts".to_owned()]),
+                ..WorkerCapabilities::default()
+            },
+            capacity: WorkerCapacity {
+                total_capacity_units: 4,
+                assigned_capacity_units: 0,
+                cpu_utilization_ratio: None,
+                memory_utilization_ratio: None,
+                ingress_bits_per_second: None,
+                egress_bits_per_second: None,
+            },
+            last_heartbeat: Utc::now(),
+        };
+        let registry = PgWorkerRegistry::new(pool.clone());
+        registry.register(worker.clone()).await.expect("worker registers");
+        worker.state = WorkerState::Accepting;
+        registry.heartbeat(worker).await.expect("worker becomes eligible");
+
+        let source_profile = SourceMediaProfile::RtpMp2t {
+            bind_address: loopback.into(),
+            port: rtp_port,
+        };
+        let destination_profile = DestinationMediaProfile::SrtMpegTs {
+            host: loopback.to_string(),
+            port: srt_port,
+            mode: arc_domain::SrtMode::Caller,
+        };
+        let source = catalog::create_source(
+            &pool,
+            "Live RTP source",
+            source_profile.adapter_id(),
+            serde_json::to_value(&source_profile).expect("source serializes"),
+        )
+        .await
+        .expect("source creates");
+        let source = catalog::validate_source_draft(&pool, source.id)
+            .await
+            .expect("source validates");
+        let destination = catalog::create_destination(
+            &pool,
+            "Live SRT destination",
+            destination_profile.adapter_id(),
+            serde_json::to_value(&destination_profile).expect("destination serializes"),
+        )
+        .await
+        .expect("destination creates");
+        let destination = catalog::validate_destination_draft(&pool, destination.id)
+            .await
+            .expect("destination validates");
+
+        let receiver_source = gstreamer::ElementFactory::make("srtsrc")
+            .property(
+                "uri",
+                format!("srt://127.0.0.1:{srt_port}?mode=listener"),
+            )
+            .build()
+            .expect("SRT receiver builds");
+        let receiver_sink = AppSink::builder().sync(false).build();
+        let receiver_pipeline = gstreamer::Pipeline::new();
+        receiver_pipeline
+            .add_many([
+                &receiver_source,
+                receiver_sink.upcast_ref::<gstreamer::Element>(),
+            ])
+            .expect("SRT receiver elements add");
+        receiver_source
+            .link(receiver_sink.upcast_ref::<gstreamer::Element>())
+            .expect("SRT receiver links");
+        receiver_pipeline
+            .set_state(gstreamer::State::Playing)
+            .expect("SRT receiver starts");
+
+        let dispatcher = Arc::new(WorkerCommandDispatcher::new(Arc::new(
+            PgAssignmentGenerationStore::new(pool.clone()),
+        )));
+        let app = router_with_database_and_worker_dispatcher(
+            pool.clone(),
+            Arc::new(TestWorkerAuthenticator {
+                worker_id,
+                token: "worker-secret",
+                available: true,
+            }),
+            dispatcher,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("API listener binds");
+        let address = listener.local_addr().expect("API listener has an address");
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, server_app)
+                .await
+                .expect("API server runs");
+        });
+
+        let media_pipeline = Arc::new(GstreamerMediaPipeline::new().expect("worker GStreamer initializes"));
+        let worker_client = WorkerControlClient::new(
+            WorkerControlClientConfig {
+                endpoint: format!("ws://{address}/api/v1/workers/control"),
+                worker_id,
+                bearer_token: "worker-secret".to_owned(),
+                allow_insecure_loopback: true,
+            },
+            Arc::new(PgAssignmentGenerationStore::new(pool.clone())),
+            media_pipeline,
+        )
+        .expect("worker control client builds");
+        let worker_status = worker_client.connection_status();
+        let worker_task = tokio::spawn(async move { worker_client.run_session().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut status = worker_status;
+            while !*status.borrow() {
+                status.changed().await.expect("worker status remains open");
+            }
+        })
+        .await
+        .expect("worker establishes control session");
+
+        let pipeline_id = Uuid::new_v4();
+        let plan_request = serde_json::json!({
+            "pipelineId": pipeline_id,
+            "sourceId": source.id,
+            "sourceRevision": source.current_revision,
+            "destinationId": destination.id,
+            "destinationRevision": destination.current_revision,
+        });
+        let plan_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/plan-assignment")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(plan_request.to_string()))
+                    .expect("planning request builds"),
+            )
+            .await
+            .expect("planning request completes");
+        assert_eq!(plan_response.status(), StatusCode::OK);
+        let plan_body = to_bytes(plan_response.into_body(), usize::MAX)
+            .await
+            .expect("planning response reads");
+        let plan: Value =
+            serde_json::from_slice(&plan_body).expect("planning response is valid JSON");
+        let assignment_id = Uuid::parse_str(
+            plan["assignment"]["id"]
+                .as_str()
+                .expect("assignment ID is returned"),
+        )
+        .expect("assignment ID is valid");
+        let generation = plan["assignment"]["generation"]
+            .as_i64()
+            .expect("assignment generation is returned");
+
+        let start_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/assignments/{assignment_id}/start"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "generation": generation }).to_string(),
+                    ))
+                    .expect("start request builds"),
+            )
+            .await
+            .expect("start request completes");
+        assert_eq!(start_response.status(), StatusCode::OK);
+
+        let mut transport_stream = Vec::with_capacity(188 * 7);
+        for packet_index in 0..7u8 {
+            let mut packet = vec![packet_index; 188];
+            packet[0] = 0x47;
+            packet[1] = 0x01;
+            packet[2] = 0x00;
+            packet[3] = 0x10 | packet_index;
+            transport_stream.extend_from_slice(&packet);
+        }
+        let sender = UdpSocket::bind((loopback, 0)).expect("RTP sender binds");
+        for sequence in 1..=4u16 {
+            let mut datagram = Vec::with_capacity(12 + transport_stream.len());
+            datagram.extend_from_slice(&[0x80, 33]);
+            datagram.extend_from_slice(&sequence.to_be_bytes());
+            datagram.extend_from_slice(&(u32::from(sequence) * 3_600).to_be_bytes());
+            datagram.extend_from_slice(&0x4152_4331_u32.to_be_bytes());
+            datagram.extend_from_slice(&transport_stream);
+            sender
+                .send_to(&datagram, (loopback, rtp_port))
+                .expect("RTP fixture packet sends");
+        }
+
+        let mut received = Vec::new();
+        for _ in 0..5 {
+            let Some(sample) = receiver_sink.try_pull_sample(gstreamer::ClockTime::from_seconds(1))
+            else {
+                continue;
+            };
+            let buffer = sample
+                .buffer()
+                .expect("SRT receiver sample has a buffer")
+                .map_readable()
+                .expect("SRT receiver buffer is readable");
+            received.extend_from_slice(buffer.as_slice());
+            if received
+                .windows(transport_stream.len())
+                .any(|candidate| candidate == transport_stream.as_slice())
+            {
+                break;
+            }
+        }
+        assert!(
+            received
+                .windows(transport_stream.len())
+                .any(|candidate| candidate == transport_stream.as_slice()),
+            "API-dispatched SRT output did not contain the original MPEG-TS packets"
+        );
+
+        let stop_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/assignments/{assignment_id}/stop"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "generation": generation }).to_string(),
+                    ))
+                    .expect("stop request builds"),
+            )
+            .await
+            .expect("stop request completes");
+        assert_eq!(stop_response.status(), StatusCode::OK);
+
+        worker_task.abort();
+        let _ = worker_task.await;
+        server.abort();
+        receiver_pipeline
+            .set_state(gstreamer::State::Null)
+            .expect("SRT receiver stops");
     }
 
     #[tokio::test]

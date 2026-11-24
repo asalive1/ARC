@@ -21,7 +21,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+arc-gstreamer = { path = "../arc-gstreamer" }
 futures-util.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
 sqlx.workspace = true
 tokio-tungstenite.workspace = true
 tower.workspace = true

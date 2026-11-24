@@ -1,4 +1,11 @@
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use arc_application::{
     AssignmentGenerationStore, MediaPipeline, PipelineSpecification, PortError, PortResult,
@@ -32,6 +39,7 @@ pub enum WorkerCommand {
     Stop,
 }
 
+#[derive(Clone, Debug)]
 pub struct WorkerControlClientConfig {
     pub endpoint: String,
     pub worker_id: Uuid,
@@ -39,11 +47,13 @@ pub struct WorkerControlClientConfig {
     pub allow_insecure_loopback: bool,
 }
 
+#[derive(Clone)]
 pub struct WorkerControlClient {
     config: WorkerControlClientConfig,
     generation_store: Arc<dyn AssignmentGenerationStore>,
     media_pipeline: Arc<dyn MediaPipeline>,
     connection_status: watch::Sender<bool>,
+    session_was_established: Arc<AtomicBool>,
 }
 
 impl WorkerControlClient {
@@ -70,6 +80,7 @@ impl WorkerControlClient {
             generation_store,
             media_pipeline,
             connection_status,
+            session_was_established: Arc::new(AtomicBool::new(false)),
         };
         client.websocket_request()?;
         Ok(client)
@@ -154,6 +165,7 @@ impl WorkerControlClient {
             ));
         }
         self.connection_status.send_replace(true);
+        self.session_was_established.store(true, Ordering::Release);
 
         while let Some(message) = socket.next().await {
             match message.map_err(|_| {
@@ -231,6 +243,10 @@ impl WorkerControlClient {
         self.connection_status.subscribe()
     }
 
+    pub fn consume_session_was_established(&self) -> bool {
+        self.session_was_established.swap(false, Ordering::AcqRel)
+    }
+
     fn websocket_request(&self) -> PortResult<tokio_tungstenite::tungstenite::http::Request<()>> {
         let mut request = self
             .config
@@ -274,6 +290,10 @@ impl WorkerControlClient {
             })?;
         request.headers_mut().insert("authorization", authorization);
         request.headers_mut().insert("x-worker-id", worker_id);
+        request.headers_mut().insert(
+            "x-forwarded-proto",
+            HeaderValue::from_static("https"),
+        );
         Ok(request)
     }
 }
@@ -747,12 +767,14 @@ mod tests {
             media_pipeline.clone(),
             true,
         );
+        let observer = client.clone();
         let client_task = tokio::spawn(async move { client.run_session().await });
         let acknowledgements = server.await.expect("test server joins");
         client_task
             .await
             .expect("worker client task joins")
             .expect("worker session completes");
+        assert!(observer.consume_session_was_established());
         assert_eq!(acknowledgements.len(), 3);
         assert_eq!(
             acknowledgements[0].outcome,

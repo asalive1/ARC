@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "arc-application",
  "arc-domain",
+ "arc-gstreamer",
  "arc-infrastructure",
  "arc-shared",
  "arc-worker",
@@ -30,6 +31,8 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "gstreamer",
+ "gstreamer-app",
  "serde",
  "serde_json",
  "sqlx",

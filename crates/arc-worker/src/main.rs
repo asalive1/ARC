@@ -191,7 +191,11 @@ async fn run_control_sessions(client: WorkerControlClient) {
             ),
         }
         tokio::time::sleep(reconnect_delay).await;
-        reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+        reconnect_delay = if client.consume_session_was_established() {
+            Duration::from_secs(1)
+        } else {
+            (reconnect_delay * 2).min(MAX_RECONNECT_DELAY)
+        };
     }
 }
 

@@ -138,9 +138,11 @@ actual network use, including a network-backed ALSA device, may be higher.
 These are deterministic POC placeholders, not measured capacity limits or
 proof that a worker or network can safely carry a stream. Their provisional
 units feed worker placement and reservation, but network bandwidth, memory,
-transport overhead, and variable stream costs are not admitted yet. Calibrate
-resource costs and add the missing dimensions before relying on estimates for
-real media admission. Advertise actual
+transport overhead, and variable stream costs are not fully measured yet.
+The POC now admits ingress/egress limits and explicit CPU/memory pressure
+reported by each worker, while normalized capacity units remain provisional.
+Calibrate resource costs and add the missing dimensions before relying on
+estimates for real media admission. Advertise actual
 GStreamer elements/codecs, audio backends, platform, architecture, and hardware
 acceleration per worker. Linux x86-64/ARM64 Docker and Windows x86-64 are
 targets subject to explicit plugin/codec availability and license validation.

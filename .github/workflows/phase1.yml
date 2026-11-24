@@ -1,0 +1,80 @@
+name: Phase 1
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: arc
+          POSTGRES_PASSWORD: arc-test-only
+          POSTGRES_DB: arc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U arc -d arc"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-alsa
+      - name: Rust unit tests
+        run: cargo test --locked -p arc-domain -p arc-infrastructure -p arc-worker -p arc-api
+      - name: API PostgreSQL and live media tests
+        env:
+          DATABASE_URL: postgres://arc:arc-test-only@127.0.0.1:5432/arc
+        run: cargo test --locked -p arc-api -- --ignored --test-threads=1
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: UI tests
+        working-directory: ui
+        run: npm ci && npm test -- --run
+      - name: UI typecheck and build
+        working-directory: ui
+        run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose default configuration
+        run: docker compose config --quiet
+      - name: Compose secrets configuration
+        env:
+          ARC_WORKER_CREDENTIALS_FILE_SOURCE: ./secrets/worker_credentials.json
+          ARC_WORKER_CONTROL_TOKEN_FILE_SOURCE: ./secrets/worker_control_token.txt
+          ARC_WORKER_CONTROL_ENDPOINT: wss://ingress.example/api/v1/workers/control
+        run: |
+          mkdir -p secrets
+          printf '%s' '{"00000000-0000-0000-0000-000000000001":"abababababababababababababababababababababababababababababababab"}' > secrets/worker_credentials.json
+          printf '%s' 'abababababababababababababababababababababababababababababababab' > secrets/worker_control_token.txt
+          docker compose -f compose.yaml -f compose.secrets.yaml --profile worker config --quiet
+      - name: Build API, UI and worker images
+        run: docker compose build api ui worker

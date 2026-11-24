@@ -30,7 +30,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
         .parse::<Uuid>()
         .map_err(|error| invalid_config("ARC_WORKER_ID", error))?;
     let endpoint = required_env("ARC_WORKER_CONTROL_ENDPOINT")?;
-    let bearer_token = required_env("ARC_WORKER_CONTROL_TOKEN")?;
+    let bearer_token = worker_control_token()?;
     let stable_name =
         env::var("ARC_WORKER_NAME").unwrap_or_else(|_| format!("arc-worker-{worker_id}"));
     let enable_alsa = env::var("ARC_WORKER_ENABLE_ALSA")
@@ -46,6 +46,14 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
             invalid_config("ARC_WORKER_CAPACITY_UNITS", "must be greater than zero").into(),
         );
     }
+    let ingress_bits_per_second =
+        optional_u64_env("ARC_WORKER_INGRESS_BITS_PER_SECOND")?;
+    let egress_bits_per_second =
+        optional_u64_env("ARC_WORKER_EGRESS_BITS_PER_SECOND")?;
+    let cpu_utilization_ratio =
+        optional_ratio_env("ARC_WORKER_CPU_UTILIZATION_RATIO")?;
+    let memory_utilization_ratio =
+        optional_ratio_env("ARC_WORKER_MEMORY_UTILIZATION_RATIO")?;
 
     let media_pipeline = Arc::new(GstreamerMediaPipeline::new().map_err(port_error)?);
     let mut worker = local_worker(
@@ -57,6 +65,10 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     worker.capabilities.platform = Some(native_platform()?);
     worker.capabilities.architecture = Some(native_architecture()?);
     worker.capacity.total_capacity_units = capacity_units;
+    worker.capacity.ingress_bits_per_second = ingress_bits_per_second;
+    worker.capacity.egress_bits_per_second = egress_bits_per_second;
+    worker.capacity.cpu_utilization_ratio = cpu_utilization_ratio;
+    worker.capacity.memory_utilization_ratio = memory_utilization_ratio;
     if worker.capabilities.source_adapters.is_empty()
         || worker.capabilities.destination_adapters.is_empty()
     {
@@ -253,6 +265,7 @@ async fn run_control_sessions(client: WorkerControlClient) {
                 "worker control session failed; reconnecting"
             ),
         }
+
         tokio::time::sleep(reconnect_delay).await;
         reconnect_delay = if client.consume_session_was_established() {
             Duration::from_secs(1)
@@ -260,6 +273,66 @@ async fn run_control_sessions(client: WorkerControlClient) {
             (reconnect_delay * 2).min(MAX_RECONNECT_DELAY)
         };
     }
+}
+
+fn worker_control_token() -> io::Result<String> {
+    let token = if let Ok(path) = env::var("ARC_WORKER_CONTROL_TOKEN_FILE") {
+        if path.trim().is_empty() {
+            return Err(invalid_config(
+                "ARC_WORKER_CONTROL_TOKEN_FILE",
+                "must not be empty",
+            ));
+        }
+        std::fs::read_to_string(&path)
+            .map_err(|error| invalid_config(
+                "ARC_WORKER_CONTROL_TOKEN_FILE",
+                &format!("could not read secret file: {error}"),
+            ))?
+            .trim()
+            .to_owned()
+    } else {
+        required_env("ARC_WORKER_CONTROL_TOKEN")?
+    };
+    if token.len() != 64
+        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid_config(
+            "ARC_WORKER_CONTROL_TOKEN",
+            "must be a 64-character hexadecimal token",
+        ));
+    }
+    Ok(token)
+}
+
+fn optional_u64_env(name: &str) -> io::Result<Option<u64>> {
+    let Some(value) = env::var(name).ok() else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    value
+        .trim()
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| invalid_config(name, error))
+}
+
+fn optional_ratio_env(name: &str) -> io::Result<Option<f32>> {
+    let Some(value) = env::var(name).ok() else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let ratio = value
+        .trim()
+        .parse::<f32>()
+        .map_err(|error| invalid_config(name, error))?;
+    if !(0.0..=1.0).contains(&ratio) {
+        return Err(invalid_config(name, "must be between 0.0 and 1.0"));
+    }
+    Ok(Some(ratio))
 }
 
 fn native_architecture() -> io::Result<Architecture> {

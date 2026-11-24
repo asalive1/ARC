@@ -35,6 +35,24 @@ and overwrites `X-Forwarded-Proto` with `https`. Compose does not create or
 trust a development certificate and the worker does not permit plaintext
 connections. Keep these values in the ignored `.env`, not in source control.
 
+For the Docker-secrets and TLS ingress POC, generate a certificate/key and
+secret files, then start with both Compose files:
+
+```powershell
+.\deploy\generate-local-tls.ps1
+New-Item -ItemType Directory secrets -Force
+@('{"<worker-uuid>":"<64-character-hex-token>"}') | Set-Content secrets\worker_credentials.json
+Set-Content secrets\worker_control_token.txt "<64-character-hex-token>"
+$env:ARC_WORKER_CREDENTIALS_FILE_SOURCE="./secrets/worker_credentials.json"
+$env:ARC_WORKER_CONTROL_TOKEN_FILE_SOURCE="./secrets/worker_control_token.txt"
+docker compose -f compose.yaml -f compose.secrets.yaml --profile worker up --build --wait
+```
+
+The Nginx ingress forwards WebSocket upgrades to the API and sets
+`X-Forwarded-Proto=https`. Use a certificate/trust chain valid for the worker's
+configured WSS hostname; the generated local certificate is not trusted by
+default and must not be reused as a production certificate.
+
 After configuration, start the worker profile with:
 
 ```powershell
@@ -47,10 +65,54 @@ control session is connected. `ARC_WORKER_CAPACITY_UNITS` defaults to `2`.
 ALSA capability is disabled by default; enabling `ARC_WORKER_ENABLE_ALSA`
 requires exposing the host's audio device to the worker container. The GStreamer
 adapter advertises only paths whose required plugin factories are installed.
+For Docker, add the host sound device to the worker service override explicitly,
+for example:
+
+```yaml
+services:
+  worker:
+    devices:
+      - "/dev/snd:/dev/snd"
+    group_add:
+      - "audio"
+```
+
+Worker capacity can be calibrated conservatively with optional heartbeat
+configuration:
+`ARC_WORKER_INGRESS_BITS_PER_SECOND`,
+`ARC_WORKER_EGRESS_BITS_PER_SECOND`,
+`ARC_WORKER_CPU_UTILIZATION_RATIO`, and
+`ARC_WORKER_MEMORY_UTILIZATION_RATIO`. Bandwidth limits are absolute POC limits.
+CPU and memory ratios must be from `0.0` to `1.0`; a configured ratio at or
+above `0.90` rejects new placement. Unknown or absent limits remain unbounded
+and do not replace real performance calibration.
 
 `docker compose down` stops and removes the containers but preserves database
 data. `docker compose down --volumes` also permanently removes the local
 database volume.
+
+## PostgreSQL clean migration and restore evidence
+
+Run the isolated recovery acceptance script:
+
+```powershell
+.\deploy\validate-postgres-recovery.ps1
+```
+
+The script creates a fresh PostgreSQL database, starts the API image, waits for
+readiness, restarts the API container, dumps the database, restores it into a
+second database, and verifies a representative marker. It writes
+`artifacts/arc-postgres-recovery.dump` and removes all temporary containers and
+network resources afterward.
+
+Generate the locked Rust package inventory for release review:
+
+```powershell
+.\deploy\generate-rust-dependency-inventory.ps1
+```
+
+This produces JSON and tab-separated package inventories. It does not replace
+the required runtime OS/GStreamer license and package closure.
 
 ## Scope and limitations
 
@@ -73,9 +135,10 @@ database volume.
   multi-platform base images and avoid platform-specific media packages, but
   Linux AMD64/ARM64 release builds and Windows x86-64 builds have not yet been
   validated.
-- This is a local development stack, not a production deployment. API
-  authentication, TLS termination, worker networking/device access, backups,
-  and production secret management remain out of scope.
+- This is a local development stack, not a production deployment. Docker
+  secret-file mounting and the WSS ingress override are POC paths; production
+  secret-provider lifecycle, certificate automation, worker networking/device
+  access, backups, and key rotation remain separate release work.
 - The API enables the worker-control WebSocket route only when
   `ARC_WORKER_CREDENTIALS_JSON` is configured. Compose does not include a TLS
   proxy; the worker profile therefore requires an independently configured

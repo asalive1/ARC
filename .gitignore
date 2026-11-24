@@ -5,3 +5,6 @@ ui/dist/
 .env
 .env.*
 !.env.example
+artifacts/
+deploy/tls/*.pem
+deploy/tls/*.key

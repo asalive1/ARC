@@ -1,4 +1,10 @@
-use std::{env, error::Error, net::SocketAddr, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    io::{self, Read},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use arc_api::{
     router_with_database, router_with_database_and_worker_dispatcher, WorkerCommandDispatcher,
@@ -21,11 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let database_pool = connect_postgres(&database_url).await?;
     migrate(&database_pool).await?;
 
-    let credentials_json = match env::var(LOCAL_WORKER_CREDENTIALS_ENV) {
-        Ok(value) if !value.trim().is_empty() => Some(value),
-        Ok(_) | Err(env::VarError::NotPresent) => None,
-        Err(error) => return Err(error.into()),
-    };
+    let credentials_json = worker_credentials_json()?;
     let api_router = if let Some(credentials_json) = credentials_json {
         let secret_provider =
             LocalWorkerSecretProvider::from_json(&credentials_json).map_err(|error| {
@@ -69,4 +71,39 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received");
+}
+
+fn worker_credentials_json() -> Result<Option<String>, Box<dyn Error>> {
+    if let Ok(path) = env::var("ARC_WORKER_CREDENTIALS_FILE") {
+        if path.trim().is_empty() {
+            return Err(invalid_config(
+                "ARC_WORKER_CREDENTIALS_FILE",
+                "must not be empty",
+            ).into());
+        }
+        let mut file = std::fs::File::open(&path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        if contents.trim().is_empty() {
+            return Err(invalid_config(
+                "ARC_WORKER_CREDENTIALS_FILE",
+                "secret file is empty",
+            )
+            .into());
+        }
+        return Ok(Some(contents));
+    }
+
+    match env::var(LOCAL_WORKER_CREDENTIALS_ENV) {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn invalid_config(name: &str, detail: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{name}: {detail}"),
+    )
 }

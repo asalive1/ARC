@@ -93,6 +93,8 @@ pub struct PipelineRequirements {
     pub platform: Option<Platform>,
     pub architecture: Option<Architecture>,
     pub capacity_units: u32,
+    pub ingress_bits_per_second: Option<u64>,
+    pub egress_bits_per_second: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -103,6 +105,10 @@ pub enum PlacementRejection {
     HeartbeatInFuture,
     MissingCapabilities(Vec<String>),
     InsufficientCapacity { required: u32, available: u32 },
+    InsufficientIngressBandwidth { required: u64, available: u64 },
+    InsufficientEgressBandwidth { required: u64, available: u64 },
+    CpuPressure,
+    MemoryPressure,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -246,6 +252,36 @@ impl Worker {
                 available,
             });
         }
+        if let Some(required) = requirements.ingress_bits_per_second {
+            if self.capacity.ingress_bits_per_second.is_some_and(|available| required > available) {
+                return Some(PlacementRejection::InsufficientIngressBandwidth {
+                    required,
+                    available: self.capacity.ingress_bits_per_second.unwrap_or(0),
+                });
+            }
+        }
+        if let Some(required) = requirements.egress_bits_per_second {
+            if self.capacity.egress_bits_per_second.is_some_and(|available| required > available) {
+                return Some(PlacementRejection::InsufficientEgressBandwidth {
+                    required,
+                    available: self.capacity.egress_bits_per_second.unwrap_or(0),
+                });
+            }
+        }
+        if self
+            .capacity
+            .cpu_utilization_ratio
+            .is_some_and(|ratio| ratio >= 0.90)
+        {
+            return Some(PlacementRejection::CpuPressure);
+        }
+        if self
+            .capacity
+            .memory_utilization_ratio
+            .is_some_and(|ratio| ratio >= 0.90)
+        {
+            return Some(PlacementRejection::MemoryPressure);
+        }
 
         None
     }
@@ -323,6 +359,36 @@ mod tests {
                 required: 3,
                 available: 2,
             })
+        );
+    }
+
+    #[test]
+    fn bandwidth_and_resource_pressure_rejections_are_structural() {
+        let requirements = PipelineRequirements {
+            source_adapter: Some("rtp".to_owned()),
+            destination_adapter: Some("rtp".to_owned()),
+            capacity_units: 1,
+            ingress_bits_per_second: Some(2_000_000),
+            egress_bits_per_second: Some(3_000_000),
+            ..PipelineRequirements::default()
+        };
+        let mut limited = worker(WorkerState::Accepting, 4);
+        limited.capacity.ingress_bits_per_second = Some(1_000_000);
+        limited.capacity.egress_bits_per_second = Some(4_000_000);
+        assert_eq!(
+            limited.placement_rejection(&requirements),
+            Some(PlacementRejection::InsufficientIngressBandwidth {
+                required: 2_000_000,
+                available: 1_000_000,
+            })
+        );
+
+        let mut pressured = worker(WorkerState::Accepting, 4);
+        pressured.capacity.egress_bits_per_second = Some(4_000_000);
+        pressured.capacity.cpu_utilization_ratio = Some(0.91);
+        assert_eq!(
+            pressured.placement_rejection(&requirements),
+            Some(PlacementRejection::CpuPressure)
         );
     }
 

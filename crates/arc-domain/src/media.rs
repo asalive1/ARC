@@ -197,6 +197,8 @@ pub fn estimate_pipeline_requirements(
             platform,
             audio_backends,
             capacity_units: 2,
+            ingress_bits_per_second: ingress,
+            egress_bits_per_second: egress,
             ..PipelineRequirements::default()
         },
         ingress_payload_bits_per_second: ingress,

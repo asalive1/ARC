@@ -497,6 +497,8 @@ mod tests {
                 platform: None,
                 architecture: None,
                 capacity_units: 1,
+                ingress_bits_per_second: None,
+                egress_bits_per_second: None,
             },
             configuration: serde_json::json!({}),
         }

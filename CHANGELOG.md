@@ -35,6 +35,10 @@
 - Added PostgreSQL-backed latest-session leases for cross-process worker replacement fencing.
 - Added database-backed API readiness and Compose API health checks.
 - Made unstarted assignment cancellation repeatable for the same exact generation while rejecting active or uncertain lifecycle states.
+- Added worker heartbeat ingress/egress limits and CPU/memory pressure admission guards.
+- Documented explicit ALSA device exposure for the opt-in worker container.
+- Added file-backed Docker secret startup inputs and a WSS Nginx ingress Compose override.
+- Added isolated PostgreSQL clean-migration, restart, dump, and restore acceptance evidence script.
 - Added the `arc-gstreamer` adapter for supported Phase 1 paths, a worker executable with PostgreSQL registration/heartbeat and control reconnect, and an opt-in Compose worker profile.
 - Added a live GStreamer RTP MPEG-TS-to-SRT loopback test that verifies the original transport-stream payload reaches an SRT listener.
 - Added a generation-checked Start lifecycle endpoint that dispatches the persisted route snapshot to the assigned worker and records running state only after acknowledgement.

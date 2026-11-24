@@ -2,6 +2,11 @@ export interface Liveness {
   status: "alive";
 }
 
+export interface Readiness {
+  status: "ready";
+  database: "ready";
+}
+
 export type SourceMediaProfile =
   | { kind: "alsa_l16"; device: string }
   | {
@@ -146,6 +151,28 @@ export async function fetchLiveness(
   }
 
   return { status: "alive" };
+}
+
+export async function fetchReadiness(
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<Readiness> {
+  const response = await fetcher(`${baseUrl}/api/v1/health/ready`);
+  if (!response.ok) {
+    throw new Error(`API readiness request failed with HTTP ${response.status}`);
+  }
+  const body: unknown = await response.json();
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    !("status" in body) ||
+    body.status !== "ready" ||
+    !("database" in body) ||
+    body.database !== "ready"
+  ) {
+    throw new Error("API returned an invalid readiness response");
+  }
+  return { status: "ready", database: "ready" };
 }
 
 export function fetchSources(

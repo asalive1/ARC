@@ -53,6 +53,7 @@ pub fn router() -> Router {
 
 fn database_routes() -> Router {
     router()
+        .route("/api/v1/health/ready", get(readiness))
         .route("/api/v1/sources", get(list_sources).post(create_source))
         .route("/api/v1/sources/{source_id}", put(update_source))
         .route(
@@ -255,7 +256,14 @@ async fn handle_worker_control(
     }
 
     let session = match &dispatcher {
-        Some(dispatcher) => Some(dispatcher.start_session(worker_id).await),
+        Some(dispatcher) => match dispatcher.start_session(worker_id).await {
+            Ok(session) => Some(session),
+            Err(error) => {
+                tracing::error!(%worker_id, code = error.code, message = %error.message, "failed to register worker control session lease");
+                close_worker_control(&mut socket, "worker session unavailable").await;
+                return;
+            }
+        },
         None => None,
     };
     let welcome = arc_shared::WorkerSessionWelcome {
@@ -326,6 +334,26 @@ async fn close_worker_control(socket: &mut WebSocket, reason: &'static str) {
 
 async fn liveness() -> Json<Value> {
     Json(json!({ "status": "alive" }))
+}
+
+async fn readiness(
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result: Result<i32, sqlx::Error> =
+        sqlx::query_scalar("SELECT 1").fetch_one(&pool).await;
+    match result {
+        Ok(_) => Ok(Json(json!({ "status": "ready", "database": "ready" }))),
+        Err(error) => {
+            tracing::error!(%error, "API readiness database check failed");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "database": "unavailable"
+                })),
+            ))
+        }
+    }
 }
 
 async fn capabilities() -> Json<Value> {
@@ -661,7 +689,10 @@ async fn start_assignment(
         Err(error) => {
             if matches!(
                 error.code,
-                "worker_session_unavailable" | "worker_session_busy" | "worker_command_too_large"
+                "worker_session_unavailable"
+                    | "worker_session_replaced"
+                    | "worker_session_busy"
+                    | "worker_command_too_large"
             ) {
                 assignments
                     .reset_start(assignment_id, request.generation)
@@ -923,7 +954,11 @@ impl ApiError {
                 code: error.code,
                 message: error.message,
             },
-            "worker_session_unavailable" | "worker_session_busy" | "worker_session_ended" => Self {
+            "worker_session_unavailable"
+            | "worker_session_busy"
+            | "worker_session_ended"
+            | "worker_session_replaced"
+            | "worker_session_registration_failed" => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: error.code,
                 message: error.message,
@@ -1744,6 +1779,34 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn readiness_route_reports_database_health() {
+        let pool = connect_postgres(&env::var("DATABASE_URL").expect("DATABASE_URL is set"))
+            .await
+            .expect("database connects");
+        migrate(&pool).await.expect("database migrates");
+
+        let response = router_with_database(pool)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health/ready")
+                    .body(Body::empty())
+                    .expect("readiness request builds"),
+            )
+            .await
+            .expect("readiness request completes");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("readiness response reads");
+        let value: Value =
+            serde_json::from_slice(&body).expect("readiness response is JSON");
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["database"], "ready");
+    }
+
+    #[tokio::test]
     async fn capability_route_returns_worker_collection() {
         let response = router()
             .oneshot(
@@ -2188,9 +2251,10 @@ mod tests {
             .set_state(gstreamer::State::Playing)
             .expect("SRT receiver starts");
 
-        let dispatcher = Arc::new(WorkerCommandDispatcher::new(Arc::new(
-            PgAssignmentGenerationStore::new(pool.clone()),
-        )));
+        let dispatcher = Arc::new(WorkerCommandDispatcher::new_with_lease_pool(
+            Arc::new(PgAssignmentGenerationStore::new(pool.clone())),
+            pool.clone(),
+        ));
         let app = router_with_database_and_worker_dispatcher(
             pool.clone(),
             Arc::new(TestWorkerAuthenticator {
@@ -2492,9 +2556,10 @@ mod tests {
             .as_i64()
             .expect("assignment generation is returned");
 
-        let dispatcher = Arc::new(WorkerCommandDispatcher::new(Arc::new(
-            PgAssignmentGenerationStore::new(pool.clone()),
-        )));
+        let dispatcher = Arc::new(WorkerCommandDispatcher::new_with_lease_pool(
+            Arc::new(PgAssignmentGenerationStore::new(pool.clone())),
+            pool.clone(),
+        ));
         let app = router_with_database_and_worker_dispatcher(
             pool.clone(),
             Arc::new(TestWorkerAuthenticator {

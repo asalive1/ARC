@@ -31,7 +31,7 @@ import {
   createDestination as createDestinationRequest,
   createSource as createSourceRequest,
   fetchDestinations,
-  fetchLiveness,
+  fetchReadiness,
   fetchPipelineAssignment,
   fetchSources,
   planRoute,
@@ -159,8 +159,8 @@ export function App() {
   );
 
   const health = useQuery({
-    queryKey: ["api", "liveness"],
-    queryFn: () => fetchLiveness(apiBaseUrl),
+    queryKey: ["api", "readiness"],
+    queryFn: () => fetchReadiness(apiBaseUrl),
     retry: 1,
   });
   const sources = useQuery({

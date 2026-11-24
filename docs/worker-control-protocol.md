@@ -219,7 +219,9 @@ assignments. Clients can use this to reconcile an uncertain planning or
 cancellation commit rather than assuming a connection failure means rollback.
 `POST /api/v1/assignments/{assignmentId}/cancel` requires the exact generation
 and atomically cancels only a `planned`, `not_started` assignment while
-releasing its reservation. It cannot stop a running pipeline. Planning requests
+releasing its reservation. Repeating the exact cancel generation is idempotent.
+Starting/running/stopping assignments cannot be converted to cancellation,
+so cancellation never interrupts uncertain worker execution. Planning requests
 require a non-nil UUID `Idempotency-Key`. The same key and request body replay
 the original planned or unavailable result for 24 hours; reusing a key with a
 different body returns a conflict. The key is distinct from the stable pipeline
@@ -247,10 +249,14 @@ generations before executing commands.
 The WebSocket session sends versioned command envelopes and receives correlated
 completion acknowledgements; it still rejects binary frames and does not
 process worker events. The worker executable runs the WebSocket client and
-registers Start/Stop media handlers. Cross-process session leases and restart
-reconciliation remain unimplemented. Workers independently fence generations
-before executing commands; API-side dispatch alone does not make stale
-in-flight work safe.
+registers Start/Stop media handlers. After a successful Welcome, the executable queries
+persisted assignments assigned to that worker and re-prepares/restarts
+starting or running assignments, or re-executes stopping assignments and
+marks them stopped. The API records the latest control session ID for each
+worker in PostgreSQL. A replacement session updates the lease and dispatch
+rejects a local socket that no longer matches it. Disconnect cleanup deletes
+only the matching lease, so an old API instance cannot remove a newer session.
+Workers independently fence generations before executing commands.
 
 ## Drain request foundation
 

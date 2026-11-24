@@ -20,6 +20,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Liveness"
+  /health/ready:
+    get:
+      operationId: getReadiness
+      summary: Check whether the API and its PostgreSQL database are ready
+      responses:
+        "200":
+          description: The API and PostgreSQL database are ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+        "503":
+          description: PostgreSQL is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
   /system/capabilities:
     get:
       operationId: getSystemCapabilities
@@ -312,7 +329,7 @@ paths:
     post:
       operationId: cancelUnstartedAssignment
       summary: Cancel an unstarted planned assignment
-      description: Requires the assignment generation as a fencing check. Only planned assignments still observed as not_started can be cancelled; cancellation atomically releases the capacity reservation. It does not stop running media or disable resources used by another active assignment.
+      description: Requires the assignment generation as a fencing check. Only planned assignments still observed as not_started can be cancelled; cancellation atomically releases the capacity reservation. Repeating cancellation for the same already-cancelled generation is idempotent. It does not stop starting/running media or disable resources used by another active assignment.
       parameters:
         - name: assignmentId
           in: path
@@ -501,6 +518,16 @@ components:
         status:
           type: string
           const: alive
+    Readiness:
+      type: object
+      required: [status, database]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        database:
+          type: string
+          enum: [ready, unavailable]
     Capabilities:
       type: object
       required: [apiVersion, workers]

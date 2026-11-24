@@ -1,10 +1,12 @@
 use std::{env, error::Error, io, sync::Arc, time::Duration};
 
-use arc_application::WorkerRegistry;
+use arc_application::{MediaPipeline, PipelineSpecification, WorkerRegistry};
 use arc_domain::{Architecture, Platform, WorkerState};
 use arc_gstreamer::GstreamerMediaPipeline;
 use arc_infrastructure::{
-    postgres::connect_postgres, worker_fencing::PgAssignmentGenerationStore,
+    assignments::PgAssignments,
+    postgres::connect_postgres,
+    worker_fencing::PgAssignmentGenerationStore,
     worker_registry::PgWorkerRegistry,
 };
 use arc_worker::{local_worker, WorkerControlClient, WorkerControlClientConfig};
@@ -74,6 +76,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
         .await
         .map_err(port_error)?;
 
+    let assignments = PgAssignments::new(pool.clone());
     let generation_store = Arc::new(PgAssignmentGenerationStore::new(pool));
     let client = WorkerControlClient::new(
         WorkerControlClientConfig {
@@ -112,13 +115,23 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
                 if changed.is_err() {
                     return Err(io::Error::other("worker connection status channel closed").into());
                 }
-                worker.state = if *connection_status.borrow() {
+                let connected = *connection_status.borrow();
+                worker.state = if connected {
                     WorkerState::Ready
                 } else {
                     WorkerState::Warming
                 };
                 worker.last_heartbeat = Utc::now();
                 registry.heartbeat(worker.clone()).await.map_err(port_error)?;
+                if connected {
+                    reconcile_runtime_assignments(
+                        &assignments,
+                        media_pipeline.as_ref(),
+                        worker_id,
+                    )
+                    .await
+                    .map_err(port_error)?;
+                }
             }
             _ = heartbeat.tick() => {
                 worker.state = if *connection_status.borrow() {
@@ -137,6 +150,56 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     worker.state = WorkerState::Offline;
     worker.last_heartbeat = Utc::now();
     registry.heartbeat(worker).await.map_err(port_error)?;
+    Ok(())
+}
+
+async fn reconcile_runtime_assignments(
+    assignments: &PgAssignments,
+    media_pipeline: &dyn MediaPipeline,
+    worker_id: Uuid,
+) -> Result<(), arc_application::PortError> {
+    for snapshot in assignments
+        .list_runtime_for_worker(worker_id)
+        .await?
+    {
+        let Some(route) = snapshot.assignment.route else {
+            continue;
+        };
+        let specification = PipelineSpecification {
+            pipeline_id: snapshot.assignment.pipeline_id,
+            assignment_generation: snapshot.assignment.generation,
+            requirements: snapshot.assignment.requirements,
+            configuration: route.configuration,
+        };
+
+        if snapshot.desired_state == "running" {
+            media_pipeline.prepare(&specification).await?;
+            media_pipeline
+                .start(specification.pipeline_id, specification.assignment_generation)
+                .await?;
+            assignments
+                .mark_started(
+                    snapshot.assignment.id,
+                    snapshot.assignment.generation,
+                )
+                .await?;
+        } else if snapshot.desired_state == "stopped"
+            && snapshot.observed_state == "stopping"
+        {
+            media_pipeline
+                .stop(
+                    specification.pipeline_id,
+                    specification.assignment_generation,
+                )
+                .await?;
+            assignments
+                .mark_stopped(
+                    snapshot.assignment.id,
+                    snapshot.assignment.generation,
+                )
+                .await?;
+        }
+    }
     Ok(())
 }
 

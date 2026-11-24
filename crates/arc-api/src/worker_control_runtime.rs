@@ -9,6 +9,7 @@ use arc_shared::{WorkerCommandAcknowledgement, WorkerCommandEnvelope, WorkerComm
 use arc_worker::{dispatch_if_fresh, CommandDispatchResult};
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket};
 use serde::Serialize;
+use sqlx::PgPool;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use uuid::Uuid;
 
@@ -20,6 +21,7 @@ pub struct WorkerCommandDispatcher {
     generation_store: Arc<dyn AssignmentGenerationStore>,
     sessions: Mutex<HashMap<Uuid, ActiveSession>>,
     pipeline_locks: Mutex<HashMap<Uuid, Weak<Mutex<()>>>>,
+    lease_pool: Option<PgPool>,
 }
 
 struct ActiveSession {
@@ -47,6 +49,19 @@ impl WorkerCommandDispatcher {
             generation_store,
             sessions: Mutex::new(HashMap::new()),
             pipeline_locks: Mutex::new(HashMap::new()),
+            lease_pool: None,
+        }
+    }
+
+    pub fn new_with_lease_pool(
+        generation_store: Arc<dyn AssignmentGenerationStore>,
+        lease_pool: PgPool,
+    ) -> Self {
+        Self {
+            generation_store,
+            sessions: Mutex::new(HashMap::new()),
+            pipeline_locks: Mutex::new(HashMap::new()),
+            lease_pool: Some(lease_pool),
         }
     }
 
@@ -85,8 +100,31 @@ impl WorkerCommandDispatcher {
         result
     }
 
-    pub(crate) async fn start_session(&self, worker_id: Uuid) -> WorkerControlSession {
+    pub(crate) async fn start_session(
+        &self,
+        worker_id: Uuid,
+    ) -> PortResult<WorkerControlSession> {
         let session_id = Uuid::new_v4();
+        if let Some(pool) = &self.lease_pool {
+            sqlx::query(
+                "INSERT INTO worker_control_sessions (worker_id, session_id) \
+                 VALUES ($1, $2) \
+                 ON CONFLICT (worker_id) DO UPDATE SET \
+                 session_id = EXCLUDED.session_id, \
+                 created_at = clock_timestamp(), \
+                 replaced_at = clock_timestamp()",
+            )
+            .bind(worker_id)
+            .bind(session_id)
+            .execute(pool)
+            .await
+            .map_err(|error| PortError {
+                code: "worker_session_registration_failed",
+                message: format!(
+                    "worker control session lease could not be registered: {error}"
+                ),
+            })?;
+        }
         let (command_sender, commands) = mpsc::channel(WORKER_COMMAND_QUEUE_CAPACITY);
         let (cancel, cancelled) = watch::channel(false);
         let replaced = self.sessions.lock().await.insert(
@@ -100,12 +138,12 @@ impl WorkerCommandDispatcher {
         if let Some(replaced) = replaced {
             let _ = replaced.cancel.send(true);
         }
-        WorkerControlSession {
+        Ok(WorkerControlSession {
             worker_id,
             session_id,
             commands,
             cancelled,
-        }
+        })
     }
 
     pub(crate) async fn serve_session(
@@ -208,18 +246,38 @@ impl WorkerCommandDispatcher {
         command_id: Uuid,
         message: String,
     ) -> PortResult<()> {
-        let sender = self
+        let (session_id, sender) = self
             .sessions
             .lock()
             .await
             .get(&worker_id)
-            .map(|session| session.commands.clone())
+            .map(|session| (session.session_id, session.commands.clone()))
             .ok_or_else(|| {
                 session_error(
                     "worker_session_unavailable",
                     "worker has no active control session",
                 )
             })?;
+        if let Some(pool) = &self.lease_pool {
+            let current: Option<Uuid> = sqlx::query_scalar(
+                "SELECT session_id FROM worker_control_sessions WHERE worker_id = $1",
+            )
+            .bind(worker_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| PortError {
+                code: "worker_session_registration_failed",
+                message: format!(
+                    "worker control session lease could not be read: {error}"
+                ),
+            })?;
+            if current != Some(session_id) {
+                return Err(session_error(
+                    "worker_session_replaced",
+                    "worker control session was replaced by another API instance",
+                ));
+            }
+        }
         let (completion, completed) = oneshot::channel();
         sender
             .try_send(PendingCommand {
@@ -283,6 +341,17 @@ impl WorkerCommandDispatcher {
             .is_some_and(|session| session.session_id == session_id)
         {
             sessions.remove(&worker_id);
+        }
+        drop(sessions);
+        if let Some(pool) = &self.lease_pool {
+            let _ = sqlx::query(
+                "DELETE FROM worker_control_sessions \
+                 WHERE worker_id = $1 AND session_id = $2",
+            )
+            .bind(worker_id)
+            .bind(session_id)
+            .execute(pool)
+            .await;
         }
     }
 }

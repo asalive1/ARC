@@ -45,6 +45,7 @@ requires attention to all listed terms.
 | Emotion React / Styled | 11.14.0 / 11.14.1 | MIT | UI styling |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | Worker WebSocket client message handling and API session tests |
 | GStreamer Rust bindings | 0.25.4 | MIT OR Apache-2.0 | Worker media-plane adapter |
+| gstreamer-app Rust bindings | 0.25.2 | MIT OR Apache-2.0 | API-dispatched live RTP/SRT integration-test receivers |
 | Material UI | 7.3.11 | MIT | UI components |
 | TanStack React Query | 5.108.3 | MIT | UI data fetching |
 | React / React DOM | 19.3.1 / 19.3.1 | MIT | UI runtime |
@@ -105,6 +106,7 @@ package metadata.
 | NGINX 1.29 | Serves the UI in the runtime image | [BSD-2-Clause](https://nginx.org/LICENSE); preserve the applicable source or binary notices. |
 | GStreamer 1.22 runtime | Worker RTP, ALSA and SRT pipeline plugins | GStreamer core/base/good are LGPL-2.1-or-later; the SRT library is MPL-2.0 as approved for Phase 1. Preserve notices and source obligations. |
 | Rust toolchain | API build image (`rust:1-slim`) and worker build image (`rust:1-bookworm`) | Rust is generally [MIT OR Apache-2.0](https://github.com/rust-lang/rust/blob/master/LICENSE-MIT); toolchain components and bundled dependencies may differ. |
+| curl/libcurl | API runtime healthcheck package | curl license (MIT-style); preserve applicable notices. |
 | Node.js 22 | UI build image | Node.js is generally [MIT](https://github.com/nodejs/node/blob/main/LICENSE); bundled components have their own notices. |
 | Debian Bookworm / Alpine Linux | Base images for API, worker, UI, database and build stages | Distributions contain many separately licensed packages. Inventory the actual packages in each exact image; neither image has a single blanket license. |
 

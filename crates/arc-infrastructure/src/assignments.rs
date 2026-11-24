@@ -349,6 +349,36 @@ impl PgAssignments {
         rows.into_iter().map(PlannedAssignment::try_from).collect()
     }
 
+    pub async fn list_runtime_for_worker(
+        &self,
+        worker_id: Uuid,
+    ) -> PortResult<Vec<AssignmentSnapshot>> {
+        if worker_id.is_nil() {
+            return Err(PortError {
+                code: "invalid_worker_id",
+                message: "worker ID must not be nil".to_owned(),
+            });
+        }
+        let rows = sqlx::query_as::<_, AssignmentSnapshotRow>(
+            "SELECT id, resource_id AS pipeline_id, worker_id, generation, \
+             reservation_id, requirements, source_id, source_revision, destination_id, \
+             destination_revision, media_path, route_configuration, desired_state, \
+             observed_state FROM pipeline_assignments \
+             WHERE resource_type = 'pipeline' AND worker_id = $1 \
+             AND ((desired_state = 'running' AND observed_state IN ('starting', 'running')) \
+               OR (desired_state = 'stopped' AND observed_state = 'stopping')) \
+             ORDER BY id",
+        )
+        .bind(worker_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| error_with("database_error", error))?;
+        rows
+            .into_iter()
+            .map(AssignmentSnapshot::try_from)
+            .collect()
+    }
+
     pub async fn get_by_pipeline(
         &self,
         pipeline_id: Uuid,
@@ -552,6 +582,12 @@ impl PgAssignments {
             message: "pipeline assignment does not exist".to_owned(),
         })?;
         let initial_snapshot = AssignmentSnapshot::try_from(initial_row)?;
+        if initial_snapshot.assignment.generation != generation {
+            return Err(PortError {
+                code: "assignment_conflict",
+                message: "assignment generation does not match the requested generation".to_owned(),
+            });
+        }
         lock_route_resources(
             &mut transaction,
             initial_snapshot.assignment.route.as_ref(),
@@ -828,6 +864,21 @@ impl PgAssignments {
             message: "planned assignment does not exist".to_owned(),
         })?;
         let initial_snapshot = AssignmentSnapshot::try_from(initial_row)?;
+        if initial_snapshot.assignment.generation != generation {
+            return Err(PortError {
+                code: "assignment_conflict",
+                message: "assignment generation does not match the requested generation".to_owned(),
+            });
+        }
+        if initial_snapshot.desired_state == "cancelled"
+            && initial_snapshot.observed_state == "cancelled"
+        {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| error_with("database_error", error))?;
+            return Ok(());
+        }
         lock_route_resources(
             &mut transaction,
             initial_snapshot.assignment.route.as_ref(),
@@ -1172,10 +1223,38 @@ mod tests {
             reconnected.list_planned().await.expect("list"),
             vec![first.clone()]
         );
+        sqlx::query(
+            "UPDATE pipeline_assignments SET desired_state = 'running', \
+             observed_state = 'starting' WHERE id = $1",
+        )
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .expect("set restart-recovery starting state");
+        let runtime = reconnected
+            .list_runtime_for_worker(id)
+            .await
+            .expect("list runtime assignments");
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].assignment.id, first.id);
+        assert_eq!(runtime[0].desired_state, "running");
+        assert_eq!(runtime[0].observed_state, "starting");
+        sqlx::query(
+            "UPDATE pipeline_assignments SET desired_state = 'planned', \
+             observed_state = 'not_started' WHERE id = $1",
+        )
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .expect("restore planned state");
         reconnected
             .cancel_unstarted(first.id, first.generation)
             .await
             .expect("cancel");
+        reconnected
+            .cancel_unstarted(first.id, first.generation)
+            .await
+            .expect("repeat cancellation is idempotent");
         assert_eq!(
             reservations.release(reservation.id).await.unwrap_err().code,
             "reservation_released"
@@ -1193,14 +1272,10 @@ mod tests {
             .await
             .expect("plan again");
         assert_eq!(second.generation, 2);
-        assert_eq!(
-            assignments
-                .cancel_unstarted(first.id, first.generation)
-                .await
-                .unwrap_err()
-                .code,
-            "assignment_conflict"
-        );
+        assignments
+            .cancel_unstarted(first.id, first.generation)
+            .await
+            .expect("cancel retry remains idempotent");
         sqlx::query("UPDATE pipeline_assignments SET observed_state = 'running' WHERE id = $1")
             .bind(second.id)
             .execute(&pool)

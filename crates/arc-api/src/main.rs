@@ -38,7 +38,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arc::new(SecretProviderWorkerAuthenticator::new(secret_provider));
         let generation_store: Arc<dyn AssignmentGenerationStore> =
             Arc::new(PgAssignmentGenerationStore::new(database_pool.clone()));
-        let dispatcher = Arc::new(WorkerCommandDispatcher::new(generation_store));
+        let dispatcher = Arc::new(WorkerCommandDispatcher::new_with_lease_pool(
+            generation_store,
+            database_pool.clone(),
+        ));
         tracing::info!("worker control endpoint enabled with local credentials");
         router_with_database_and_worker_dispatcher(database_pool.clone(), authenticator, dispatcher)
     } else {

@@ -6,6 +6,7 @@ import {
   createSource,
   fetchPipelineAssignment,
   fetchLiveness,
+  fetchReadiness,
   fetchSources,
   planRoute,
   planRouteAssignment,
@@ -26,6 +27,7 @@ describe("fetchLiveness", () => {
     await expect(fetchLiveness("http://arc-api:8080", fetcher)).resolves.toEqual({
       status: "alive",
     });
+
     expect(fetcher).toHaveBeenCalledWith(
       "http://arc-api:8080/api/v1/health/live",
     );
@@ -48,6 +50,37 @@ describe("fetchLiveness", () => {
 
     await expect(fetchLiveness("", fetcher)).rejects.toThrow(
       "API returned an invalid liveness response",
+    );
+  });
+});
+
+describe("fetchReadiness", () => {
+  it("requests the database readiness endpoint", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ status: "ready", database: "ready" }), {
+        status: 200,
+      }),
+    );
+
+    await expect(fetchReadiness("http://arc-api:8080", fetcher)).resolves.toEqual({
+      status: "ready",
+      database: "ready",
+    });
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://arc-api:8080/api/v1/health/ready",
+    );
+  });
+
+  it("surfaces database readiness failures", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({ status: "not_ready", database: "unavailable" }),
+        { status: 503 },
+      ),
+    );
+
+    await expect(fetchReadiness("", fetcher)).rejects.toThrow(
+      "API readiness request failed with HTTP 503",
     );
   });
 });

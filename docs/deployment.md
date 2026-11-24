@@ -20,6 +20,9 @@ Open the UI at `http://localhost:3000`; the API is also available at
 `ARC_UI_PORT` and `ARC_API_PORT` in `.env`. Published ports bind only to
 loopback. The database has no published host port.
 
+The API readiness endpoint is `GET /api/v1/health/ready`; it succeeds only when
+PostgreSQL responds. Compose marks the API container healthy after that check.
+
 ## Optional worker profile
 
 The worker image and executable are included but are not started by default.

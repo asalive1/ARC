@@ -31,6 +31,10 @@
 - Added a worker WebSocket client with bounded messages, TLS-by-default endpoint validation, welcome verification, and generation-gated Start/Stop handlers using the injected media pipeline interface.
 - Reset worker reconnect backoff after a successful welcome and preserve the established-session marker across the session status transition.
 - Added API-dispatched live RTP MPEG-TS-to-SRT GStreamer loopback coverage and forwarded-protocol headers for loopback worker control tests.
+- Added worker startup reconciliation for persisted starting/running and stopping assignments.
+- Added PostgreSQL-backed latest-session leases for cross-process worker replacement fencing.
+- Added database-backed API readiness and Compose API health checks.
+- Made unstarted assignment cancellation repeatable for the same exact generation while rejecting active or uncertain lifecycle states.
 - Added the `arc-gstreamer` adapter for supported Phase 1 paths, a worker executable with PostgreSQL registration/heartbeat and control reconnect, and an opt-in Compose worker profile.
 - Added a live GStreamer RTP MPEG-TS-to-SRT loopback test that verifies the original transport-stream payload reaches an SRT listener.
 - Added a generation-checked Start lifecycle endpoint that dispatches the persisted route snapshot to the assigned worker and records running state only after acknowledgement.

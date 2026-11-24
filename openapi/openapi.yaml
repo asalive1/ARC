@@ -238,7 +238,7 @@ paths:
               $ref: "#/components/schemas/RoutePlanRequest"
       responses:
         "200":
-          description: The compatible media path.
+          description: The compatible media path and its provisional resource estimate. No capacity is checked or reserved.
           content:
             application/json:
               schema:
@@ -550,12 +550,31 @@ components:
           $ref: "#/components/schemas/DestinationMediaProfile"
     RoutePlan:
       type: object
-      required: [mediaPath]
+      required: [mediaPath, estimate]
       properties:
         mediaPath:
           type: string
           enum:
             [alsa_l16_to_rtp_l16, rtp_l16_to_rtp_l16, rtp_l24_to_rtp_l24, rtp_mp2t_to_srt_mpeg_ts, srt_mpeg_ts_to_srt_mpeg_ts]
+        estimate:
+          $ref: "#/components/schemas/RouteResourceEstimate"
+    RouteResourceEstimate:
+      type: object
+      description: Provisional, uncalibrated estimate; not proof of available capacity. Null payload rates are unknown and known rates exclude protocol overhead.
+      required: [capacityUnits, ingressPayloadBitsPerSecond, egressPayloadBitsPerSecond]
+      properties:
+        capacityUnits:
+          type: integer
+          minimum: 1
+          description: Provisional normalized capacity units, not a measured resource limit.
+        ingressPayloadBitsPerSecond:
+          type: [integer, "null"]
+          minimum: 0
+          description: Estimated ingress payload rate, or null if unknown.
+        egressPayloadBitsPerSecond:
+          type: [integer, "null"]
+          minimum: 0
+          description: Estimated egress payload rate, or null if unknown.
     ApiError:
       type: object
       required: [code, message]

@@ -58,6 +58,10 @@ dependencies = [
 name = "arc-infrastructure"
 version = "0.1.0"
 dependencies = [
+ "arc-application",
+ "arc-domain",
+ "async-trait",
+ "chrono",
  "serde",
  "serde_json",
  "sqlx",

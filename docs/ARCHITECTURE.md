@@ -16,6 +16,7 @@ deliverables:
 - [Security model](security-model.md)
 - [Test strategy](test-strategy.md)
 - [Dependency license inventory](dependency-license-inventory.md)
+- [Technology licensing guide](licensing.md)
 - [Risk register](risk-register.md)
 - [Assumptions](assumptions.md) and [open questions](open-questions.md)
 - [Delivery and Git plan](delivery-plan.md)

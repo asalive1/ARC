@@ -1,2 +1,7 @@
+pub mod assignments;
+pub mod capacity_reservations;
 pub mod catalog;
+pub mod pipeline_planning;
 pub mod postgres;
+pub mod scheduler;
+pub mod worker_registry;

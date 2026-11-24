@@ -60,6 +60,11 @@ export interface RoutePlan {
     | "rtp_l24_to_rtp_l24"
     | "rtp_mp2t_to_srt_mpeg_ts"
     | "srt_mpeg_ts_to_srt_mpeg_ts";
+  estimate?: {
+    capacityUnits: number;
+    ingressPayloadBitsPerSecond: number | null;
+    egressPayloadBitsPerSecond: number | null;
+  };
 }
 
 async function requestJson<T>(
@@ -211,13 +216,13 @@ export function validateDestination(
   );
 }
 
-export function planRoute(
+export async function planRoute(
   source: SourceMediaProfile,
   destination: DestinationMediaProfile,
   baseUrl = "",
   fetcher: typeof fetch = globalThis.fetch,
 ): Promise<RoutePlan> {
-  return requestJson(
+  const response = await requestJson<unknown>(
     "/routes/plan",
     {
       method: "POST",
@@ -227,4 +232,56 @@ export function planRoute(
     baseUrl,
     fetcher,
   );
+  if (
+    typeof response !== "object" ||
+    response === null ||
+    !("mediaPath" in response) ||
+    !isMediaPath(response.mediaPath)
+  ) {
+    throw new Error("API returned an invalid route plan");
+  }
+  const mediaPath = response.mediaPath;
+  if (!("estimate" in response)) {
+    return { mediaPath };
+  }
+  const estimate = response.estimate;
+  if (
+    typeof estimate !== "object" ||
+    estimate === null ||
+    !("capacityUnits" in estimate) ||
+    !isNonnegativeInteger(estimate.capacityUnits) ||
+    estimate.capacityUnits === 0 ||
+    !("ingressPayloadBitsPerSecond" in estimate) ||
+    !isPayloadRate(estimate.ingressPayloadBitsPerSecond) ||
+    !("egressPayloadBitsPerSecond" in estimate) ||
+    !isPayloadRate(estimate.egressPayloadBitsPerSecond)
+  ) {
+    throw new Error("API returned an invalid route estimate");
+  }
+  return {
+    mediaPath,
+    estimate: {
+      capacityUnits: estimate.capacityUnits,
+      ingressPayloadBitsPerSecond: estimate.ingressPayloadBitsPerSecond,
+      egressPayloadBitsPerSecond: estimate.egressPayloadBitsPerSecond,
+    },
+  };
+}
+
+function isMediaPath(value: unknown): value is RoutePlan["mediaPath"] {
+  return (
+    value === "alsa_l16_to_rtp_l16" ||
+    value === "rtp_l16_to_rtp_l16" ||
+    value === "rtp_l24_to_rtp_l24" ||
+    value === "rtp_mp2t_to_srt_mpeg_ts" ||
+    value === "srt_mpeg_ts_to_srt_mpeg_ts"
+  );
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPayloadRate(value: unknown): value is number | null {
+  return value === null || isNonnegativeInteger(value);
 }

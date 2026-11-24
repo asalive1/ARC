@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arc-application = { path = "../arc-application" }
+arc-domain = { path = "../arc-domain" }
+async-trait.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

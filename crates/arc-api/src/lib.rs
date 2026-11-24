@@ -1,5 +1,5 @@
 use arc_domain::{
-    plan_media_path, validate_destination_profile, validate_source_profile,
+    estimate_pipeline_requirements, validate_destination_profile, validate_source_profile,
     DestinationMediaProfile, MediaProfileError, SourceMediaProfile,
 };
 use arc_infrastructure::catalog::{
@@ -83,6 +83,15 @@ struct PlanRouteRequest {
 #[serde(rename_all = "camelCase")]
 struct PlanRouteResponse {
     media_path: &'static str,
+    estimate: RouteResourceEstimate,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteResourceEstimate {
+    capacity_units: u32,
+    ingress_payload_bits_per_second: Option<u64>,
+    egress_payload_bits_per_second: Option<u64>,
 }
 
 async fn list_sources(
@@ -212,10 +221,15 @@ async fn update_destination(
 async fn plan_route(
     Json(request): Json<PlanRouteRequest>,
 ) -> Result<Json<PlanRouteResponse>, ApiError> {
-    let media_path = plan_media_path(&request.source, &request.destination)
+    let estimate = estimate_pipeline_requirements(&request.source, &request.destination)
         .map_err(ApiError::invalid_media_profile)?;
     Ok(Json(PlanRouteResponse {
-        media_path: media_path.as_str(),
+        media_path: estimate.media_path.as_str(),
+        estimate: RouteResourceEstimate {
+            capacity_units: estimate.requirements.capacity_units,
+            ingress_payload_bits_per_second: estimate.ingress_payload_bits_per_second,
+            egress_payload_bits_per_second: estimate.egress_payload_bits_per_second,
+        },
     }))
 }
 
@@ -416,6 +430,56 @@ mod tests {
         );
         let value: Value = serde_json::from_slice(&body).expect("response is JSON");
         assert_eq!(value["mediaPath"], "rtp_mp2t_to_srt_mpeg_ts");
+        assert_eq!(
+            value["estimate"],
+            serde_json::json!({
+                "capacityUnits": 2,
+                "ingressPayloadBitsPerSecond": null,
+                "egressPayloadBitsPerSecond": null
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn route_planner_reports_known_alsa_payload_rate() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/plan")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source": { "kind": "alsa_l16", "device": "hw:1,0" },
+                            "destination": {
+                                "kind": "rtp_l16",
+                                "address": "127.0.0.1",
+                                "port": 5004,
+                                "payloadType": 96
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router handles request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body reads");
+        let value: Value = serde_json::from_slice(&body).expect("response is JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "mediaPath": "alsa_l16_to_rtp_l16",
+                "estimate": {
+                    "capacityUnits": 2,
+                    "ingressPayloadBitsPerSecond": null,
+                    "egressPayloadBitsPerSecond": 1536000
+                }
+            })
+        );
     }
 
     #[tokio::test]

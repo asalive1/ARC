@@ -184,8 +184,16 @@ describe("catalog and route API", () => {
   });
 
   it("plans a matching RTP L24 path", async () => {
+    const result = {
+      mediaPath: "rtp_l24_to_rtp_l24",
+      estimate: {
+        capacityUnits: 2,
+        ingressPayloadBitsPerSecond: null,
+        egressPayloadBitsPerSecond: null,
+      },
+    };
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(JSON.stringify({ mediaPath: "rtp_l24_to_rtp_l24" }), {
+      new Response(JSON.stringify(result), {
         status: 200,
       }),
     );
@@ -207,7 +215,7 @@ describe("catalog and route API", () => {
         "",
         fetcher,
       ),
-    ).resolves.toEqual({ mediaPath: "rtp_l24_to_rtp_l24" });
+    ).resolves.toEqual(result);
     expect(fetcher).toHaveBeenCalledWith(
       "/api/v1/routes/plan",
       expect.objectContaining({
@@ -227,6 +235,51 @@ describe("catalog and route API", () => {
         }),
       }),
     );
+  });
+
+  it("supports older route plans but rejects malformed estimates", async () => {
+    const source = { kind: "alsa_l16" as const, device: "hw:1,0" };
+    const destination = {
+      kind: "rtp_l16" as const,
+      address: "127.0.0.1",
+      port: 5004,
+      payloadType: 96,
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ mediaPath: "alsa_l16_to_rtp_l16" })),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          mediaPath: "alsa_l16_to_rtp_l16",
+          estimate: { capacityUnits: 2, ingressPayloadBitsPerSecond: null },
+        })),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          mediaPath: "alsa_l16_to_rtp_l16",
+          estimate: {
+            capacityUnits: 2,
+            ingressPayloadBitsPerSecond: null,
+            egressPayloadBitsPerSecond: 1536000,
+          },
+        })),
+      );
+    await expect(planRoute(source, destination, "", fetcher)).resolves.toEqual({
+      mediaPath: "alsa_l16_to_rtp_l16",
+    });
+    await expect(planRoute(source, destination, "", fetcher)).rejects.toThrow(
+      "API returned an invalid route estimate",
+    );
+    await expect(planRoute(source, destination, "", fetcher)).resolves.toEqual({
+      mediaPath: "alsa_l16_to_rtp_l16",
+      estimate: {
+        capacityUnits: 2,
+        ingressPayloadBitsPerSecond: null,
+        egressPayloadBitsPerSecond: 1536000,
+      },
+    });
   });
 
   it("surfaces API errors for catalog operations", async () => {

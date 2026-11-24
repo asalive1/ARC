@@ -98,10 +98,35 @@ bounded RTP reorder and ADTS reassembly; editable 500 ms decoder delay. See
 
 ## Capacity and portability
 
-Estimate repeatable per-pipeline resource requirements (transport, demux,
-decode, conversion, fan-out, encode/mux, delay-buffer memory, preview, and
-network bandwidth). The POC estimator is deterministic and bounded; placement
-uses compatibility and safe capacity, not CPU alone. Advertise actual
+The internal Phase 1 estimator first validates and selects one of the five
+supported one-source, one-destination paths. It produces the corresponding
+source and destination adapter requirements and a provisional cost of two
+normalized units: one for the source side and one for the destination side.
+ALSA additionally requires Linux and the `alsa` audio backend. No decode,
+conversion, fan-out, signal extraction, delay, or preview work is modeled by
+these paths. Adding those features requires extending the estimator.
+
+The estimate records 1,536,000 bits/s of outbound audio payload for ALSA
+48 kHz stereo L16 to RTP; it excludes protocol overhead. Other ingress and
+egress payload rates are unknown because the current profiles do not specify
+the necessary stream properties. Unknown is represented as `None`, not zero;
+actual network use, including a network-backed ALSA device, may be higher.
+
+These are deterministic POC placeholders, not measured capacity limits or
+proof that a worker or network can safely carry a stream. Network bandwidth,
+memory, transport overhead, and variable stream costs are not admitted yet;
+the estimator is not connected to route activation. Calibrate resource costs
+and add the missing dimensions before real media admission. Advertise actual
 GStreamer elements/codecs, audio backends, platform, architecture, and hardware
 acceleration per worker. Linux x86-64/ARM64 Docker and Windows x86-64 are
 targets subject to explicit plugin/codec availability and license validation.
+
+The route planning API and compatibility view expose the provisional units and
+payload rates alongside the existing media path. Planning does not check or
+reserve worker capacity. The UI explicitly reports when an older API does not
+provide an estimate and hides results that no longer match the selected
+profiles.
+
+Separately, an internal pipeline planning transaction uses the same estimator
+to reserve capacity and create a planned assignment together. It is not called
+by the compatibility API and does not persist a route or start media.

@@ -15,6 +15,8 @@ erDiagram
     ROUTE_INSTANCE ||--o{ ROUTE_EVENT : records
     SOURCE ||--o{ SIGNAL_MAPPING : triggers
     WORKER ||--o{ PIPELINE_ASSIGNMENT : owns
+    WORKER ||--o{ WORKER_CAPACITY_RESERVATION : reserves
+    WORKER_CAPACITY_RESERVATION o|--o| PIPELINE_ASSIGNMENT : supports
     PIPELINE_ASSIGNMENT ||--o{ OPERATION : advances
     OPERATION ||--o{ OPERATION_ITEM : contains
     PRINCIPAL ||--o{ AUDIT_RECORD : acts
@@ -127,6 +129,17 @@ erDiagram
       text desired_state
       text observed_state
       timestamptz lease_expires_at
+      uuid reservation_id FK
+      jsonb requirements
+    }
+    WORKER_CAPACITY_RESERVATION {
+      uuid id PK
+      uuid pipeline_id
+      uuid worker_id FK
+      bigint capacity_units
+      text state
+      timestamptz created_at
+      timestamptz released_at
     }
     OPERATION {
       uuid id PK

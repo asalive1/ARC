@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -70,6 +70,7 @@ pub enum WorkerState {
 #[serde(rename_all = "camelCase")]
 pub struct Worker {
     pub id: Uuid,
+    pub stable_name: String,
     pub version: String,
     pub state: WorkerState,
     pub capabilities: WorkerCapabilities,
@@ -97,8 +98,65 @@ pub struct PipelineRequirements {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlacementRejection {
     WorkerNotAccepting,
+    HeartbeatExpired,
+    HeartbeatInFuture,
     MissingCapabilities(Vec<String>),
     InsufficientCapacity { required: u32, available: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerRejection {
+    pub worker_id: Uuid,
+    pub reason: PlacementRejection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlacementDecision {
+    Selected { worker_id: Uuid },
+    Unavailable { rejections: Vec<WorkerRejection> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlacementError {
+    NegativeHeartbeatAge,
+}
+
+pub fn select_worker(
+    workers: &[Worker],
+    requirements: &PipelineRequirements,
+    now: DateTime<Utc>,
+    max_heartbeat_age: Duration,
+) -> Result<PlacementDecision, PlacementError> {
+    if max_heartbeat_age < Duration::zero() {
+        return Err(PlacementError::NegativeHeartbeatAge);
+    }
+
+    let mut selected = None;
+    let mut rejections = Vec::new();
+    for worker in workers {
+        let rejection = if worker.last_heartbeat > now {
+            Some(PlacementRejection::HeartbeatInFuture)
+        } else if now.signed_duration_since(worker.last_heartbeat) > max_heartbeat_age {
+            Some(PlacementRejection::HeartbeatExpired)
+        } else {
+            worker.placement_rejection(requirements)
+        };
+        if let Some(reason) = rejection {
+            rejections.push(WorkerRejection {
+                worker_id: worker.id,
+                reason,
+            });
+        } else if selected.is_none_or(|id| worker.id < id) {
+            selected = Some(worker.id);
+        }
+    }
+
+    if let Some(worker_id) = selected {
+        Ok(PlacementDecision::Selected { worker_id })
+    } else {
+        rejections.sort_by_key(|rejection| rejection.worker_id);
+        Ok(PlacementDecision::Unavailable { rejections })
+    }
 }
 
 impl Worker {
@@ -198,6 +256,7 @@ mod tests {
     fn worker(state: WorkerState, capacity: u32) -> Worker {
         Worker {
             id: Uuid::nil(),
+            stable_name: "test-worker".to_owned(),
             version: "0.1.0".to_owned(),
             state,
             capabilities: WorkerCapabilities {
@@ -262,6 +321,112 @@ mod tests {
                 required: 3,
                 available: 2,
             })
+        );
+    }
+
+    #[test]
+    fn selection_is_deterministic_and_skips_stale_or_ineligible_workers() {
+        let now = Utc::now();
+        let requirements = PipelineRequirements {
+            source_adapter: Some("rtp".to_owned()),
+            capacity_units: 2,
+            ..PipelineRequirements::default()
+        };
+        let mut stale = worker(WorkerState::Ready, 4);
+        stale.id = Uuid::from_u128(1);
+        stale.last_heartbeat = now - Duration::seconds(11);
+        let mut draining = worker(WorkerState::Draining, 4);
+        draining.id = Uuid::from_u128(2);
+        draining.last_heartbeat = now;
+        let mut eligible = worker(WorkerState::Accepting, 4);
+        eligible.id = Uuid::from_u128(4);
+        eligible.last_heartbeat = now - Duration::seconds(10);
+        let mut first = eligible.clone();
+        first.id = Uuid::from_u128(3);
+
+        assert_eq!(
+            select_worker(
+                &[eligible, draining, stale, first],
+                &requirements,
+                now,
+                Duration::seconds(10),
+            ),
+            Ok(PlacementDecision::Selected {
+                worker_id: Uuid::from_u128(3),
+            })
+        );
+    }
+
+    #[test]
+    fn selection_reports_missing_capability_capacity_and_heartbeat_failures() {
+        let now = Utc::now();
+        let requirements = PipelineRequirements {
+            source_adapter: Some("rtp".to_owned()),
+            capacity_units: 2,
+            ..PipelineRequirements::default()
+        };
+        let mut future = worker(WorkerState::Ready, 4);
+        future.id = Uuid::from_u128(4);
+        future.last_heartbeat = now + Duration::seconds(1);
+        let mut stale = worker(WorkerState::Ready, 4);
+        stale.id = Uuid::from_u128(3);
+        stale.last_heartbeat = now - Duration::seconds(11);
+        let mut low_capacity = worker(WorkerState::Ready, 1);
+        low_capacity.id = Uuid::from_u128(2);
+        low_capacity.last_heartbeat = now;
+        let mut incompatible = worker(WorkerState::Ready, 4);
+        incompatible.id = Uuid::from_u128(1);
+        incompatible.last_heartbeat = now;
+        incompatible.capabilities.source_adapters.clear();
+
+        assert_eq!(
+            select_worker(
+                &[future, stale, low_capacity, incompatible],
+                &requirements,
+                now,
+                Duration::seconds(10),
+            ),
+            Ok(PlacementDecision::Unavailable {
+                rejections: vec![
+                    WorkerRejection {
+                        worker_id: Uuid::from_u128(1),
+                        reason: PlacementRejection::MissingCapabilities(vec![
+                            "sourceAdapter:rtp".to_owned(),
+                        ]),
+                    },
+                    WorkerRejection {
+                        worker_id: Uuid::from_u128(2),
+                        reason: PlacementRejection::InsufficientCapacity {
+                            required: 2,
+                            available: 1,
+                        },
+                    },
+                    WorkerRejection {
+                        worker_id: Uuid::from_u128(3),
+                        reason: PlacementRejection::HeartbeatExpired,
+                    },
+                    WorkerRejection {
+                        worker_id: Uuid::from_u128(4),
+                        reason: PlacementRejection::HeartbeatInFuture,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn selection_handles_empty_inventory_and_rejects_negative_heartbeat_age() {
+        let requirements = PipelineRequirements::default();
+        let now = Utc::now();
+        assert_eq!(
+            select_worker(&[], &requirements, now, Duration::zero()),
+            Ok(PlacementDecision::Unavailable {
+                rejections: Vec::new(),
+            })
+        );
+        assert_eq!(
+            select_worker(&[], &requirements, now, Duration::seconds(-1)),
+            Err(PlacementError::NegativeHeartbeatAge)
         );
     }
 }

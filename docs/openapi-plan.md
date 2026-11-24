@@ -4,6 +4,11 @@
 **Base path:** `/api/v1`
 **Wire format:** JSON; OpenAPI 3.1 is the authoritative HTTP contract.
 
+The implemented route planner returns the existing `mediaPath` plus an
+`estimate` containing provisional capacity units and nullable payload rates.
+This additive response does not check or reserve capacity. The UI tolerates
+older API responses without an estimate and reports that it is unavailable.
+
 ## Contract-wide behavior
 
 - Plural resource names; stable UUIDs; RFC 3339 UTC timestamps; explicit units

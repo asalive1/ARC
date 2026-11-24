@@ -11,11 +11,13 @@ pub use arc_shared::{WorkerCommandEnvelope, WorkerEventEnvelope, WORKER_PROTOCOL
 
 pub fn local_worker(
     id: Uuid,
+    stable_name: impl Into<String>,
     version: impl Into<String>,
     capabilities: WorkerCapabilities,
 ) -> Worker {
     Worker {
         id,
+        stable_name: stable_name.into(),
         version: version.into(),
         state: WorkerState::Registering,
         capabilities,

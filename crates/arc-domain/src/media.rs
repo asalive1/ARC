@@ -2,6 +2,8 @@ use std::{error::Error, fmt, net::IpAddr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::worker::{PipelineRequirements, Platform};
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -158,6 +160,46 @@ pub fn plan_media_path(
         }
         _ => Err(MediaProfileError::UnsupportedConversion),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PipelineEstimate {
+    pub media_path: MediaPath,
+    pub requirements: PipelineRequirements,
+    pub ingress_payload_bits_per_second: Option<u64>,
+    pub egress_payload_bits_per_second: Option<u64>,
+}
+
+pub fn estimate_pipeline_requirements(
+    source: &SourceMediaProfile,
+    destination: &DestinationMediaProfile,
+) -> Result<PipelineEstimate, MediaProfileError> {
+    let media_path = plan_media_path(source, destination)?;
+    let (platform, audio_backends, ingress, egress) = match media_path {
+        MediaPath::AlsaL16ToRtpL16 => (
+            Some(Platform::Linux),
+            ["alsa".to_owned()].into_iter().collect(),
+            None,
+            Some(48_000 * 2 * 16),
+        ),
+        MediaPath::RtpL16ToRtpL16
+        | MediaPath::RtpL24ToRtpL24
+        | MediaPath::RtpMp2tToSrtMpegTs
+        | MediaPath::SrtMpegTsToSrtMpegTs => (None, Default::default(), None, None),
+    };
+    Ok(PipelineEstimate {
+        media_path,
+        requirements: PipelineRequirements {
+            source_adapter: Some(source.adapter_id().to_owned()),
+            destination_adapter: Some(destination.adapter_id().to_owned()),
+            platform,
+            audio_backends,
+            capacity_units: 2,
+            ..PipelineRequirements::default()
+        },
+        ingress_payload_bits_per_second: ingress,
+        egress_payload_bits_per_second: egress,
+    })
 }
 
 pub fn validate_source_profile(source: &SourceMediaProfile) -> Result<(), MediaProfileError> {
@@ -401,6 +443,200 @@ mod tests {
         assert_eq!(
             validate_source_profile(&srt_source),
             Err(MediaProfileError::InvalidHost)
+        );
+    }
+
+    #[test]
+    fn estimates_each_supported_path_without_assuming_unknown_bitrates() {
+        let address = IpAddr::from([127, 0, 0, 1]);
+        let rtp_l16 = DestinationMediaProfile::RtpL16 {
+            address,
+            port: 5000,
+            payload_type: 96,
+        };
+        let rtp_l24 = DestinationMediaProfile::RtpL24 {
+            address,
+            port: 5000,
+            payload_type: 96,
+        };
+        let srt = DestinationMediaProfile::SrtMpegTs {
+            host: "127.0.0.1".to_owned(),
+            port: 5000,
+            mode: SrtMode::Caller,
+        };
+        let cases = [
+            (
+                SourceMediaProfile::AlsaL16 {
+                    device: "hw:0".to_owned(),
+                },
+                rtp_l16.clone(),
+                MediaPath::AlsaL16ToRtpL16,
+                "alsa_l16",
+                "rtp_l16",
+            ),
+            (
+                SourceMediaProfile::RtpL16 {
+                    bind_address: address,
+                    port: 5000,
+                    payload_type: 96,
+                },
+                rtp_l16,
+                MediaPath::RtpL16ToRtpL16,
+                "rtp_l16",
+                "rtp_l16",
+            ),
+            (
+                SourceMediaProfile::RtpL24 {
+                    bind_address: address,
+                    port: 5000,
+                    payload_type: 96,
+                },
+                rtp_l24,
+                MediaPath::RtpL24ToRtpL24,
+                "rtp_l24",
+                "rtp_l24",
+            ),
+            (
+                SourceMediaProfile::RtpMp2t {
+                    bind_address: address,
+                    port: 5000,
+                },
+                srt.clone(),
+                MediaPath::RtpMp2tToSrtMpegTs,
+                "rtp_mp2t",
+                "srt_mpeg_ts",
+            ),
+            (
+                SourceMediaProfile::SrtMpegTs {
+                    host: "127.0.0.1".to_owned(),
+                    port: 5000,
+                    mode: SrtMode::Listener,
+                },
+                srt,
+                MediaPath::SrtMpegTsToSrtMpegTs,
+                "srt_mpeg_ts",
+                "srt_mpeg_ts",
+            ),
+        ];
+        for (source, destination, path, source_adapter, destination_adapter) in cases {
+            let estimate = estimate_pipeline_requirements(&source, &destination).unwrap();
+            assert_eq!(
+                estimate,
+                estimate_pipeline_requirements(&source, &destination).unwrap()
+            );
+            assert_eq!(estimate.media_path, path);
+            assert_eq!(
+                estimate.requirements.source_adapter.as_deref(),
+                Some(source_adapter)
+            );
+            assert_eq!(
+                estimate.requirements.destination_adapter.as_deref(),
+                Some(destination_adapter)
+            );
+            assert_eq!(estimate.requirements.capacity_units, 2);
+            if path == MediaPath::AlsaL16ToRtpL16 {
+                assert_eq!(estimate.requirements.platform, Some(Platform::Linux));
+                assert_eq!(
+                    estimate.requirements.audio_backends,
+                    ["alsa".to_owned()].into_iter().collect()
+                );
+                assert_eq!(estimate.ingress_payload_bits_per_second, None);
+                assert_eq!(estimate.egress_payload_bits_per_second, Some(1_536_000));
+            } else {
+                assert_eq!(estimate.requirements.platform, None);
+                assert!(estimate.requirements.audio_backends.is_empty());
+                assert_eq!(estimate.ingress_payload_bits_per_second, None);
+                assert_eq!(estimate.egress_payload_bits_per_second, None);
+            }
+        }
+    }
+
+    #[test]
+    fn estimate_rejects_invalid_or_unsupported_paths() {
+        let source = SourceMediaProfile::AlsaL16 {
+            device: String::new(),
+        };
+        let destination = DestinationMediaProfile::SrtMpegTs {
+            host: "127.0.0.1".to_owned(),
+            port: 5000,
+            mode: SrtMode::Caller,
+        };
+        assert_eq!(
+            estimate_pipeline_requirements(&source, &destination),
+            Err(MediaProfileError::InvalidAlsaDevice)
+        );
+        let source = SourceMediaProfile::AlsaL16 {
+            device: "hw:0".to_owned(),
+        };
+        assert_eq!(
+            estimate_pipeline_requirements(&source, &destination),
+            Err(MediaProfileError::UnsupportedConversion)
+        );
+    }
+
+    #[test]
+    fn estimate_enforces_worker_capabilities_and_capacity() {
+        use crate::worker::{
+            Architecture, PlacementRejection, Worker, WorkerCapabilities, WorkerCapacity,
+            WorkerState,
+        };
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        let source = SourceMediaProfile::AlsaL16 {
+            device: "hw:0".to_owned(),
+        };
+        let destination = DestinationMediaProfile::RtpL16 {
+            address: IpAddr::from([127, 0, 0, 1]),
+            port: 5004,
+            payload_type: 96,
+        };
+        let requirements = estimate_pipeline_requirements(&source, &destination)
+            .unwrap()
+            .requirements;
+        let mut worker = Worker {
+            id: Uuid::new_v4(),
+            stable_name: "test-worker".to_owned(),
+            version: "0.1.0".to_owned(),
+            state: WorkerState::Ready,
+            capabilities: WorkerCapabilities {
+                source_adapters: ["alsa_l16".to_owned()].into_iter().collect(),
+                destination_adapters: ["rtp_l16".to_owned()].into_iter().collect(),
+                audio_backends: ["alsa".to_owned()].into_iter().collect(),
+                platform: Some(Platform::Linux),
+                architecture: Some(Architecture::X86_64),
+                ..WorkerCapabilities::default()
+            },
+            capacity: WorkerCapacity {
+                total_capacity_units: 2,
+                assigned_capacity_units: 0,
+                cpu_utilization_ratio: None,
+                memory_utilization_ratio: None,
+                ingress_bits_per_second: None,
+                egress_bits_per_second: None,
+            },
+            last_heartbeat: Utc::now(),
+        };
+        assert_eq!(worker.placement_rejection(&requirements), None);
+        worker.capabilities.audio_backends.clear();
+        assert!(matches!(
+            worker.placement_rejection(&requirements),
+            Some(PlacementRejection::MissingCapabilities(_))
+        ));
+        worker.capabilities.audio_backends.insert("alsa".to_owned());
+        worker.capabilities.platform = Some(Platform::Windows);
+        assert!(matches!(
+            worker.placement_rejection(&requirements),
+            Some(PlacementRejection::MissingCapabilities(_))
+        ));
+        worker.capabilities.platform = Some(Platform::Linux);
+        worker.capacity.assigned_capacity_units = 1;
+        assert_eq!(
+            worker.placement_rejection(&requirements),
+            Some(PlacementRejection::InsufficientCapacity {
+                required: 2,
+                available: 1
+            })
         );
     }
 }

@@ -12,7 +12,9 @@ implemented yet.
 Start with [the system architecture](docs/system-architecture.md), then review
 the [open questions](docs/open-questions.md) and
 [delivery plan](docs/delivery-plan.md). The complete pre-code document set is
-listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). See the
+[technology licensing guide](docs/licensing.md) for current and planned
+third-party technologies.
 
 ## Development
 

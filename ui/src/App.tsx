@@ -834,6 +834,17 @@ function WorkspaceView({
   sourceError: string;
   destinationError: string;
 }) {
+  const selectedSource = sources.find((source) => source.id === selectedSourceId);
+  const selectedDestination = destinations.find(
+    (destination) => destination.id === selectedDestinationId,
+  );
+  const resultMatchesSelection =
+    selectedSource !== undefined &&
+    selectedDestination !== undefined &&
+    routePlan.variables !== undefined &&
+    JSON.stringify(routePlan.variables.source) === JSON.stringify(selectedSource.configuration) &&
+    JSON.stringify(routePlan.variables.destination) === JSON.stringify(selectedDestination.configuration);
+
   return (
     <Stack spacing={2.5}>
       <Paper variant="outlined" sx={{ p: { xs: 2, md: 3 } }}>
@@ -981,15 +992,36 @@ function WorkspaceView({
                 </Button>
               </Box>
             )}
-            {routePlan.isError && (
+            {routePlan.isError && resultMatchesSelection && (
               <Alert severity="error">
-                No compatible path: {routePlan.error.message}
+                Path check failed: {routePlan.error.message}
               </Alert>
             )}
-            {routePlan.isSuccess && (
+            {routePlan.isSuccess && resultMatchesSelection && (
               <Alert severity="success">
                 Compatible path: {routePlan.data.mediaPath}. This is a plan
-                only; no media is flowing.
+                only; no worker capacity was checked or reserved, and no media
+                is flowing.
+                {routePlan.data.estimate ? (
+                  <>
+                    <br />
+                    Provisional, uncalibrated estimate: {routePlan.data.estimate.capacityUnits} capacity
+                    units. Payload rate: input{" "}
+                    {routePlan.data.estimate.ingressPayloadBitsPerSecond === null
+                      ? "unknown"
+                      : `${routePlan.data.estimate.ingressPayloadBitsPerSecond.toLocaleString()} bits/s`}
+                    ; output{" "}
+                    {routePlan.data.estimate.egressPayloadBitsPerSecond === null
+                      ? "unknown"
+                      : `${routePlan.data.estimate.egressPayloadBitsPerSecond.toLocaleString()} bits/s`}.
+                    Rates exclude protocol overhead.
+                  </>
+                ) : (
+                  <>
+                    <br />
+                    Resource estimate unavailable from this API version.
+                  </>
+                )}
               </Alert>
             )}
           </Stack>

@@ -2,6 +2,21 @@ export interface Liveness {
   status: "alive";
 }
 
+export interface AdminAuthStatus {
+  bootstrap_required: boolean;
+  login_required: boolean;
+}
+
+export interface AdminSession {
+  username: string;
+  csrf_token: string;
+}
+
+export interface RecoveryResult extends AdminSession {
+  replacement_recovery_token: string;
+  recovery_token_warning: string;
+}
+
 export interface Readiness {
   status: "ready";
   database: "ready";
@@ -92,11 +107,14 @@ export interface CancelAssignmentResult {
 }
 
 export interface PlanRouteAssignmentResult {
-  state: "planned" | "unavailable";
+  state: "planned" | "unavailable" | "waiting" | "cancelled";
   mediaPath: RoutePlan["mediaPath"];
   estimate: NonNullable<RoutePlan["estimate"]>;
   assignment: PlannedAssignment | null;
   rejections: { workerId: string; reason: string }[];
+  requestId?: string;
+  expiresAt?: string;
+  reason?: string;
 }
 
 export interface PlanRouteAssignmentRequest {
@@ -105,10 +123,12 @@ export interface PlanRouteAssignmentRequest {
   sourceRevision: number;
   destinationId: string;
   destinationRevision: number;
+  allowWaiting?: boolean;
 }
 
 export interface PlanRouteAssignmentInput extends PlanRouteAssignmentRequest {
   idempotencyKey: string;
+  capacityRequestId?: string;
 }
 
 export class ApiRequestError extends Error {
@@ -118,17 +138,164 @@ export class ApiRequestError extends Error {
   }
 }
 
+let csrfToken: string | undefined;
+
+export function setCsrfToken(value: string | undefined): void {
+  csrfToken = value;
+}
+
 async function requestJson<T>(
   path: string,
   init: RequestInit | undefined,
   baseUrl: string,
   fetcher: typeof fetch,
 ): Promise<T> {
-  const response = await fetcher(`${baseUrl}/api/v1${path}`, init);
+  const headers = new Headers(init?.headers);
+  const method = init?.method?.toUpperCase() ?? "GET";
+  let requestInit = init;
+  if (csrfToken) {
+    if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+      headers.set("x-arc-csrf-token", csrfToken);
+    }
+    requestInit = {
+      ...init,
+      credentials: "same-origin",
+      headers,
+    };
+  }
+  const response = await fetcher(`${baseUrl}/api/v1${path}`, requestInit);
+  if (!response.ok) {
+    if (response.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("arc-auth-required"));
+    }
+    throw new ApiRequestError(response.status);
+  }
+  return (await response.json()) as T;
+}
+
+async function authRequest<T>(
+  path: string,
+  init?: RequestInit,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<T> {
+  const response = await fetcher(`${baseUrl}/api/v1/auth${path}`, {
+    ...init,
+    credentials: "same-origin",
+  });
   if (!response.ok) {
     throw new ApiRequestError(response.status);
   }
   return (await response.json()) as T;
+}
+
+export function fetchAdminAuthStatus(
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<AdminAuthStatus> {
+  return authRequest("/status", undefined, baseUrl, fetcher);
+}
+
+export function fetchAdminSession(
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<AdminSession> {
+  return authRequest("/session", undefined, baseUrl, fetcher);
+}
+
+export function loginAdmin(
+  username: string,
+  password: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<{ csrf_token: string }> {
+  return authRequest(
+    "/login",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function bootstrapAdmin(
+  bootstrapToken: string,
+  username: string,
+  password: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<{ csrf_token: string }> {
+  return authRequest(
+    "/bootstrap",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        bootstrap_token: bootstrapToken,
+        username,
+        password,
+      }),
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function recoverAdmin(
+  recoveryToken: string,
+  newPassword: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RecoveryResult> {
+  return authRequest(
+    "/recover",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ recovery_token: recoveryToken, new_password: newPassword }),
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function logoutAdmin(
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<{ ok: true }> {
+  return authRequest(
+    "/logout",
+    {
+      method: "POST",
+      headers: { "x-arc-csrf-token": csrfToken ?? "" },
+    },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function changeAdminPassword(
+  currentPassword: string,
+  newPassword: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<{ ok: true }> {
+  return requestJson(
+    "/auth/password",
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    },
+    baseUrl,
+    fetcher,
+  );
 }
 
 export async function fetchLiveness(
@@ -346,7 +513,7 @@ export function planRouteAssignment(
   baseUrl = "",
   fetcher: typeof fetch = globalThis.fetch,
 ): Promise<PlanRouteAssignmentResult> {
-  const { idempotencyKey, ...request } = input;
+  const { idempotencyKey, capacityRequestId: _capacityRequestId, ...request } = input;
   return requestJson(
     "/routes/plan-assignment",
     {
@@ -357,6 +524,32 @@ export function planRouteAssignment(
       },
       body: JSON.stringify(request),
     },
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function fetchCapacityRequest(
+  requestId: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<PlanRouteAssignmentResult> {
+  return requestJson(
+    `/capacity-requests/${encodeURIComponent(requestId)}`,
+    undefined,
+    baseUrl,
+    fetcher,
+  );
+}
+
+export function cancelCapacityRequest(
+  requestId: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<PlanRouteAssignmentResult> {
+  return requestJson(
+    `/capacity-requests/${encodeURIComponent(requestId)}/cancel`,
+    { method: "POST" },
     baseUrl,
     fetcher,
   );

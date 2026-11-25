@@ -1,0 +1,59 @@
+services:
+  ingress-acme:
+    profiles:
+      - acme
+    image: nginx:1.29-alpine
+    depends_on:
+      - api
+      - ui
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx-worker-acme.conf:/etc/nginx/conf.d/default.conf:ro
+      - letsencrypt_data:/etc/letsencrypt:ro
+      - acme_webroot:/var/www/certbot:ro
+    restart: unless-stopped
+
+  certbot-renew:
+    profiles:
+      - acme
+    image: certbot/certbot:v5.10.0
+    depends_on:
+      - ingress-acme
+    pid: "service:ingress-acme"
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      while :; do
+        certbot renew --webroot -w /var/www/certbot --deploy-hook "kill -HUP 1"
+        sleep 12h
+      done
+    volumes:
+      - letsencrypt_data:/etc/letsencrypt
+      - acme_webroot:/var/www/certbot
+    restart: unless-stopped
+
+  certbot-bootstrap:
+    profiles:
+      - acme-bootstrap
+    image: certbot/certbot:v5.10.0
+    ports:
+      - "80:80"
+    command:
+      - certonly
+      - --standalone
+      - --non-interactive
+      - --agree-tos
+      - --email
+      - ${ARC_ACME_EMAIL:?Set ARC_ACME_EMAIL in .env}
+      - --cert-name
+      - arc-worker
+      - -d
+      - ${ARC_PUBLIC_DOMAIN:?Set ARC_PUBLIC_DOMAIN in .env}
+    volumes:
+      - letsencrypt_data:/etc/letsencrypt
+      - acme_webroot:/var/www/certbot
+
+volumes:
+  letsencrypt_data:
+  acme_webroot:

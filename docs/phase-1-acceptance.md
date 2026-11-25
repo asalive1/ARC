@@ -15,6 +15,13 @@
 - Configured bandwidth guards and OS-derived CPU/memory pressure reporting
   (Linux cgroup v1/v2 or Windows host metrics), with explicit overrides.
 - Docker secret-file credential inputs and WSS Nginx ingress POC.
+- First-run administrator bootstrap, recovery-token rotation, Argon2 password
+  handling, cookie sessions, CSRF enforcement, login/logout and session
+  revocation.
+- File-backed worker credential reload and active-session revalidation.
+- Five-minute strict-FIFO capacity waits with status, cancellation, expiry and
+  idempotent retry behavior.
+- Optional Certbot ACME issuance/renewal profile and NGINX reload hook.
 - Optional worker PEM CA bundles, additive to public roots, for private WSS
   ingress trust.
 - Clean PostgreSQL migration, API restart, dump and restore script.
@@ -41,14 +48,37 @@ build also pass. A successful GitHub Actions run for these fixes remains pending
 until a subsequent push or pull request.
 
 The Linux ARM64 worker image also builds with Docker Buildx. Its emulated
-runtime reports `aarch64` and contains the worker binary and ALSA, RTP, app,
-and SRT GStreamer plugins. This is build/package evidence, not native ARM64
-media or device smoke acceptance.
+runtime reports `aarch64` and contains the worker binary and required ALSA,
+app, audioconvert, coreelements, UDP, RTP, RTP-manager and SRT GStreamer
+plugins. This is build/package evidence, not native ARM64 media or device
+smoke acceptance.
 
-The AMD64 runtime audit confirmed every installed GStreamer plugin reports
-LGPL metadata and the required ARC factories load. The emulated ARM64 runtime
-also loads the required factories and excludes the known GPL/unknown-plugin
-packages. Full OS SBOM/license review and native media smoke tests remain open.
+The AMD64 and emulated ARM64 runtime audits confirmed the required ARC
+factories load, all six copied plugin modules are readable to the configured
+non-root worker, and the GStreamer registry path is writable. The selected
+ALSA, app, audioconvert, coreelements, UDP, RTP, RTP-manager and SRT plugins
+report LGPL metadata, and the known unused GPL/unknown-plugin packages are
+absent. Fresh worker SBOMs contain 185 package records and 32 `NOASSERTION`
+license declarations per architecture. Full OS SBOM/license and notice review
+and native media smoke tests remain open.
+
+The local API image SBOM was regenerated (190 packages, 43 `NOASSERTION`
+records) and paired with a CycloneDX report of 208 locked API Rust components,
+including the administrator-auth dependencies. These are local-build reports,
+not release SBOMs. The GStreamer parser header and generated parser outputs are
+traced to the shipped core library; the generated outputs contain Bison's
+special-exception notice.
+
+The current continuation validation also passed the API, infrastructure and
+worker Rust unit suites (18, 5 and 12 tests passed respectively, with 5 API
+and 11 infrastructure PostgreSQL-dependent tests ignored in the unit run),
+the UI suite (18 tests), and the API/UI/worker image builds. A separate
+PostgreSQL-backed administrator flow verified bootstrap, session issuance,
+CSRF rejection, recovery-token replacement, prior-session revocation, login
+and logout. Capacity PostgreSQL tests and UI integration/build tests passed.
+Workspace-wide `cargo fmt --check` is not clean: it reports formatting
+differences across existing and modified Rust sources; the new auth and
+capacity modules were formatted.
 
 ## Acceptance commands
 
@@ -62,11 +92,18 @@ packages. Full OS SBOM/license review and native media smoke tests remain open.
 
 - After Phase 2 implementation, live ALSA hardware produces RTP L16 without
   underrun or device errors, and deployed RTP-to-SRT evidence is reviewed.
-- A trusted WSS ingress uses a certificate valid for the worker hostname.
-- Production credential provider lifecycle is implemented and tested.
+- A trusted WSS ingress uses a certificate valid for the worker hostname;
+  actual ACME issuance, renewal and deployed reload still require a real
+  public hostname and reachable ports.
+- Coordinated worker credential rotation/revocation is exercised against a
+  deployed Compose stack, including active WebSocket session closure.
 - ARM64/AMD64 Linux and x64 Windows worker targets pass media smoke tests.
-- GStreamer/plugin SBOM and package closure exclude GPL/AGPL components and
-  resolve all unknown licenses.
-- Real CPU, memory, network bandwidth and stream costs are calibrated.
+- Remaining `NOASSERTION` licenses, package notices and base OS obligations
+  receive review against exact release artifacts. No published release image
+  digests or Windows worker artifacts currently exist; local image IDs are not
+  release evidence.
+- The reproducible local synthetic CPU, memory, network bandwidth and
+  workload-cost baseline is run and documented; hardware/deployed calibration
+  remains after Phase 2.
 - Multi-route/crosspoint UI is not a Phase 1 implementation requirement.
 - Approved remote, commit/release branch, CI, phase tag and push remain external authorization gates.

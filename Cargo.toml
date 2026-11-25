@@ -17,7 +17,9 @@ version = "0.1.0"
 
 [workspace.dependencies]
 async-trait = "0.1"
+argon2 = "0.5"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = { version = "0.3", features = ["sink"] }
 gstreamer = "0.25"
@@ -27,6 +29,8 @@ serde_json = "1"
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+rand = "0.8"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
 subtle = "2.6"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

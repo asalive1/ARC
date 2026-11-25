@@ -35,7 +35,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
         .map_err(|error| invalid_config("ARC_WORKER_ID", error))?;
     let endpoint = required_env("ARC_WORKER_CONTROL_ENDPOINT")?;
     let ca_certificates_file = optional_path_env("ARC_WORKER_CONTROL_CA_FILE")?;
-    let bearer_token = worker_control_token()?;
+    let (bearer_token, bearer_token_file) = worker_control_token()?;
     let stable_name =
         env::var("ARC_WORKER_NAME").unwrap_or_else(|_| format!("arc-worker-{worker_id}"));
     let enable_alsa = env::var("ARC_WORKER_ENABLE_ALSA")
@@ -113,6 +113,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
             ca_certificates_file,
             worker_id,
             bearer_token,
+            bearer_token_file,
             allow_insecure_loopback: false,
         },
         generation_store,
@@ -303,23 +304,24 @@ async fn run_control_sessions(client: WorkerControlClient) {
     }
 }
 
-fn worker_control_token() -> io::Result<String> {
-    let token = if let Ok(path) = env::var("ARC_WORKER_CONTROL_TOKEN_FILE") {
+fn worker_control_token() -> io::Result<(String, Option<PathBuf>)> {
+    let (token, token_file) = if let Ok(path) = env::var("ARC_WORKER_CONTROL_TOKEN_FILE") {
         if path.trim().is_empty() {
             return Err(invalid_config(
                 "ARC_WORKER_CONTROL_TOKEN_FILE",
                 "must not be empty",
             ));
         }
-        std::fs::read_to_string(&path)
+        let token = std::fs::read_to_string(&path)
             .map_err(|error| invalid_config(
                 "ARC_WORKER_CONTROL_TOKEN_FILE",
                 &format!("could not read secret file: {error}"),
             ))?
             .trim()
-            .to_owned()
+            .to_owned();
+        (token, Some(PathBuf::from(path)))
     } else {
-        required_env("ARC_WORKER_CONTROL_TOKEN")?
+        (required_env("ARC_WORKER_CONTROL_TOKEN")?, None)
     };
     if token.len() != 64
         || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -329,7 +331,7 @@ fn worker_control_token() -> io::Result<String> {
             "must be a 64-character hexadecimal token",
         ));
     }
-    Ok(token)
+    Ok((token, token_file))
 }
 
 fn optional_u64_env(name: &str) -> io::Result<Option<u64>> {

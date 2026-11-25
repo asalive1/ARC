@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use arc_application::{AssignmentGenerationStore, PortError, PortResult};
+use arc_application::{AssignmentGenerationStore, PortError, PortResult, WorkerAuthenticator};
 use arc_shared::{WorkerCommandAcknowledgement, WorkerCommandEnvelope, WorkerCommandOutcome};
 use arc_worker::{dispatch_if_fresh, CommandDispatchResult};
 use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket};
@@ -150,11 +150,24 @@ impl WorkerCommandDispatcher {
         &self,
         socket: &mut WebSocket,
         mut session: WorkerControlSession,
+        authenticator: Arc<dyn WorkerAuthenticator>,
+        bearer_token: String,
     ) {
         let worker_id = session.worker_id;
         let mut pending = HashMap::new();
+        let mut credential_check = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        credential_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let close_reason = loop {
             tokio::select! {
+                _ = credential_check.tick() => {
+                    if let Err(error) = authenticator.authenticate(worker_id, &bearer_token).await {
+                        tracing::warn!(%worker_id, code = error.code, "closing worker session after credential revocation or provider failure");
+                        break Some("worker credential revoked");
+                    }
+                }
                 cancellation = session.cancelled.changed() => {
                     if cancellation.is_err() || *session.cancelled.borrow() {
                         break Some("worker session replaced");

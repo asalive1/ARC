@@ -1,5 +1,6 @@
 pub mod assignments;
 pub mod capacity_reservations;
+pub mod capacity_wait;
 pub mod catalog;
 pub mod pipeline_planning;
 pub mod postgres;

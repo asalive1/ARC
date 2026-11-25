@@ -1,6 +1,7 @@
 use arc_application::{PortError, PortResult, SecretProvider, WorkerAuthenticator};
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
@@ -47,6 +48,36 @@ impl SecretProvider for LocalWorkerSecretProvider {
             .get(&worker_id)
             .cloned()
             .ok_or_else(secret_not_found)
+    }
+}
+
+pub struct FileWorkerSecretProvider {
+    path: PathBuf,
+}
+
+impl FileWorkerSecretProvider {
+    pub fn from_file(path: impl AsRef<Path>) -> PortResult<Self> {
+        let path = path.as_ref().to_owned();
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            tracing::error!(%error, "failed to read worker credential secret file");
+            secret_provider_unavailable()
+        })?;
+        LocalWorkerSecretProvider::from_json(&contents)?;
+        Ok(Self { path })
+    }
+}
+
+#[async_trait]
+impl SecretProvider for FileWorkerSecretProvider {
+    async fn resolve_reference(&self, reference: &str) -> PortResult<String> {
+        let contents = std::fs::read_to_string(&self.path).map_err(|error| {
+            tracing::error!(%error, "failed to reload worker credential secret file");
+            secret_provider_unavailable()
+        })?;
+        LocalWorkerSecretProvider::from_json(&contents)
+            .map_err(|_| secret_provider_unavailable())?
+            .resolve_reference(reference)
+            .await
     }
 }
 
@@ -115,6 +146,13 @@ fn secret_not_found() -> PortError {
     PortError {
         code: "secret_not_found",
         message: "worker credential reference was not found".to_owned(),
+    }
+}
+
+fn secret_provider_unavailable() -> PortError {
+    PortError {
+        code: "secret_provider_unavailable",
+        message: "worker credentials could not be loaded".to_owned(),
     }
 }
 
@@ -187,6 +225,42 @@ mod tests {
                 .code,
             "secret_not_found"
         );
+    }
+
+    #[tokio::test]
+    async fn file_provider_observes_rotated_credentials_without_restarting() {
+        let worker_id = Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("arc-worker-credentials-{worker_id}.json"));
+        let first = "ab".repeat(32);
+        let second = "cd".repeat(32);
+        std::fs::write(
+            &path,
+            format!("{{\"{worker_id}\":\"{first}\"}}"),
+        )
+        .expect("initial credentials are written");
+        let provider = FileWorkerSecretProvider::from_file(&path)
+            .expect("initial credential file is valid");
+
+        assert_eq!(
+            provider
+                .resolve_reference(&format!("workers/{worker_id}/control-token"))
+                .await
+                .expect("initial credential resolves"),
+            first
+        );
+        std::fs::write(
+            &path,
+            format!("{{\"{worker_id}\":\"{second}\"}}"),
+        )
+        .expect("rotated credentials are written");
+        assert_eq!(
+            provider
+                .resolve_reference(&format!("workers/{worker_id}/control-token"))
+                .await
+                .expect("rotated credential resolves"),
+            second
+        );
+        std::fs::remove_file(path).expect("temporary credentials are removed");
     }
 
     #[test]

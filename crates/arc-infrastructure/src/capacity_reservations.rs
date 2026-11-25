@@ -6,7 +6,10 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::{FromRow, PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::worker_registry::{error_with, WorkerRow};
+use crate::{
+    capacity_wait::{has_waiters, lock_queue},
+    worker_registry::{error_with, WorkerRow},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityReservation {
@@ -105,6 +108,16 @@ impl PgCapacityReservations {
             .begin()
             .await
             .map_err(|error| error_with("database_error", error))?;
+        lock_queue(&mut transaction).await?;
+        if has_waiters(&mut transaction).await? {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| error_with("database_error", error))?;
+            return Ok(ReservationDecision::Unavailable {
+                rejections: Vec::new(),
+            });
+        }
         let decision = reserve_in_transaction(
             &mut transaction,
             pipeline_id,

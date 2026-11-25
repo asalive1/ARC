@@ -13,15 +13,19 @@ COPY crates ./crates
 COPY database ./database
 RUN cargo build --locked --release --package arc-worker --bin arc-worker --features gstreamer-runtime
 
-FROM debian:bookworm-slim AS gst-srt-plugin
+FROM debian:bookworm-slim AS gst-required-plugins
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         gstreamer1.0-plugins-bad \
-    && plugin="$(find /usr/lib -type f -path '*/gstreamer-1.0/libgstsrt.so' -print -quit)" \
-    && test -n "$plugin" \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-base \
     && mkdir -p /out \
-    && cp "$plugin" /out/libgstsrt.so \
+    && for plugin in libgstapp.so libgstaudioconvert.so libgstsrt.so libgstudp.so libgstrtp.so libgstrtpmanager.so; do \
+        source="$(find /usr/lib -type f -path "*/gstreamer-1.0/${plugin}" -print -quit)"; \
+        test -n "$source"; \
+        cp "$source" "/out/${plugin}"; \
+    done \
     && rm -rf /var/lib/apt/lists/*
 
 FROM debian:bookworm-slim
@@ -30,13 +34,12 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
         gstreamer1.0-alsa \
-        gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good \
+        libgstreamer-plugins-base1.0-0 \
         libsrt1.5-gnutls \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /workspace/target/release/arc-worker /usr/local/bin/arc-worker
-COPY --from=gst-srt-plugin /out/libgstsrt.so /usr/local/lib/gstreamer-1.0/libgstsrt.so
+COPY --from=gst-required-plugins /out/ /usr/local/lib/gstreamer-1.0/
 ENV GST_REGISTRY=/tmp/gst-registry.bin \
     GST_PLUGIN_PATH_1_0=/usr/local/lib/gstreamer-1.0
 USER 10001:10001

@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   cancelAssignment,
+  cancelCapacityRequest,
   createDestination,
   createSource,
   fetchPipelineAssignment,
+  fetchCapacityRequest,
   fetchLiveness,
   fetchReadiness,
   fetchSources,
@@ -321,6 +323,32 @@ describe("catalog and route API", () => {
   });
 
   describe("assignment API", () => {
+    it("opts into waiting and reads or cancels the returned request", async () => {
+      const waiting = {
+        state: "waiting", requestId: "request/1", expiresAt: "2026-01-01T00:05:00Z",
+        mediaPath: "rtp_l16_to_rtp_l16",
+        estimate: { capacityUnits: 2, ingressPayloadBitsPerSecond: null, egressPayloadBitsPerSecond: null },
+        assignment: null, rejections: [],
+      };
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async () =>
+        new Response(JSON.stringify(waiting), { status: 200 }),
+      );
+      await planRouteAssignment({
+        pipelineId: "pipeline", idempotencyKey: "key", sourceId: "source",
+        sourceRevision: 1, destinationId: "destination", destinationRevision: 1,
+        allowWaiting: true, capacityRequestId: "local-only",
+      }, "", fetcher);
+      expect(JSON.parse((fetcher.mock.calls[0][1] as RequestInit).body as string)).toEqual({
+        pipelineId: "pipeline", sourceId: "source", sourceRevision: 1,
+        destinationId: "destination", destinationRevision: 1, allowWaiting: true,
+      });
+      await expect(fetchCapacityRequest("request/1", "", fetcher)).resolves.toEqual(waiting);
+      await cancelCapacityRequest("request/1", "", fetcher);
+      expect(fetcher.mock.calls[1][0]).toBe("/api/v1/capacity-requests/request%2F1");
+      expect(fetcher.mock.calls[2]).toEqual([
+        "/api/v1/capacity-requests/request%2F1/cancel", { method: "POST" },
+      ]);
+    });
     it("plans a capacity-reserving assignment with pinned endpoint revisions", async () => {
       const planned = {
         state: "planned",

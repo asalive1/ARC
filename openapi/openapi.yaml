@@ -2,17 +2,147 @@ openapi: 3.1.0
 info:
   title: ARC API
   version: 1.0.0
-  description: Phase 1 media profile planning and catalog API.
+  description: >-
+    Phase 1 API. Operator routes require an administrator session cookie; all
+    state-changing authenticated requests also require X-Arc-CSRF-Token.
   license:
     name: MIT OR Apache-2.0
     identifier: MIT OR Apache-2.0
 servers:
   - url: /api/v1
+security:
+  - AdminSession: []
 paths:
+  /auth/status:
+    get:
+      operationId: getAdminAuthStatus
+      summary: Read first-run administrator provisioning status
+      security: []
+      responses:
+        "200":
+          description: Administrator bootstrap state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthStatus"
+  /auth/session:
+    get:
+      operationId: getAdminSession
+      summary: Read the current administrator session and CSRF token
+      responses:
+        "200":
+          description: Authenticated administrator session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminSession"
+        "401":
+          $ref: "#/components/responses/AuthenticationError"
+  /auth/bootstrap:
+    post:
+      operationId: bootstrapAdministrator
+      summary: Create the first administrator using the one-time bootstrap secret
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminBootstrapRequest"
+      responses:
+        "200":
+          description: Administrator created and session established.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminSessionToken"
+        "400":
+          $ref: "#/components/responses/AuthenticationError"
+        "401":
+          $ref: "#/components/responses/AuthenticationError"
+        "409":
+          $ref: "#/components/responses/AuthenticationError"
+  /auth/login:
+    post:
+      operationId: loginAdministrator
+      summary: Start an administrator session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminLoginRequest"
+      responses:
+        "200":
+          description: Session established; session cookie is set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminSessionToken"
+        "401":
+          $ref: "#/components/responses/AuthenticationError"
+  /auth/logout:
+    post:
+      operationId: logoutAdministrator
+      summary: Revoke the current administrator session
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      responses:
+        "200":
+          description: Session revoked and cookie expired.
+        "401":
+          $ref: "#/components/responses/AuthenticationError"
+        "403":
+          $ref: "#/components/responses/CsrfError"
+  /auth/recover:
+    post:
+      operationId: recoverAdministrator
+      summary: Reset the administrator password and rotate the recovery secret
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminRecoveryRequest"
+      responses:
+        "200":
+          description: Password reset, sessions revoked, and replacement recovery secret returned once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminRecoveryResponse"
+        "400":
+          $ref: "#/components/responses/AuthenticationError"
+        "401":
+          $ref: "#/components/responses/AuthenticationError"
+  /auth/password:
+    put:
+      operationId: changeAdministratorPassword
+      summary: Change the current administrator password and revoke sessions
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminPasswordChangeRequest"
+      responses:
+        "200":
+          description: Password changed; all administrator sessions are revoked.
+        "400":
+          $ref: "#/components/responses/AuthenticationError"
+        "401":
+          $ref: "#/components/responses/AuthenticationError"
+        "403":
+          $ref: "#/components/responses/CsrfError"
   /health/live:
     get:
       operationId: getLiveness
       summary: Check whether the API process is alive
+      security: []
       responses:
         "200":
           description: The API process is alive.
@@ -24,6 +154,7 @@ paths:
     get:
       operationId: getReadiness
       summary: Check whether the API and its PostgreSQL database are ready
+      security: []
       responses:
         "200":
           description: The API and PostgreSQL database are ready.
@@ -266,7 +397,7 @@ paths:
     post:
       operationId: planRouteAssignment
       summary: Reserve capacity and create a revision-pinned planned assignment
-      description: This control-plane operation checks worker eligibility and capacity, then atomically persists a reservation and planned assignment. It does not activate or execute the route. Worker heartbeats must be no older than the server-controlled 30-second limit. Retries with the same Idempotency-Key and request body replay the original result for 24 hours; reusing a key with a different body returns 409.
+      description: Without allowWaiting, checks capacity immediately and returns planned or unavailable. With allowWaiting, durably queues the request for at most five minutes in strict FIFO order; older waits block newer immediate admissions too. Waiting does not start media. Worker heartbeats must be no older than 30 seconds. The idempotency key is retained for 24 hours; immediate requests replay their original outcome, while wait requests replay their current status. Reusing the key for a different request or waiting mode returns 409.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -283,7 +414,7 @@ paths:
               $ref: "#/components/schemas/PlanRouteAssignmentRequest"
       responses:
         "200":
-          description: The assignment was planned, or no eligible worker had capacity. An unavailable result creates no reservation or assignment.
+          description: A planned or unavailable immediate result, or the current status of an opted-in capacity request.
           content:
             application/json:
               schema:
@@ -297,6 +428,52 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiError"
         "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /capacity-requests/{requestId}:
+    get:
+      operationId: getCapacityRequest
+      summary: Read a durable capacity request
+      description: Waiting requests expire after five minutes as unavailable with reason expired and never retry implicitly. Terminal records may be purged after the 24-hour idempotency window.
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Current wait status, including a planned assignment if admission won.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanRouteAssignmentResult"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /capacity-requests/{requestId}/cancel:
+    post:
+      operationId: cancelCapacityRequest
+      summary: Cancel a capacity wait
+      description: Cancels a live wait immediately. If planning, expiry, or an earlier cancellation has already won, returns that terminal status unchanged; cancel a planned assignment using its separate generation-fenced operation.
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Current status after cancellation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanRouteAssignmentResult"
+        "404":
           $ref: "#/components/responses/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
@@ -497,7 +674,31 @@ paths:
         "400":
           $ref: "#/components/responses/Problem"
 components:
+  securitySchemes:
+    AdminSession:
+      type: apiKey
+      in: cookie
+      name: arc_admin_session
+  parameters:
+    CsrfToken:
+      name: X-Arc-CSRF-Token
+      in: header
+      required: true
+      schema:
+        type: string
   responses:
+    AuthenticationError:
+      description: Administrator authentication or request validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AuthenticationError"
+    CsrfError:
+      description: CSRF validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AuthenticationError"
     Problem:
       description: Request or domain error.
       content:
@@ -511,6 +712,95 @@ components:
           schema:
             $ref: "#/components/schemas/ApiError"
   schemas:
+    AdminAuthStatus:
+      type: object
+      required: [bootstrap_required, login_required]
+      properties:
+        bootstrap_required:
+          type: boolean
+        login_required:
+          type: boolean
+    AdminSession:
+      type: object
+      required: [username, csrf_token]
+      properties:
+        username:
+          type: string
+        csrf_token:
+          type: string
+    AdminSessionToken:
+      type: object
+      required: [csrf_token]
+      properties:
+        csrf_token:
+          type: string
+    AdminBootstrapRequest:
+      type: object
+      required: [bootstrap_token, username, password]
+      properties:
+        bootstrap_token:
+          type: string
+          minLength: 32
+        username:
+          type: string
+          minLength: 3
+          maxLength: 64
+          pattern: "^[A-Za-z0-9._-]+$"
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+    AdminLoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+    AdminRecoveryRequest:
+      type: object
+      required: [recovery_token, new_password]
+      properties:
+        recovery_token:
+          type: string
+          minLength: 32
+        new_password:
+          type: string
+          minLength: 12
+          maxLength: 128
+    AdminRecoveryResponse:
+      allOf:
+        - $ref: "#/components/schemas/AdminSession"
+        - type: object
+          required: [replacement_recovery_token, recovery_token_warning]
+          properties:
+            replacement_recovery_token:
+              type: string
+            recovery_token_warning:
+              type: string
+    AdminPasswordChangeRequest:
+      type: object
+      required: [current_password, new_password]
+      properties:
+        current_password:
+          type: string
+        new_password:
+          type: string
+          minLength: 12
+          maxLength: 128
+    AuthenticationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
     Liveness:
       type: object
       required: [status]
@@ -807,13 +1097,17 @@ components:
           type: integer
           minimum: 1
           description: Expected current destination revision; stale revisions are rejected.
+        allowWaiting:
+          type: boolean
+          default: false
+          description: Opt into the durable five-minute FIFO capacity queue.
     PlanRouteAssignmentResult:
       type: object
       required: [state, mediaPath, estimate, assignment, rejections]
       properties:
         state:
           type: string
-          enum: [planned, unavailable]
+          enum: [planned, unavailable, waiting, cancelled]
         mediaPath:
           type: string
           enum:
@@ -828,6 +1122,17 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/WorkerRejection"
+        requestId:
+          type: string
+          format: uuid
+          description: Present for opted-in wait requests, including terminal results.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Database deadline for the wait; present for opted-in requests.
+        reason:
+          type: string
+          description: Terminal reason such as expired, cancelled, or stale_route_revision.
     PlannedAssignment:
       type: object
       required: [id, pipelineId, workerId, generation, reservationId, requirements, route]

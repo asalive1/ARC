@@ -50,6 +50,7 @@ pub struct WorkerControlClientConfig {
     pub ca_certificates_file: Option<PathBuf>,
     pub worker_id: Uuid,
     pub bearer_token: String,
+    pub bearer_token_file: Option<PathBuf>,
     pub allow_insecure_loopback: bool,
 }
 
@@ -292,7 +293,8 @@ impl WorkerControlClient {
                 "worker control requires WSS except for explicitly allowed loopback tests",
             ));
         }
-        let authorization = HeaderValue::from_str(&format!("Bearer {}", self.config.bearer_token))
+        let bearer_token = self.current_bearer_token()?;
+        let authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
             .map_err(|_| {
                 worker_client_error(
                     "invalid_worker_control_config",
@@ -313,6 +315,28 @@ impl WorkerControlClient {
             HeaderValue::from_static("https"),
         );
         Ok(request)
+    }
+
+    fn current_bearer_token(&self) -> PortResult<String> {
+        let token = match &self.config.bearer_token_file {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|_| {
+                    worker_client_error(
+                        "worker_control_secret_unavailable",
+                        "worker bearer credential file could not be read",
+                    )
+                })?
+                .trim()
+                .to_owned(),
+            None => self.config.bearer_token.clone(),
+        };
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(worker_client_error(
+                "invalid_worker_control_config",
+                "worker bearer credential must be a 64-character hexadecimal token",
+            ));
+        }
+        Ok(token)
     }
 }
 
@@ -661,7 +685,7 @@ mod tests {
                 );
                 assert_eq!(
                     request.headers()["authorization"].to_str().unwrap(),
-                    "Bearer local-worker-token"
+                    format!("Bearer {}", test_token())
                 );
                 Ok(response)
             })
@@ -761,13 +785,50 @@ mod tests {
                 endpoint,
                 ca_certificates_file: None,
                 worker_id,
-                bearer_token: "local-worker-token".to_owned(),
+                bearer_token: test_token(),
+                bearer_token_file: None,
                 allow_insecure_loopback,
             },
             store,
             media_pipeline,
         )
         .expect("worker control client configuration is valid")
+    }
+
+    fn test_token() -> String {
+        "ab".repeat(32)
+    }
+
+    #[test]
+    fn reconnect_request_reloads_rotated_file_token() {
+        let worker_id = Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("arc-worker-token-{worker_id}.txt"));
+        let first = "ab".repeat(32);
+        let second = "cd".repeat(32);
+        std::fs::write(&path, &first).expect("initial token is written");
+        let client = WorkerControlClient::new(
+            WorkerControlClientConfig {
+                endpoint: "ws://127.0.0.1:8080/api/v1/workers/control".to_owned(),
+                ca_certificates_file: None,
+                worker_id,
+                bearer_token: first,
+                bearer_token_file: Some(path.clone()),
+                allow_insecure_loopback: true,
+            },
+            Arc::new(TestGenerationStore::default()),
+            Arc::new(TestMediaPipeline::default()),
+        )
+        .expect("file-backed worker token is valid");
+
+        std::fs::write(&path, &second).expect("rotated token is written");
+        let request = client
+            .websocket_request()
+            .expect("reconnect request reloads the token");
+        assert_eq!(
+            request.headers()["authorization"],
+            format!("Bearer {second}")
+        );
+        std::fs::remove_file(path).expect("temporary token file is removed");
     }
 
     #[test]
@@ -778,6 +839,7 @@ mod tests {
                 ca_certificates_file: None,
                 worker_id: Uuid::new_v4(),
                 bearer_token: "local-worker-token".to_owned(),
+                bearer_token_file: None,
                 allow_insecure_loopback: true,
             },
             Arc::new(TestGenerationStore::default()),

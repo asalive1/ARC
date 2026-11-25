@@ -33,14 +33,18 @@ requires attention to all listed terms.
 | Technology | Locked version | Declared license | Use |
 |---|---:|---|---|
 | async-trait | 0.1.92 | MIT OR Apache-2.0 | Rust async interfaces |
+| Argon2 | 0.5.3 | MIT OR Apache-2.0 | Administrator password hashing |
 | Axum | 0.8.9 | MIT | HTTP API |
+| base64 | 0.22.1 | MIT OR Apache-2.0 | Opaque administrator session tokens |
 | Chrono | 0.4.45 | MIT OR Apache-2.0 | Dates and times |
+| rand | 0.8.8 | MIT OR Apache-2.0 | Cryptographically secure authentication tokens and password salts |
 | rustls | 0.23.46 | MIT OR Apache-2.0 | Worker WebSocket TLS client |
 | rustls-pemfile | 2.2.0 | MIT OR Apache-2.0 | Parse optional worker CA trust bundles |
 | Serde / serde_json | 1.0.229 / 1.0.154 | MIT OR Apache-2.0 | Serialization |
+| sha2 | 0.10.9 | MIT OR Apache-2.0 | One-way hashes for bootstrap, recovery and session credentials |
 | SQLx | 0.8.6 | MIT OR Apache-2.0 | PostgreSQL access and migrations |
 | sysinfo | 0.37.2 | MIT | Worker CPU and memory utilization telemetry |
-| subtle | 2.6.1 | BSD-3-Clause | Constant-time worker credential comparison |
+| subtle | 2.6.1 | BSD-3-Clause | Constant-time worker and administrator token comparisons |
 | Tokio | 1.54.1 | MIT | Asynchronous runtime |
 | Tower | 0.5.3 | MIT | HTTP service testing |
 | tracing / tracing-subscriber | 0.1.44 / 0.3.23 | MIT | Logging and tracing |
@@ -91,6 +95,9 @@ comparison. It was already present transitively in the lockfile; its direct
 use is now listed above.
 The local JSON environment credential provider reuses Serde and adds no
 third-party packages.
+Administrator authentication adds Argon2 password hashing, cryptographic token
+generation, and token hashing. Cookie sessions use HttpOnly/SameSite settings
+and CSRF tokens; no additional authentication framework was introduced.
 The API WebSocket feature uses Axum's existing WebSocket support. The
 tokio-tungstenite and futures-util direct dependencies support the worker's
 production WebSocket client and API session tests. The GStreamer Rust bindings
@@ -99,6 +106,8 @@ together with the other transitive WebSocket and GStreamer packages, remain
 subject to the release-time dependency inventory.
 Optional worker private-CA trust uses `rustls` and `rustls-pemfile`, while
 `webpki-roots` preserves the bundled public trust roots.
+The optional Certbot sidecar adds an ACME issuance/renewal image but no Rust
+workspace package; record its exact image digest and package SBOM for releases.
 
 Key WebSocket transitive packages include `tungstenite` 0.29.0
 (MIT OR Apache-2.0) and `data-encoding` 2.11.1 (MIT), based on the locked
@@ -110,7 +119,8 @@ package metadata.
 |---|---|---|
 | PostgreSQL 16 | Database in Compose | [PostgreSQL License](https://www.postgresql.org/about/licence/); preserve the required notices. |
 | NGINX 1.29 | Serves the UI in the runtime image | [BSD-2-Clause](https://nginx.org/LICENSE); preserve the applicable source or binary notices. |
-| GStreamer 1.22 runtime | Worker RTP, ALSA and SRT pipeline plugins | Required GStreamer plugins, including the isolated SRT plugin, are LGPL-2.1-or-later; the SRT library is MPL-2.0 as approved for Phase 1. Preserve notices and source obligations. |
+| Certbot 5.10.0 | Optional ACME certificate issuance and renewal image | [Apache-2.0](https://github.com/certbot/certbot/blob/master/LICENSE.txt); inventory the exact image and bundled Alpine packages for release. |
+| GStreamer 1.22 runtime | Worker RTP, ALSA and SRT pipeline plugins | Required components and selected source files are LGPL-2+. The core parser is generated with Bison's exception and ships through `libgstreamer1.0-0`. SRT is MPL-2.0 as approved for Phase 1. Preserve notices and source obligations. |
 | Rust toolchain | API build image (`rust:1-slim`) and worker build image (`rust:1-bookworm`) | Rust is generally [MIT OR Apache-2.0](https://github.com/rust-lang/rust/blob/master/LICENSE-MIT); toolchain components and bundled dependencies may differ. |
 | curl/libcurl | API runtime healthcheck package | curl license (MIT-style); preserve applicable notices. |
 | Node.js 22 | UI build image | Node.js is generally [MIT](https://github.com/nodejs/node/blob/main/LICENSE); bundled components have their own notices. |
@@ -123,12 +133,18 @@ notices per target artifact.
 
 ## Phase 1 media runtime
 
-The opt-in worker image includes GStreamer core, base, good and ALSA runtime
-packages. The SRT plugin is extracted from the Debian bad-plugin package in a
-non-shipped build stage; only `libgstsrt.so` is copied into the runtime image.
+The opt-in worker image installs GStreamer core, the Base support library
+(`libgstreamer-plugins-base1.0-0`) and the ALSA plugin, but not the full Base,
+Good or Bad plugin bundles. It copies only `libgstapp.so`,
+`libgstaudioconvert.so`, `libgstudp.so`, `libgstrtp.so`,
+`libgstrtpmanager.so` and `libgstsrt.so` from non-shipped Debian plugin
+extraction stages. The SRT runtime library is installed separately.
 The user approved LGPL GStreamer components and
 [Haivision SRT under MPL-2.0](https://github.com/Haivision/srt/blob/master/LICENSE)
-for Phase 1, with GPL/AGPL components excluded. GStreamer's
+for Phase 1, with GPL/AGPL media components excluded from the media stack and
+its dependencies. This exclusion does not apply to base OS packages; their
+licenses, notices and obligations still require inventory and review.
+GStreamer's
 [licensing guidance](https://github.com/GStreamer/gstreamer/blob/main/subprojects/gst-docs/markdown/frequently-asked-questions/licensing.md)
 describes the framework and plugin licensing; individual plugins and external
 libraries must still be checked. LGPL and MPL distribution obligations,
@@ -139,10 +155,28 @@ patent considerations are separate from software copyright licenses.
 The Debian `gstreamer1.0-plugins-bad` package also contains unused GPL plugins
 (`dtsdec`, `faad`, `mpeg2enc`, `mplex`, `resindvd`, and `x265`) and plugins with
 unknown license metadata (`mpegpsdemux`, `rtponvif`, and `voamrwbenc`). These
-are excluded from the final worker image by copying only the LGPL SRT plugin
-and installing the separately licensed MPL-2.0 SRT runtime library. This
-removes the known disallowed plugin modules, but the full per-target OS
-dependency/SBOM inventory and legal review remain release gates.
+are excluded from the final worker image. The required app, audioconvert,
+coreelements, ALSA, UDP, RTP, RTP-manager and SRT plugins report LGPL metadata
+on AMD64 and emulated ARM64; the separately licensed MPL-2.0 SRT runtime
+library is installed. The final images also omit `libaa1`, `libcaca0` and
+`libdv4` from the full good-plugin bundle; `libdvdnav4` and `libdvdread8` are
+absent as well. Full per-target OS dependency/license and notice review
+remains a release gate. The targeted SBOM and plugin findings are summarized in
+[dependency-license-inventory](dependency-license-inventory.md). Current Linux
+image SBOMs describe local builds only: no release image digests or Windows
+worker artifact are available for release review.
+
+Debian's GStreamer core copyright metadata labels the generated parser header
+`gst/parse/grammar.tab.h` GPL-3+. Debian's Meson build generates
+`grammar.tab.c` and `grammar.tab.h` with Bison, includes the header from
+`parse.l`, and adds both parser outputs to the `gstreamer-1.0` library. The
+Debian `libgstreamer1.0-0` package ships that shared library, not the generated
+header separately. Reproduction with Bookworm Bison 3.8.2 confirmed the Bison
+special-exception notice in both generated outputs; Bison's published
+[conditions](https://www.gnu.org/software/bison/manual/html_node/Conditions.html)
+confirm the exception applies to output containing that notice. The technical
+generator and package-to-binary scope is resolved; package notices and full
+release license closure still require per-artifact review.
 
 RTP, SRT, MPEG-TS, ALSA and audio format names in ARC profiles do not by
 themselves establish the license of a particular implementation. Inventory

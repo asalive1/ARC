@@ -8,6 +8,7 @@ use arc_infrastructure::catalog::{
 };
 use arc_infrastructure::{
     assignments::{AssignmentSnapshot, PgAssignments, PlannedAssignment},
+    capacity_wait::{CapacityWaitRequest, PgCapacityWait, QueueProgress},
     pipeline_planning::{PgPipelinePlanner, PipelinePlanningDecision, RouteRevision},
     postgres::PgPool,
 };
@@ -29,6 +30,8 @@ use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 mod worker_control_runtime;
+mod admin_auth;
+pub use admin_auth::AdminAuth;
 pub use worker_control_runtime::WorkerCommandDispatcher;
 use worker_control_runtime::MAX_WORKER_CONTROL_MESSAGE_SIZE;
 
@@ -68,6 +71,8 @@ fn database_routes() -> Router {
             "/api/v1/routes/plan-assignment",
             post(plan_route_assignment),
         )
+        .route("/api/v1/capacity-requests/{request_id}", get(get_capacity_request))
+        .route("/api/v1/capacity-requests/{request_id}/cancel", post(cancel_capacity_request))
         .route(
             "/api/v1/pipelines/{pipeline_id}/assignment",
             get(get_pipeline_assignment),
@@ -79,7 +84,25 @@ fn database_routes() -> Router {
 }
 
 pub fn router_with_database(pool: PgPool) -> Router {
-    database_routes().layer(Extension(pool))
+    with_capacity_processor(database_routes().layer(Extension(pool.clone())), pool)
+}
+
+pub fn router_with_database_and_admin_auth(
+    pool: PgPool,
+    admin_auth: AdminAuth,
+) -> Router {
+    let protected = database_routes()
+        .route(
+            "/api/v1/auth/password",
+            put(admin_auth::change_password),
+        )
+        .layer(Extension(pool.clone()))
+        .layer(Extension(admin_auth.clone()));
+    with_capacity_processor(
+        admin_auth::protect(protected, admin_auth.clone())
+            .merge(admin_auth::public_routes(admin_auth)),
+        pool,
+    )
 }
 
 pub fn router_with_worker_authenticator(authenticator: Arc<dyn WorkerAuthenticator>) -> Router {
@@ -110,7 +133,7 @@ pub fn router_with_database_and_worker_dispatcher(
     authenticator: Arc<dyn WorkerAuthenticator>,
     dispatcher: Arc<WorkerCommandDispatcher>,
 ) -> Router {
-    database_routes()
+    let routes = database_routes()
         .route(
             "/api/v1/assignments/{assignment_id}/start",
             post(start_assignment),
@@ -123,8 +146,90 @@ pub fn router_with_database_and_worker_dispatcher(
             authenticator,
             Some(dispatcher.clone()),
         ))
-        .layer(Extension(pool))
-        .layer(Extension(dispatcher))
+        .layer(Extension(pool.clone()))
+        .layer(Extension(dispatcher));
+    with_capacity_processor(routes, pool)
+}
+
+pub fn router_with_database_worker_dispatcher_and_admin_auth(
+    pool: PgPool,
+    authenticator: Arc<dyn WorkerAuthenticator>,
+    dispatcher: Arc<WorkerCommandDispatcher>,
+    admin_auth: AdminAuth,
+) -> Router {
+    let protected = database_routes()
+        .route(
+            "/api/v1/assignments/{assignment_id}/start",
+            post(start_assignment),
+        )
+        .route(
+            "/api/v1/assignments/{assignment_id}/stop",
+            post(stop_assignment),
+        )
+        .route(
+            "/api/v1/auth/password",
+            put(admin_auth::change_password),
+        )
+        .layer(Extension(pool.clone()))
+        .layer(Extension(dispatcher.clone()))
+        .layer(Extension(admin_auth.clone()));
+    let routes = admin_auth::protect(protected, admin_auth.clone())
+        .merge(admin_auth::public_routes(admin_auth))
+        .merge(worker_control_router(
+            authenticator,
+            Some(dispatcher),
+        ));
+    with_capacity_processor(routes, pool)
+}
+
+struct CapacityProcessor(tokio::task::JoinHandle<()>);
+
+impl Drop for CapacityProcessor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn with_capacity_processor(router: Router, pool: PgPool) -> Router {
+    let task = tokio::spawn(async move {
+        let queue = PgCapacityWait::new(pool);
+        let mut listener = None;
+        loop {
+            if listener.is_none() {
+                match tokio::time::timeout(Duration::from_secs(1), queue.listen()).await {
+                    Ok(Ok(connection)) => listener = Some(connection),
+                    Ok(Err(error)) => tracing::warn!(code = error.code, "capacity listener unavailable"),
+                    Err(_) => tracing::warn!("capacity listener timed out"),
+                }
+            }
+            let failed = loop {
+                match queue.process_one(chrono::Duration::seconds(MAX_PLANNING_HEARTBEAT_AGE_SECONDS)).await {
+                    Ok(QueueProgress::Advanced) => tokio::task::yield_now().await,
+                    Ok(QueueProgress::Blocked | QueueProgress::Empty) => break false,
+                    Err(error) => {
+                        tracing::warn!(code = error.code, "capacity queue processing failed");
+                        break true;
+                    }
+                }
+            };
+            if failed {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else if let Some(connection) = &mut listener {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    result = connection.recv() => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "capacity listener disconnected");
+                            listener = None;
+                        }
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    });
+    router.layer(Extension(Arc::new(CapacityProcessor(task))))
 }
 
 #[derive(Clone)]
@@ -204,10 +309,21 @@ async fn worker_control(
         return worker_control_error(status, code, message);
     }
 
+    let bearer_token = bearer_token.to_owned();
+    let authenticator = state.authenticator.clone();
+    let dispatcher = state.dispatcher.clone();
     websocket
         .max_message_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
         .max_frame_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_worker_control(socket, worker_id, state.dispatcher))
+        .on_upgrade(move |socket| {
+            handle_worker_control(
+                socket,
+                worker_id,
+                dispatcher,
+                authenticator,
+                bearer_token,
+            )
+        })
         .into_response()
 }
 
@@ -240,6 +356,8 @@ async fn handle_worker_control(
     mut socket: WebSocket,
     worker_id: Uuid,
     dispatcher: Option<Arc<WorkerCommandDispatcher>>,
+    authenticator: Arc<dyn WorkerAuthenticator>,
+    bearer_token: String,
 ) {
     let first_message = tokio::time::timeout(WORKER_CONTROL_HELLO_TIMEOUT, socket.recv()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first_message else {
@@ -292,11 +410,29 @@ async fn handle_worker_control(
     }
 
     if let (Some(dispatcher), Some(session)) = (dispatcher, session) {
-        dispatcher.serve_session(&mut socket, session).await;
+        dispatcher
+            .serve_session(&mut socket, session, authenticator, bearer_token)
+            .await;
         return;
     }
 
-    while let Some(message) = socket.recv().await {
+    let mut credential_check = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    credential_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let message = tokio::select! {
+            _ = credential_check.tick() => {
+                if authenticator.authenticate(worker_id, &bearer_token).await.is_err() {
+                    close_worker_control(&mut socket, "worker credential revoked").await;
+                    return;
+                }
+                continue;
+            }
+            message = socket.recv() => message,
+        };
+        let Some(message) = message else { return };
         match message {
             Ok(Message::Ping(payload)) => {
                 if let Err(error) = socket.send(Message::Pong(payload)).await {
@@ -407,6 +543,8 @@ struct PlanRouteAssignmentRequest {
     source_revision: i64,
     destination_id: Uuid,
     destination_revision: i64,
+    #[serde(default)]
+    allow_waiting: bool,
 }
 
 #[derive(Serialize)]
@@ -417,6 +555,12 @@ struct PlanRouteAssignmentResponse {
     estimate: RouteResourceEstimate,
     assignment: Option<PlannedAssignment>,
     rejections: Vec<arc_domain::WorkerRejection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,17 +735,25 @@ async fn plan_route_assignment(
         .ok_or_else(|| {
             ApiError::invalid_request("Idempotency-Key header must be a non-nil UUID")
         })?;
+    let route = RouteRevision {
+        source_id: request.source_id,
+        source_revision: request.source_revision,
+        destination_id: request.destination_id,
+        destination_revision: request.destination_revision,
+    };
+    if request.allow_waiting {
+        let snapshot = PgCapacityWait::new(pool)
+            .enqueue(idempotency_key, request.pipeline_id, route)
+            .await
+            .map_err(ApiError::pipeline_planning)?;
+        return Ok(Json(capacity_response(snapshot)));
+    }
     let planner = PgPipelinePlanner::new(pool);
     let decision = planner
         .plan_with_idempotency_key(
             idempotency_key,
             request.pipeline_id,
-            RouteRevision {
-                source_id: request.source_id,
-                source_revision: request.source_revision,
-                destination_id: request.destination_id,
-                destination_revision: request.destination_revision,
-            },
+            route,
             chrono::Duration::seconds(MAX_PLANNING_HEARTBEAT_AGE_SECONDS),
         )
         .await
@@ -628,7 +780,65 @@ async fn plan_route_assignment(
         },
         assignment,
         rejections,
+        request_id: None,
+        expires_at: None,
+        reason: None,
     }))
+}
+
+fn capacity_response(snapshot: CapacityWaitRequest) -> PlanRouteAssignmentResponse {
+    let assignment = match snapshot.result {
+        Some(PipelinePlanningDecision::Planned(planned)) => Some(planned.assignment),
+        _ => None,
+    };
+    let state = match snapshot.state.as_str() {
+        "waiting" => "waiting",
+        "planned" => "planned",
+        "cancelled" => "cancelled",
+        _ => "unavailable",
+    };
+    PlanRouteAssignmentResponse {
+        state,
+        media_path: snapshot.estimate.media_path.as_str(),
+        estimate: RouteResourceEstimate {
+            capacity_units: snapshot.estimate.requirements.capacity_units,
+            ingress_payload_bits_per_second: snapshot.estimate.ingress_payload_bits_per_second,
+            egress_payload_bits_per_second: snapshot.estimate.egress_payload_bits_per_second,
+        },
+        assignment,
+        rejections: Vec::new(),
+        request_id: Some(snapshot.request_id),
+        expires_at: Some(snapshot.expires_at),
+        reason: snapshot.reason,
+    }
+}
+
+async fn get_capacity_request(
+    Path(request_id): Path<Uuid>,
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<PlanRouteAssignmentResponse>, ApiError> {
+    capacity_status(PgCapacityWait::new(pool).get(request_id).await)
+}
+
+async fn cancel_capacity_request(
+    Path(request_id): Path<Uuid>,
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<PlanRouteAssignmentResponse>, ApiError> {
+    capacity_status(PgCapacityWait::new(pool).cancel(request_id).await)
+}
+
+fn capacity_status(
+    result: arc_application::PortResult<Option<CapacityWaitRequest>>,
+) -> Result<Json<PlanRouteAssignmentResponse>, ApiError> {
+    result
+        .map_err(ApiError::pipeline_planning)?
+        .map(capacity_response)
+        .map(Json)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: "Capacity request does not exist".to_owned(),
+        })
 }
 
 async fn get_pipeline_assignment(
@@ -1877,6 +2087,121 @@ mod tests {
             })
         );
     }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database"]
+    async fn capacity_wait_api_recovers_and_processes_fifo() {
+        async fn call(app: &axum::Router, method: &str, path: &str, key: Option<Uuid>, body: Option<Value>) -> (StatusCode, Value) {
+            let mut request = Request::builder().method(method).uri(path);
+            if let Some(key) = key {
+                request = request.header("idempotency-key", key.to_string());
+            }
+            if body.is_some() {
+                request = request.header("content-type", "application/json");
+            }
+            let response = app.clone().oneshot(request.body(Body::from(body.map(|b| b.to_string()).unwrap_or_default())).unwrap()).await.unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&body).unwrap())
+        }
+
+        let pool = connect_postgres(&env::var("DATABASE_URL").unwrap()).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let source_profile = SourceMediaProfile::RtpL16 {
+            bind_address: IpAddr::from([0, 0, 0, 0]), port: 5000, payload_type: 96,
+        };
+        let destination_profile = DestinationMediaProfile::RtpL16 {
+            address: IpAddr::from([127, 0, 0, 1]), port: 5002, payload_type: 96,
+        };
+        let source = catalog::create_source(&pool, "wait API source", source_profile.adapter_id(), serde_json::to_value(&source_profile).unwrap()).await.unwrap();
+        let source = catalog::validate_source_draft(&pool, source.id).await.unwrap();
+        let destination = catalog::create_destination(&pool, "wait API destination", destination_profile.adapter_id(), serde_json::to_value(&destination_profile).unwrap()).await.unwrap();
+        let destination = catalog::validate_destination_draft(&pool, destination.id).await.unwrap();
+        let body = |pipeline: Uuid, wait: bool| serde_json::json!({
+            "pipelineId": pipeline, "sourceId": source.id, "sourceRevision": source.current_revision,
+            "destinationId": destination.id, "destinationRevision": destination.current_revision, "allowWaiting": wait
+        });
+        let app = router_with_database(pool.clone());
+        let (status, immediate) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(Uuid::new_v4()), Some(body(Uuid::new_v4(), false))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(immediate["state"], "unavailable");
+        assert!(immediate.get("requestId").is_none());
+        let key = Uuid::new_v4();
+        let request = body(Uuid::new_v4(), true);
+        let (_, waiting) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(key), Some(request.clone())).await;
+        assert_eq!(waiting["state"], "waiting");
+        assert!(waiting["expiresAt"].is_string());
+        let id = waiting["requestId"].as_str().unwrap();
+        let path = format!("/api/v1/capacity-requests/{id}");
+        let (_, cancelled) = call(&app, "POST", &format!("{path}/cancel"), None, None).await;
+        assert_eq!(cancelled["state"], "cancelled");
+        let (_, replay) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(key), Some(request.clone())).await;
+        assert_eq!(replay["state"], "cancelled");
+        let mut changed = request.clone();
+        changed["allowWaiting"] = false.into();
+        assert_eq!(call(&app, "POST", "/api/v1/routes/plan-assignment", Some(key), Some(changed)).await.0, StatusCode::CONFLICT);
+
+        let expired_key = Uuid::new_v4();
+        let expired_body = body(Uuid::new_v4(), true);
+        let (_, expired) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(expired_key), Some(expired_body.clone())).await;
+        let expired_id = Uuid::parse_str(expired["requestId"].as_str().unwrap()).unwrap();
+        sqlx::query("UPDATE capacity_wait_requests SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE request_id = $1")
+            .bind(expired_id).execute(&pool).await.unwrap();
+        let (_, expired) = call(&app, "GET", &format!("/api/v1/capacity-requests/{expired_id}"), None, None).await;
+        assert_eq!(expired["state"], "unavailable");
+        assert_eq!(expired["reason"], "expired");
+        let (_, replay) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(expired_key), Some(expired_body)).await;
+        assert_eq!(replay["state"], "unavailable");
+        assert_eq!(replay["reason"], "expired");
+
+        let (_, first) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(Uuid::new_v4()), Some(body(Uuid::new_v4(), true))).await;
+        let (_, second) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(Uuid::new_v4()), Some(body(Uuid::new_v4(), true))).await;
+        let first_path = format!("/api/v1/capacity-requests/{}", first["requestId"].as_str().unwrap());
+        let second_path = format!("/api/v1/capacity-requests/{}", second["requestId"].as_str().unwrap());
+        drop(app);
+        let worker_id = Uuid::new_v4();
+        let registry = PgWorkerRegistry::new(pool.clone());
+        let mut worker = Worker {
+            id: worker_id, stable_name: format!("wait-api-{worker_id}"), version: "1".into(),
+            state: WorkerState::Registering,
+            capabilities: WorkerCapabilities { platform: Some(Platform::Linux), architecture: Some(Architecture::X86_64),
+                source_adapters: BTreeSet::from(["rtp_l16".into()]), destination_adapters: BTreeSet::from(["rtp_l16".into()]), ..WorkerCapabilities::default() },
+            capacity: WorkerCapacity { total_capacity_units: 2, assigned_capacity_units: 0, cpu_utilization_ratio: None,
+                memory_utilization_ratio: None, ingress_bits_per_second: None, egress_bits_per_second: None },
+            last_heartbeat: Utc::now(),
+        };
+        registry.register(worker.clone()).await.unwrap();
+        worker.state = WorkerState::Accepting;
+        registry.heartbeat(worker.clone()).await.unwrap();
+        let app = router_with_database(pool.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let (_, status) = call(&app, "GET", &first_path, None, None).await;
+                if status["state"] == "planned" { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(call(&app, "GET", &second_path, None, None).await.1["state"], "waiting");
+        sqlx::query("ALTER TABLE workers DISABLE TRIGGER capacity_workers_changed")
+            .execute(&pool).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        worker.capacity.total_capacity_units = 4;
+        registry.heartbeat(worker).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let (_, status) = call(&app, "GET", &second_path, None, None).await;
+                if status["state"] == "planned" { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        sqlx::query("ALTER TABLE workers ENABLE TRIGGER capacity_workers_changed")
+            .execute(&pool).await.unwrap();
+        let (_, terminal) = call(&app, "POST", &format!("{second_path}/cancel"), None, None).await;
+        assert_eq!(terminal["state"], "planned");
+        assert!(terminal["assignment"]["id"].is_string());
+        assert_eq!(call(&app, "GET", &format!("/api/v1/capacity-requests/{}", Uuid::new_v4()), None, None).await.0, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
     async fn assignment_planning_api_pins_revisions() {
@@ -2283,6 +2608,7 @@ mod tests {
                 ca_certificates_file: None,
                 worker_id,
                 bearer_token: "worker-secret".to_owned(),
+                bearer_token_file: None,
                 allow_insecure_loopback: true,
             },
             Arc::new(PgAssignmentGenerationStore::new(pool.clone())),

@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::{
     assignments::{PgAssignments, PlannedAssignment, PlannedRouteConfig},
     capacity_reservations::{reserve_in_transaction, ReservationDecision},
+    capacity_wait::{has_waiters, lock_queue},
     worker_registry::error_with,
 };
 
@@ -72,8 +73,9 @@ impl PgPipelinePlanner {
             .begin()
             .await
             .map_err(|error| error_with("database_error", error))?;
+        lock_queue(&mut transaction).await?;
         let decision = self
-            .plan_in_transaction(&mut transaction, pipeline_id, route, max_heartbeat_age)
+            .plan_now_in_transaction(&mut transaction, pipeline_id, route, max_heartbeat_age)
             .await?;
         transaction
             .commit()
@@ -106,6 +108,7 @@ impl PgPipelinePlanner {
             .execute(&mut *transaction)
             .await
             .map_err(|error| error_with("database_error", error))?;
+        lock_queue(&mut transaction).await?;
         sqlx::query("DELETE FROM route_plan_idempotency WHERE expires_at <= clock_timestamp()")
             .execute(&mut *transaction)
             .await
@@ -142,7 +145,7 @@ impl PgPipelinePlanner {
         }
 
         let decision = self
-            .plan_in_transaction(&mut transaction, pipeline_id, route, max_heartbeat_age)
+            .plan_now_in_transaction(&mut transaction, pipeline_id, route, max_heartbeat_age)
             .await?;
         sqlx::query(
             "INSERT INTO route_plan_idempotency \
@@ -162,38 +165,38 @@ impl PgPipelinePlanner {
         Ok(decision)
     }
 
-    async fn plan_in_transaction(
+    async fn plan_now_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
         pipeline_id: Uuid,
         route: RouteRevision,
         max_heartbeat_age: Duration,
     ) -> PortResult<PipelinePlanningDecision> {
-        if route.source_id.is_nil()
-            || route.destination_id.is_nil()
-            || route.source_revision <= 0
-            || route.destination_revision <= 0
-        {
-            return Err(error_with(
-                "invalid_route_revision",
-                "source and destination IDs and positive revisions are required",
-            ));
+        if has_waiters(transaction).await? {
+            if pipeline_id.is_nil() || max_heartbeat_age < Duration::zero() {
+                return Err(error_with(
+                    "invalid_reservation",
+                    "pipeline ID and nonnegative heartbeat age are required",
+                ));
+            }
+            let (estimate, _) = validate_route(transaction, route).await?;
+            return Ok(PipelinePlanningDecision::Unavailable {
+                estimate,
+                rejections: Vec::new(),
+            });
         }
-        let source = load_source(transaction, route).await?;
-        let destination = load_destination(transaction, route).await?;
-        let estimate = estimate_pipeline_requirements(&source, &destination)
-            .map_err(|error| error_with("invalid_media_profile", error))?;
-        let route_config = PlannedRouteConfig {
-            source_id: route.source_id,
-            source_revision: route.source_revision,
-            destination_id: route.destination_id,
-            destination_revision: route.destination_revision,
-            media_path: estimate.media_path.as_str().to_owned(),
-            configuration: json!({
-                "source": source,
-                "destination": destination,
-            }),
-        };
+        self.plan_in_transaction(transaction, pipeline_id, route, max_heartbeat_age)
+            .await
+    }
+
+    pub(crate) async fn plan_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        pipeline_id: Uuid,
+        route: RouteRevision,
+        max_heartbeat_age: Duration,
+    ) -> PortResult<PipelinePlanningDecision> {
+        let (estimate, route_config) = validate_route(transaction, route).await?;
         let decision = match reserve_in_transaction(
             transaction,
             pipeline_id,
@@ -225,6 +228,38 @@ impl PgPipelinePlanner {
         };
         Ok(decision)
     }
+}
+
+pub(crate) async fn validate_route(
+    transaction: &mut Transaction<'_, Postgres>,
+    route: RouteRevision,
+) -> PortResult<(PipelineEstimate, PlannedRouteConfig)> {
+    if route.source_id.is_nil()
+        || route.destination_id.is_nil()
+        || route.source_revision <= 0
+        || route.destination_revision <= 0
+    {
+        return Err(error_with(
+            "invalid_route_revision",
+            "source and destination IDs and positive revisions are required",
+        ));
+    }
+    let source = load_source(transaction, route).await?;
+    let destination = load_destination(transaction, route).await?;
+    let estimate = estimate_pipeline_requirements(&source, &destination)
+        .map_err(|error| error_with("invalid_media_profile", error))?;
+    let route_config = PlannedRouteConfig {
+        source_id: route.source_id,
+        source_revision: route.source_revision,
+        destination_id: route.destination_id,
+        destination_revision: route.destination_revision,
+        media_path: estimate.media_path.as_str().to_owned(),
+        configuration: json!({
+            "source": source,
+            "destination": destination,
+        }),
+    };
+    Ok((estimate, route_config))
 }
 
 async fn load_source(

@@ -8,17 +8,25 @@ persists in the `postgres_data` named volume.
 ## Start
 
 Copy `.env.example` to `.env`, replace the local database password with a
-URL-safe value, then run:
+URL-safe value, and create the first-run administrator secrets:
 
 ```powershell
 Copy-Item .env.example .env
-docker compose up --build --wait
+powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\new-admin-secrets.ps1
+docker compose -f compose.yaml -f compose.admin-secrets.yaml up --build --wait
 ```
 
-Open the UI at `http://localhost:3000`; the API is also available at
-`http://localhost:8080/api/v1/health/live`. Both host ports can be changed with
-`ARC_UI_PORT` and `ARC_API_PORT` in `.env`. Published ports bind only to
-loopback. The database has no published host port.
+Open the UI at `http://localhost:3000` and enter the one-time bootstrap token
+from `secrets\admin_bootstrap_token.txt` to create the administrator account;
+there is no default password. Keep the recovery token from
+`secrets\admin_recovery_token.txt` offline and protected. After administrator
+recovery, replace that file with the newly issued recovery token and recreate
+the API service. `ARC_ADMIN_COOKIE_SECURE=false` is only for this local
+HTTP-only development setup; use `true` behind production HTTPS.
+
+The API is also available at `http://localhost:8080/api/v1/health/live`. Both
+host ports can be changed with `ARC_UI_PORT` and `ARC_API_PORT` in `.env`.
+Published ports bind only to loopback. The database has no published host port.
 
 The API readiness endpoint is `GET /api/v1/health/ready`; it succeeds only when
 PostgreSQL responds. Compose marks the API container healthy after that check.
@@ -55,30 +63,67 @@ services:
       - ./deploy/trust/ingress-ca.pem:/etc/arc/trust/ingress-ca.pem:ro
 ```
 
-For the Docker-secrets and TLS ingress POC, generate a certificate/key and
-secret files, then start with both Compose files:
+For the local Docker-secrets and TLS-ingress POC, generate a certificate/key
+and worker credential files, then combine the administrator and worker secret
+overlays:
 
 ```powershell
 .\deploy\generate-local-tls.ps1
-New-Item -ItemType Directory secrets -Force
-@('{"<worker-uuid>":"<64-character-hex-token>"}') | Set-Content secrets\worker_credentials.json
-Set-Content secrets\worker_control_token.txt "<64-character-hex-token>"
-$env:ARC_WORKER_CREDENTIALS_FILE_SOURCE="./secrets/worker_credentials.json"
-$env:ARC_WORKER_CONTROL_TOKEN_FILE_SOURCE="./secrets/worker_control_token.txt"
-docker compose -f compose.yaml -f compose.secrets.yaml --profile worker up --build --wait
+powershell -NoProfile -ExecutionPolicy Bypass -File .\deploy\new-worker-secrets.ps1
+docker compose -f compose.yaml -f compose.admin-secrets.yaml -f compose.secrets.yaml --profile worker --profile local-tls up --build --wait
 ```
 
-The Nginx ingress forwards WebSocket upgrades to the API and sets
+Copy the printed worker ID into `.env` as `ARC_WORKER_ID`; set
+`ARC_WORKER_CREDENTIALS_FILE_SOURCE=./secrets/worker_credentials.json` and
+`ARC_WORKER_CONTROL_TOKEN_FILE_SOURCE=./secrets/worker_control_token.txt`
+there as well. Set `ARC_WORKER_NAME` and
+`ARC_WORKER_CONTROL_ENDPOINT=wss://localhost:8443/api/v1/workers/control` in
+`.env`; the worker UUID must be the same UUID used as the key in
+`worker_credentials.json`. The script writes the same randomly generated token
+to both files and restricts their Windows ACLs; it never prints the token.
+
+The local Nginx ingress forwards WebSocket upgrades to the API and sets
 `X-Forwarded-Proto=https`. Use a certificate/trust chain valid for the worker's
 configured WSS hostname. For local private-CA testing, provide its CA bundle
 with `ARC_WORKER_CONTROL_CA_FILE`; the generated local certificate is not
 trusted by default and must not be reused as a production certificate.
 
+For worker-token rotation, replace both the API credential-map secret and the
+worker token secret with the same new 64-character token, then recreate both
+services. The API closes an already established session within one second if
+the active credential source changes; a recreated worker reloads its token
+before reconnecting. There is no overlap period, and the previous token is
+rejected. Docker Compose file-backed secrets are snapshots for running
+containers, so file changes alone do not update a mounted secret.
+
 After configuration, start the worker profile with:
 
 ```powershell
-docker compose --profile worker up --build --wait
+docker compose -f compose.yaml -f compose.admin-secrets.yaml -f compose.secrets.yaml --profile worker --profile local-tls up --build --wait
 ```
+
+### Public ACME certificates
+
+For production WSS and browser access, configure `ARC_PUBLIC_DOMAIN`,
+`ARC_ACME_EMAIL`, `ARC_WORKER_CONTROL_ENDPOINT=wss://<domain>/api/v1/workers/control`,
+and `ARC_ADMIN_COOKIE_SECURE=true` in `.env`. Point public DNS at this host and
+allow inbound TCP ports 80 and 443. Obtain the initial certificate while port 80
+is available:
+
+```powershell
+docker compose -f compose.yaml -f compose.acme.yaml --profile acme-bootstrap run --rm certbot-bootstrap
+docker compose -f compose.yaml -f compose.admin-secrets.yaml -f compose.secrets.yaml -f compose.acme.yaml --profile worker --profile acme up --build --wait
+```
+
+The first command uses Certbot's standalone HTTP-01 challenge and stores the
+certificate in the persistent `letsencrypt_data` volume. The second runs the
+NGINX HTTPS ingress, serves ACME webroot challenges, proxies the UI/API and
+worker WebSocket traffic, and starts a Certbot renewal loop. Successful renewals
+signal NGINX to reload its certificate. Check `docker compose logs certbot-renew`
+and `docker compose logs ingress-acme` for renewal and reload failures. The
+bootstrap command must be repeated for a fresh deployment volume; certificate
+issuance and renewal cannot be verified without a real public domain and
+reachable ingress.
 
 The worker connects to PostgreSQL for its registry heartbeat and durable
 command-generation fence, and only advertises readiness while its authenticated
@@ -162,20 +207,23 @@ the required runtime OS/GStreamer license and package closure.
   multi-platform base images and avoid platform-specific media packages, but
   Linux AMD64/ARM64 release builds and Windows x86-64 builds have not yet been
   validated.
-- This is a local development stack, not a production deployment. Docker
-  secret-file mounting and the WSS ingress override are POC paths; production
-  secret-provider lifecycle, certificate automation, worker networking/device
-  access, backups, and key rotation remain separate release work.
-- The API enables the worker-control WebSocket route only when
-  `ARC_WORKER_CREDENTIALS_JSON` is configured. Compose does not include a TLS
-  proxy; the worker profile therefore requires an independently configured
-  trusted ingress that terminates WSS, overwrites `X-Forwarded-Proto`, and
-  keeps the API reachable only on its trusted network. Production still
-  requires a production secret-store adapter.
-- The worker image includes GStreamer core, base, good, and ALSA runtime
-  packages. It copies only the LGPL SRT plugin from the Debian bad-plugin
-  package's non-shipped extraction stage and installs the MPL-2.0 SRT runtime
-  library. The complete package/license closure still requires release-time
-  inventory and review.
+- This is a local development stack, not a production deployment. The API now
+  requires first-run administrator bootstrap/recovery secrets and protects
+  operator routes with CSRF-checked sessions. Worker credentials can be read
+  from Docker Compose secret files and are revalidated on active sessions.
+  Compose file-backed secrets are not encrypted at rest; production still
+  requires host access controls, protected backups, a managed secret store, and
+  controlled rotation.
+- The worker profile uses the local self-signed TLS ingress only for testing.
+  Production requires a public domain, ACME certificate issuance/renewal,
+  trusted ingress configuration, worker networking/device access, and proof
+  that API access is restricted to that ingress.
+- The worker runtime installs GStreamer core, the Base support library and
+  ALSA plugin, plus the MPL-2.0 SRT runtime library. It copies only the
+  required app, audioconvert, UDP, RTP, RTP-manager and SRT plugin modules from
+  non-shipped Debian extraction stages; none of the full Base/Good/Bad plugin
+  bundles are installed in the runtime image. AMD64 and emulated ARM64 checks
+  confirm required factories load and unused DV/CACA packages are absent.
+  Full package/license and notice review remains a release gate.
 - Keep `.env` local; it is ignored by Git. The example password is a
   placeholder, not a credential.

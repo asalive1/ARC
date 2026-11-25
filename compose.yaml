@@ -23,6 +23,7 @@ services:
       ARC_API_BIND_ADDRESS: 0.0.0.0:8080
       DATABASE_URL: postgres://arc:${ARC_POSTGRES_PASSWORD:?Set ARC_POSTGRES_PASSWORD in .env}@postgres:5432/arc
       ARC_WORKER_CREDENTIALS_JSON: ${ARC_WORKER_CREDENTIALS_JSON:-}
+      ARC_ADMIN_COOKIE_SECURE: ${ARC_ADMIN_COOKIE_SECURE:-true}
     depends_on:
       postgres:
         condition: service_healthy

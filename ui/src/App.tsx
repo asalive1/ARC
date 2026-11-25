@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   useMutation,
   useQuery,
@@ -12,6 +12,7 @@ import {
   Card,
   CardContent,
   Chip,
+  CircularProgress,
   CssBaseline,
   Divider,
   FormControlLabel,
@@ -27,19 +28,29 @@ import {
 
 import {
   ApiRequestError,
+  bootstrapAdmin,
+  changeAdminPassword,
   cancelAssignment as cancelAssignmentRequest,
+  cancelCapacityRequest,
+  fetchAdminAuthStatus,
+  fetchAdminSession,
   createDestination as createDestinationRequest,
   createSource as createSourceRequest,
   fetchDestinations,
   fetchReadiness,
   fetchPipelineAssignment,
+  fetchCapacityRequest,
   fetchSources,
+  loginAdmin,
+  logoutAdmin,
   planRoute,
   planRouteAssignment,
   startAssignment as startAssignmentRequest,
   stopAssignment as stopAssignmentRequest,
   updateDestination as updateDestinationRequest,
   updateSource as updateSourceRequest,
+  recoverAdmin,
+  setCsrfToken,
   validateDestination,
   validateSource,
   type DestinationMediaProfile,
@@ -51,6 +62,25 @@ import {
 } from "./api";
 
 const apiBaseUrl = import.meta.env.VITE_ARC_API_BASE_URL ?? "";
+const capacityAttemptStorageKey = "arc-capacity-attempt";
+
+function storedCapacityAttempt(): PlanRouteAssignmentInput | undefined {
+  try {
+    const raw = sessionStorage.getItem(capacityAttemptStorageKey);
+    if (!raw) return undefined;
+    const value = JSON.parse(raw) as PlanRouteAssignmentInput;
+    if (value.allowWaiting === true && typeof value.pipelineId === "string" &&
+        typeof value.idempotencyKey === "string" && typeof value.sourceId === "string" &&
+        typeof value.sourceRevision === "number" && typeof value.destinationId === "string" &&
+        typeof value.destinationRevision === "number" &&
+        (value.capacityRequestId === undefined || typeof value.capacityRequestId === "string")) {
+      return value;
+    }
+  } catch {
+    // Storage can be unavailable or contain an obsolete value.
+  }
+  return undefined;
+}
 
 type Section = "workspace" | "inputs" | "outputs" | "gpio" | "admin";
 
@@ -95,6 +125,324 @@ function createPipelineId(): string {
 
 export function App() {
   const queryClient = useQueryClient();
+  const [recoveryToken, setRecoveryToken] = useState<string>();
+  const [logoutError, setLogoutError] = useState("");
+  const authStatus = useQuery({
+    queryKey: ["auth", "status"],
+    queryFn: () => fetchAdminAuthStatus(apiBaseUrl),
+    retry: false,
+  });
+  const session = useQuery({
+    queryKey: ["auth", "session"],
+    queryFn: () => fetchAdminSession(apiBaseUrl),
+    enabled: authStatus.isSuccess && !authStatus.data.bootstrap_required,
+    retry: false,
+  });
+
+  useEffect(() => {
+    const refreshSession = () => {
+      setCsrfToken(undefined);
+      void queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
+    };
+    window.addEventListener("arc-auth-required", refreshSession);
+    return () => window.removeEventListener("arc-auth-required", refreshSession);
+  }, [queryClient]);
+
+  useEffect(() => {
+    setCsrfToken(session.data?.csrf_token);
+  }, [session.data?.csrf_token]);
+
+  if (authStatus.isPending) {
+    return <AuthLoading />;
+  }
+  if (authStatus.isError) {
+    return (
+      <AuthMessage
+        message="Administrator authentication could not be reached."
+        onRetry={() => void authStatus.refetch()}
+      />
+    );
+  }
+  if (authStatus.data.bootstrap_required) {
+    return (
+      <AdminAuthScreen
+        mode="bootstrap"
+        onAuthenticated={(csrf) => {
+          setCsrfToken(csrf);
+          void queryClient.invalidateQueries({ queryKey: ["auth", "status"] });
+          void queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
+        }}
+        onRecovered={() => undefined}
+      />
+    );
+  }
+  if (session.isPending) {
+    return <AuthLoading />;
+  }
+  if (session.isError) {
+    if (
+      session.error instanceof ApiRequestError &&
+      session.error.status !== 401
+    ) {
+      return (
+        <AuthMessage
+          message="The administrator session could not be verified."
+          onRetry={() => void session.refetch()}
+        />
+      );
+    }
+    return (
+      <AdminAuthScreen
+        mode="login"
+        onAuthenticated={(csrf) => {
+          setCsrfToken(csrf);
+          void queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
+        }}
+        onRecovered={(token, csrf) => {
+          setRecoveryToken(token);
+          setCsrfToken(csrf);
+          void queryClient.invalidateQueries({ queryKey: ["auth", "status"] });
+          void queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
+        }}
+      />
+    );
+  }
+
+  async function handleLogout() {
+    setLogoutError("");
+    try {
+      await logoutAdmin(apiBaseUrl);
+      setCsrfToken(undefined);
+      await queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
+    } catch (error) {
+      setLogoutError(
+        error instanceof Error ? error.message : "Unable to sign out.",
+      );
+    }
+  }
+
+  return (
+    <WorkspaceApp
+      username={session.data.username}
+      logoutError={logoutError}
+      recoveryToken={recoveryToken}
+      onLogout={handleLogout}
+      onDismissRecovery={() => setRecoveryToken(undefined)}
+      onPasswordChanged={() => {
+        setCsrfToken(undefined);
+        void queryClient.invalidateQueries({ queryKey: ["auth", "session"] });
+      }}
+    />
+  );
+}
+
+function AuthLoading() {
+  return (
+    <Box
+      sx={{
+        minHeight: "100vh",
+        display: "grid",
+        placeItems: "center",
+        bgcolor: "#0d151c",
+        color: "white",
+      }}
+    >
+      <CircularProgress aria-label="Loading administrator authentication" />
+    </Box>
+  );
+}
+
+function AuthMessage({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <Box sx={{ maxWidth: 520, mx: "auto", mt: 10, p: 3 }}>
+      <Stack spacing={2}>
+        <Alert severity="error">{message}</Alert>
+        <Button onClick={onRetry} variant="contained">
+          Retry
+        </Button>
+      </Stack>
+    </Box>
+  );
+}
+
+function AdminAuthScreen({
+  mode: initialMode,
+  onAuthenticated,
+  onRecovered,
+}: {
+  mode: "bootstrap" | "login";
+  onAuthenticated: (csrfToken: string) => void;
+  onRecovered: (recoveryToken: string, csrfToken: string) => void;
+}) {
+  const [mode, setMode] = useState<"bootstrap" | "login" | "recover">(
+    initialMode,
+  );
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [secretToken, setSecretToken] = useState("");
+  const [error, setError] = useState("");
+  const [pending, setPending] = useState(false);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    if (mode !== "login" && password !== confirmPassword) {
+      setError("The password entries do not match.");
+      return;
+    }
+    setPending(true);
+    try {
+      if (mode === "bootstrap") {
+        const result = await bootstrapAdmin(
+          secretToken,
+          username,
+          password,
+          apiBaseUrl,
+        );
+        onAuthenticated(result.csrf_token);
+      } else if (mode === "login") {
+        const result = await loginAdmin(username, password, apiBaseUrl);
+        onAuthenticated(result.csrf_token);
+      } else {
+        const result = await recoverAdmin(
+          secretToken,
+          password,
+          apiBaseUrl,
+        );
+        onRecovered(result.replacement_recovery_token, result.csrf_token);
+      }
+    } catch (requestError) {
+      setError(
+        requestError instanceof ApiRequestError && requestError.status === 401
+          ? "The supplied credentials were rejected."
+          : "The request failed. Check the values and try again.",
+      );
+    } finally {
+      setPending(false);
+    }
+  }
+
+  const bootstrap = mode === "bootstrap";
+  const recovering = mode === "recover";
+
+  return (
+    <Box
+      sx={{
+        minHeight: "100vh",
+        display: "grid",
+        placeItems: "center",
+        px: 2,
+        bgcolor: "#0d151c",
+      }}
+    >
+      <Card sx={{ width: "100%", maxWidth: 440 }}>
+        <CardContent sx={{ p: 3 }}>
+          <Stack component="form" spacing={2} onSubmit={submit}>
+            <Typography variant="h5" component="h1">
+              {bootstrap
+                ? "Set up ARC administrator"
+                : recovering
+                  ? "Recover administrator access"
+                  : "Sign in to ARC"}
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              {bootstrap
+                ? "Use the one-time bootstrap secret from your deployment to create the administrator account."
+                : recovering
+                  ? "Use the recovery secret to reset the administrator password. A replacement recovery secret will be shown once."
+                  : "Sign in with the local administrator account."}
+            </Typography>
+            {error && <Alert severity="error">{error}</Alert>}
+            {(bootstrap || recovering) && (
+              <TextField
+                label={bootstrap ? "Bootstrap secret" : "Recovery secret"}
+                value={secretToken}
+                onChange={(event) => setSecretToken(event.target.value)}
+                autoComplete="off"
+                required
+              />
+            )}
+            {(bootstrap || mode === "login") && (
+              <TextField
+                label="Username"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                autoComplete="username"
+                required
+              />
+            )}
+            <TextField
+              label={mode === "login" ? "Password" : "New password"}
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete={mode === "login" ? "current-password" : "new-password"}
+              inputProps={{ minLength: mode === "login" ? undefined : 12, maxLength: 128 }}
+              required
+            />
+            {mode !== "login" && (
+              <TextField
+                label="Confirm new password"
+                type="password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                autoComplete="new-password"
+                inputProps={{ minLength: 12, maxLength: 128 }}
+                required
+              />
+            )}
+            <Button type="submit" variant="contained" disabled={pending}>
+              {pending
+                ? "Please wait..."
+                : bootstrap
+                  ? "Create administrator"
+                  : recovering
+                    ? "Reset password"
+                    : "Sign in"}
+            </Button>
+            {!bootstrap && (
+              <Button
+                onClick={() => {
+                  setError("");
+                  setMode(recovering ? "login" : "recover");
+                  setPassword("");
+                  setConfirmPassword("");
+                  setSecretToken("");
+                }}
+              >
+                {recovering ? "Return to sign in" : "Recover access"}
+              </Button>
+            )}
+          </Stack>
+        </CardContent>
+      </Card>
+    </Box>
+  );
+}
+
+function WorkspaceApp({
+  username,
+  logoutError,
+  recoveryToken,
+  onLogout,
+  onDismissRecovery,
+  onPasswordChanged,
+}: {
+  username: string;
+  logoutError: string;
+  recoveryToken?: string;
+  onLogout: () => Promise<void>;
+  onDismissRecovery: () => void;
+  onPasswordChanged: () => void;
+}) {
+  const queryClient = useQueryClient();
   const [section, setSection] = useState<Section>("workspace");
   const [themeMode, setThemeMode] = useState<"dark" | "light">("dark");
   const [sourceName, setSourceName] = useState("");
@@ -121,8 +469,20 @@ export function App() {
     useState<"caller" | "listener">("caller");
   const [sourceId, setSourceId] = useState("");
   const [destinationId, setDestinationId] = useState("");
-  const [assignmentRequest, setAssignmentRequest] =
-    useState<PlanRouteAssignmentInput>();
+  const [assignmentRequest, setAssignmentRequestState] =
+    useState<PlanRouteAssignmentInput | undefined>(storedCapacityAttempt);
+  const setAssignmentRequest = (value: PlanRouteAssignmentInput | undefined) => {
+    try {
+      if (value?.allowWaiting) {
+        sessionStorage.setItem(capacityAttemptStorageKey, JSON.stringify(value));
+      } else {
+        sessionStorage.removeItem(capacityAttemptStorageKey);
+      }
+    } catch {
+      // The request remains usable in this tab when storage is unavailable.
+    }
+    setAssignmentRequestState(value);
+  };
 
   const theme = useMemo(
     () =>
@@ -509,13 +869,16 @@ export function App() {
           </Stack>
 
           <Divider />
-          <Stack spacing={0.25} sx={{ p: 2 }}>
+          <Stack spacing={0.75} sx={{ p: 2 }}>
             <Typography variant="body2" sx={{ fontWeight: 600 }}>
-              Local workspace
+              {username}
             </Typography>
             <Typography variant="caption" color="text.secondary">
-              Authentication not configured
+              Administrator
             </Typography>
+            <Button size="small" onClick={() => void onLogout()}>
+              Sign out
+            </Button>
           </Stack>
         </Box>
 
@@ -578,6 +941,9 @@ export function App() {
                   </Typography>
                 }
               />
+              <Button size="small" onClick={() => void onLogout()}>
+                Sign out
+              </Button>
             </Stack>
           </Box>
 
@@ -592,6 +958,20 @@ export function App() {
             }}
           >
             <Stack spacing={3}>
+              {logoutError && <Alert severity="error">{logoutError}</Alert>}
+              {recoveryToken && (
+                <Alert
+                  severity="warning"
+                  action={
+                    <Button color="inherit" size="small" onClick={onDismissRecovery}>
+                      I saved it
+                    </Button>
+                  }
+                >
+                  Save this replacement administrator recovery token securely.
+                  It will not be shown again: <strong>{recoveryToken}</strong>
+                </Alert>
+              )}
               <Stack
                 direction={{ xs: "column", md: "row" }}
                 alignItems={{ xs: "flex-start", md: "center" }}
@@ -752,6 +1132,7 @@ export function App() {
                   healthLabel={healthLabel}
                   healthy={health.isSuccess}
                   error={health.isError ? health.error.message : ""}
+                  onPasswordChanged={onPasswordChanged}
                 />
               )}
             </Stack>
@@ -867,6 +1248,8 @@ function WorkspaceView({
   );
   const queryClient = useQueryClient();
   const activePipelineId = assignmentRequest?.pipelineId;
+  const capacityRequestId = assignmentRequest?.capacityRequestId;
+  const [allowWaiting, setAllowWaiting] = useState(!!assignmentRequest?.allowWaiting);
   const resultMatchesSelection =
     selectedSource !== undefined &&
     selectedDestination !== undefined &&
@@ -876,9 +1259,35 @@ function WorkspaceView({
   const assignmentPlan = useMutation({
     mutationFn: (input: PlanRouteAssignmentInput) =>
       planRouteAssignment(input, apiBaseUrl),
-    onSuccess: (result, input) =>
-      onAssignmentRequestChange(result.assignment ? input : undefined),
+    onSuccess: (result, input) => {
+      if (result.requestId) {
+        queryClient.setQueryData(["capacity-request", result.requestId], result);
+        onAssignmentRequestChange({ ...input, capacityRequestId: result.requestId });
+      } else {
+        onAssignmentRequestChange(result.assignment ? input : undefined);
+      }
+    },
   });
+  const capacityStatus = useQuery({
+    queryKey: ["capacity-request", capacityRequestId],
+    queryFn: () => fetchCapacityRequest(capacityRequestId!, apiBaseUrl),
+    enabled: capacityRequestId !== undefined,
+    refetchInterval: (query) =>
+      !query.state.data || query.state.data.state === "waiting" ? 1000 : false,
+    retry: false,
+  });
+  const cancelWait = useMutation({
+    mutationFn: (id: string) => cancelCapacityRequest(id, apiBaseUrl),
+    onSuccess: (result, id) => {
+      queryClient.setQueryData(["capacity-request", id], result);
+    },
+    onError: (_error, id) => {
+      void queryClient.invalidateQueries({ queryKey: ["capacity-request", id] });
+    },
+  });
+  const waitResult = capacityRequestId ? capacityStatus.data : undefined;
+  const waitPending = !!assignmentRequest?.allowWaiting &&
+    (!capacityRequestId || !waitResult || waitResult.state === "waiting");
   const pipelineAssignment = useQuery({
     queryKey: ["pipeline-assignment", activePipelineId],
     queryFn: () => {
@@ -890,9 +1299,11 @@ function WorkspaceView({
     enabled:
       activePipelineId !== undefined &&
       !assignmentPlan.isPending &&
+      (!assignmentRequest?.allowWaiting || waitResult?.state === "planned") &&
       (assignmentPlan.isIdle ||
         assignmentPlan.isError ||
-        assignmentPlan.data?.assignment != null),
+        assignmentPlan.data?.assignment != null ||
+        waitResult?.state === "planned"),
     refetchInterval: (query) =>
       query.state.data?.observedState === "starting" ||
       query.state.data?.observedState === "stopping"
@@ -984,9 +1395,9 @@ function WorkspaceView({
     assignmentVariables.destinationId === selectedDestination.id &&
     assignmentVariables.destinationRevision ===
       selectedDestination.currentRevision;
-  const assignmentPlanResult = assignmentPlanMatchesSelection
-    ? assignmentPlan.data
-    : undefined;
+  const assignmentPlanResult = capacityRequestId
+    ? waitResult
+    : assignmentPlanMatchesSelection ? assignmentPlan.data : undefined;
   const currentAssignment =
     activePipelineId !== undefined &&
     pipelineAssignment.data?.assignment.pipelineId === activePipelineId
@@ -1005,13 +1416,16 @@ function WorkspaceView({
     activePipelineId !== undefined &&
     pipelineAssignment.isError &&
     !assignmentNotFound &&
-    assignmentPlan.data?.state !== "unavailable";
+    assignmentPlanResult?.state !== "unavailable" &&
+    assignmentPlanResult?.state !== "cancelled";
   const canCreateAssignment =
     selectedSource?.lifecycle === "validated" &&
     selectedDestination?.lifecycle === "validated" &&
     !assignmentPlan.isPending &&
+    !waitPending &&
     (activePipelineId === undefined ||
-      assignmentPlan.data?.state === "unavailable" ||
+      assignmentPlanResult?.state === "unavailable" ||
+      assignmentPlanResult?.state === "cancelled" ||
       !pipelineAssignment.isFetching) &&
     !assignmentStatusUnknown &&
     (!currentAssignment || currentAssignmentIsTerminal) &&
@@ -1042,6 +1456,9 @@ function WorkspaceView({
       assignmentPlan.variables ?? assignmentRequest;
     const retryingSamePlan =
       !currentAssignmentIsTerminal &&
+      !capacityRequestId &&
+      assignmentPlanResult?.state !== "unavailable" &&
+      assignmentPlanResult?.state !== "cancelled" &&
       previousAttempt?.sourceId === selectedSource.id &&
       previousAttempt.sourceRevision === selectedSource.currentRevision &&
       previousAttempt.destinationId === selectedDestination.id &&
@@ -1053,13 +1470,16 @@ function WorkspaceView({
     const idempotencyKey = retryingSamePlan && previousAttempt
       ? previousAttempt.idempotencyKey
       : createPipelineId();
-    const input = {
+    const input: PlanRouteAssignmentInput = {
       pipelineId,
       idempotencyKey,
       sourceId: selectedSource.id,
       sourceRevision: selectedSource.currentRevision,
       destinationId: selectedDestination.id,
       destinationRevision: selectedDestination.currentRevision,
+      ...(retryingSamePlan && previousAttempt?.allowWaiting
+        ? { allowWaiting: true }
+        : allowWaiting ? { allowWaiting: true } : {}),
     };
     onAssignmentRequestChange(input);
     assignmentPlan.mutate(input);
@@ -1270,6 +1690,16 @@ function WorkspaceView({
                 worker.
               </Alert>
             )}
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={allowWaiting}
+                  onChange={(_, checked) => setAllowWaiting(checked)}
+                  disabled={waitPending || assignmentPlan.isPending}
+                />
+              }
+              label="Wait up to five minutes for capacity (strict FIFO)"
+            />
             {selectedSource && selectedDestination && (
               <Button
                 variant="contained"
@@ -1283,6 +1713,51 @@ function WorkspaceView({
                     : "Reserve worker and plan"}
               </Button>
             )}
+            {assignmentRequest?.allowWaiting && !capacityRequestId &&
+              !assignmentPlan.isPending && (
+                <Alert severity="warning" action={<Stack direction="row">
+                  <Button color="inherit" size="small" onClick={() => assignmentPlan.mutate(assignmentRequest)}>
+                    Recover request
+                  </Button>
+                  {assignmentPlan.error instanceof ApiRequestError &&
+                    [400, 404, 409, 422].includes(assignmentPlan.error.status) && (
+                      <Button color="inherit" size="small" onClick={() => {
+                        onAssignmentRequestChange(undefined);
+                        assignmentPlan.reset();
+                      }}>Clear rejected request</Button>
+                    )}
+                </Stack>}>
+                  The wait request outcome is unknown. Recover it using the same
+                  idempotency key before creating another request.
+                </Alert>
+              )}
+            {capacityRequestId && waitPending && (
+              <Alert severity={capacityStatus.isError ? "warning" : "info"} action={
+                <Button color="inherit" size="small" disabled={cancelWait.isPending}
+                  onClick={() => cancelWait.mutate(capacityRequestId)}>
+                  Cancel wait
+                </Button>
+              }>
+                Waiting for capacity, request {capacityRequestId}
+                {waitResult?.expiresAt ? `, expires ${new Date(waitResult.expiresAt).toLocaleString()}` : ""}.
+                {capacityStatus.isError ? " Status refresh failed; retrying." : " The queue is strict FIFO."}
+                {cancelWait.isError ? ` Cancellation failed: ${cancelWait.error.message}` : ""}
+              </Alert>
+            )}
+            {capacityRequestId && capacityStatus.error instanceof ApiRequestError &&
+              capacityStatus.error.status === 404 && (
+                <Alert severity="warning" action={<Button color="inherit" size="small"
+                  onClick={() => {
+                    onAssignmentRequestChange(undefined);
+                    assignmentPlan.reset();
+                  }}>Clear local request</Button>}>
+                  This request was not found or has been purged. Clearing it does
+                  not create a new request.
+                </Alert>
+              )}
+            {assignmentPlanResult?.state === "cancelled" && (
+              <Alert severity="info">Capacity wait cancelled. No reservation was created.</Alert>
+            )}
             {assignmentPlan.isError && assignmentPlanMatchesSelection && (
               <Alert
                 severity="error"
@@ -1290,14 +1765,18 @@ function WorkspaceView({
                   <Button
                     color="inherit"
                     size="small"
-                    onClick={() => void pipelineAssignment.refetch()}
+                    onClick={() => assignmentRequest?.allowWaiting
+                      ? assignmentPlan.mutate(assignmentRequest)
+                      : void pipelineAssignment.refetch()}
                   >
                     Check status
                   </Button>
                 }
               >
                 Assignment request failed: {assignmentPlan.error.message}.{" "}
-                {currentAssignment
+                {assignmentRequest?.allowWaiting
+                ? "Recover the wait request using its original key."
+                : currentAssignment
                   ? "A persisted assignment was found and loaded."
                   : "The same pipeline ID is being checked for a committed assignment."}
                 {pipelineAssignment.isError
@@ -1307,7 +1786,9 @@ function WorkspaceView({
             )}
             {assignmentPlanResult?.state === "unavailable" && (
               <Alert severity="warning">
-                No eligible worker could be assigned.
+                {assignmentPlanResult.reason === "expired"
+                  ? "Capacity wait expired. It will not retry automatically."
+                  : `No eligible worker could be assigned.${assignmentPlanResult.reason ? ` Reason: ${assignmentPlanResult.reason}.` : ""}`}
                 {assignmentPlanResult.rejections.length > 0
                   ? ` ${assignmentPlanResult.rejections
                       .map(
@@ -1321,6 +1802,9 @@ function WorkspaceView({
             {activePipelineId !== undefined &&
               pipelineAssignment.isError &&
               !assignmentPlan.isError &&
+              !waitPending &&
+              assignmentPlanResult?.state !== "unavailable" &&
+              assignmentPlanResult?.state !== "cancelled" &&
               assignmentPlanResult?.assignment == null && (
                 <Alert
                   severity={assignmentStatusUnknown ? "error" : "info"}
@@ -1918,13 +2402,43 @@ function AdminWorkspace({
   healthLabel,
   healthy,
   error,
+  onPasswordChanged,
 }: {
   themeMode: "dark" | "light";
   onThemeChange: (mode: "dark" | "light") => void;
   healthLabel: string;
   healthy: boolean;
   error: string;
+  onPasswordChanged: () => void;
 }) {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+  const [changingPassword, setChangingPassword] = useState(false);
+
+  async function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPasswordError("");
+    if (newPassword !== confirmPassword) {
+      setPasswordError("The password entries do not match.");
+      return;
+    }
+    setChangingPassword(true);
+    try {
+      await changeAdminPassword(currentPassword, newPassword, apiBaseUrl);
+      onPasswordChanged();
+    } catch (requestError) {
+      setPasswordError(
+        requestError instanceof ApiRequestError && requestError.status === 401
+          ? "The current password was rejected."
+          : "The password could not be changed. Check the values and try again.",
+      );
+    } finally {
+      setChangingPassword(false);
+    }
+  }
+
   return (
     <Box
       sx={{
@@ -1971,12 +2485,55 @@ function AdminWorkspace({
             />
             {error && <Alert severity="error">{error}</Alert>}
             <Typography variant="body2" color="text.secondary">
-              Authentication and operator accounts are not configured in this
-              local development build.
+              Local administrator authentication is enabled. Worker credentials
+              are independently provisioned through deployment secrets.
             </Typography>
             <Typography variant="body2" color="text.secondary">
               Media runtime and route activation are not available yet.
             </Typography>
+          </Stack>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardContent>
+          <Stack component="form" spacing={2} onSubmit={changePassword}>
+            <Typography variant="h6" component="h2">
+              Administrator password
+            </Typography>
+            <Typography variant="body2" color="text.secondary">
+              Changing the password revokes all active administrator sessions.
+              Sign in again after the update.
+            </Typography>
+            {passwordError && <Alert severity="error">{passwordError}</Alert>}
+            <TextField
+              label="Current password"
+              type="password"
+              value={currentPassword}
+              onChange={(event) => setCurrentPassword(event.target.value)}
+              autoComplete="current-password"
+              required
+            />
+            <TextField
+              label="New password"
+              type="password"
+              value={newPassword}
+              onChange={(event) => setNewPassword(event.target.value)}
+              autoComplete="new-password"
+              inputProps={{ minLength: 12, maxLength: 128 }}
+              required
+            />
+            <TextField
+              label="Confirm new password"
+              type="password"
+              value={confirmPassword}
+              onChange={(event) => setConfirmPassword(event.target.value)}
+              autoComplete="new-password"
+              inputProps={{ minLength: 12, maxLength: 128 }}
+              required
+            />
+            <Button type="submit" variant="contained" disabled={changingPassword}>
+              {changingPassword ? "Changing..." : "Change password"}
+            </Button>
           </Stack>
         </CardContent>
       </Card>

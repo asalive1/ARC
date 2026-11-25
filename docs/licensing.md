@@ -35,13 +35,17 @@ requires attention to all listed terms.
 | async-trait | 0.1.92 | MIT OR Apache-2.0 | Rust async interfaces |
 | Axum | 0.8.9 | MIT | HTTP API |
 | Chrono | 0.4.45 | MIT OR Apache-2.0 | Dates and times |
+| rustls | 0.23.46 | MIT OR Apache-2.0 | Worker WebSocket TLS client |
+| rustls-pemfile | 2.2.0 | MIT OR Apache-2.0 | Parse optional worker CA trust bundles |
 | Serde / serde_json | 1.0.229 / 1.0.154 | MIT OR Apache-2.0 | Serialization |
 | SQLx | 0.8.6 | MIT OR Apache-2.0 | PostgreSQL access and migrations |
+| sysinfo | 0.37.2 | MIT | Worker CPU and memory utilization telemetry |
 | subtle | 2.6.1 | BSD-3-Clause | Constant-time worker credential comparison |
 | Tokio | 1.54.1 | MIT | Asynchronous runtime |
 | Tower | 0.5.3 | MIT | HTTP service testing |
 | tracing / tracing-subscriber | 0.1.44 / 0.3.23 | MIT | Logging and tracing |
 | UUID | 1.29.3 | Apache-2.0 OR MIT | Identifiers |
+| webpki-roots | 1.0.12 | MPL-2.0 | Bundled public TLS trust roots |
 | Emotion React / Styled | 11.14.0 / 11.14.1 | MIT | UI styling |
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | Worker WebSocket client message handling and API session tests |
 | GStreamer Rust bindings | 0.25.4 | MIT OR Apache-2.0 | Worker media-plane adapter |
@@ -93,6 +97,8 @@ production WebSocket client and API session tests. The GStreamer Rust bindings
 and `url` support the isolated `arc-gstreamer` adapter. Their locked packages,
 together with the other transitive WebSocket and GStreamer packages, remain
 subject to the release-time dependency inventory.
+Optional worker private-CA trust uses `rustls` and `rustls-pemfile`, while
+`webpki-roots` preserves the bundled public trust roots.
 
 Key WebSocket transitive packages include `tungstenite` 0.29.0
 (MIT OR Apache-2.0) and `data-encoding` 2.11.1 (MIT), based on the locked
@@ -104,7 +110,7 @@ package metadata.
 |---|---|---|
 | PostgreSQL 16 | Database in Compose | [PostgreSQL License](https://www.postgresql.org/about/licence/); preserve the required notices. |
 | NGINX 1.29 | Serves the UI in the runtime image | [BSD-2-Clause](https://nginx.org/LICENSE); preserve the applicable source or binary notices. |
-| GStreamer 1.22 runtime | Worker RTP, ALSA and SRT pipeline plugins | GStreamer core/base/good are LGPL-2.1-or-later; the SRT library is MPL-2.0 as approved for Phase 1. Preserve notices and source obligations. |
+| GStreamer 1.22 runtime | Worker RTP, ALSA and SRT pipeline plugins | Required GStreamer plugins, including the isolated SRT plugin, are LGPL-2.1-or-later; the SRT library is MPL-2.0 as approved for Phase 1. Preserve notices and source obligations. |
 | Rust toolchain | API build image (`rust:1-slim`) and worker build image (`rust:1-bookworm`) | Rust is generally [MIT OR Apache-2.0](https://github.com/rust-lang/rust/blob/master/LICENSE-MIT); toolchain components and bundled dependencies may differ. |
 | curl/libcurl | API runtime healthcheck package | curl license (MIT-style); preserve applicable notices. |
 | Node.js 22 | UI build image | Node.js is generally [MIT](https://github.com/nodejs/node/blob/main/LICENSE); bundled components have their own notices. |
@@ -117,8 +123,10 @@ notices per target artifact.
 
 ## Phase 1 media runtime
 
-The opt-in worker image now includes GStreamer core, base, good, bad and ALSA
-runtime packages. The user approved LGPL GStreamer components and
+The opt-in worker image includes GStreamer core, base, good and ALSA runtime
+packages. The SRT plugin is extracted from the Debian bad-plugin package in a
+non-shipped build stage; only `libgstsrt.so` is copied into the runtime image.
+The user approved LGPL GStreamer components and
 [Haivision SRT under MPL-2.0](https://github.com/Haivision/srt/blob/master/LICENSE)
 for Phase 1, with GPL/AGPL components excluded. GStreamer's
 [licensing guidance](https://github.com/GStreamer/gstreamer/blob/main/subprojects/gst-docs/markdown/frequently-asked-questions/licensing.md)
@@ -128,11 +136,13 @@ including applicable notices and source/modification requirements, need
 review for the actual artifacts and linking/distribution method. Codec and
 patent considerations are separate from software copyright licenses.
 
-The worker image installs `gstreamer1.0-plugins-bad` to provide the SRT
-elements. This package contains plugins beyond the factories ARC uses, and its
-complete file/package closure has not yet been audited against the GPL/AGPL
-exclusion. The worker image is not release-approved until that audit is
-complete and any disallowed components are excluded.
+The Debian `gstreamer1.0-plugins-bad` package also contains unused GPL plugins
+(`dtsdec`, `faad`, `mpeg2enc`, `mplex`, `resindvd`, and `x265`) and plugins with
+unknown license metadata (`mpegpsdemux`, `rtponvif`, and `voamrwbenc`). These
+are excluded from the final worker image by copying only the LGPL SRT plugin
+and installing the separately licensed MPL-2.0 SRT runtime library. This
+removes the known disallowed plugin modules, but the full per-target OS
+dependency/SBOM inventory and legal review remain release gates.
 
 RTP, SRT, MPEG-TS, ALSA and audio format names in ARC profiles do not by
 themselves establish the license of a particular implementation. Inventory

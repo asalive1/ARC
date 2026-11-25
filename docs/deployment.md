@@ -35,6 +35,26 @@ and overwrites `X-Forwarded-Proto` with `https`. Compose does not create or
 trust a development certificate and the worker does not permit plaintext
 connections. Keep these values in the ignored `.env`, not in source control.
 
+For an ingress using a private CA, set `ARC_WORKER_CONTROL_CA_FILE` to a PEM
+bundle path inside the worker container and mount that public CA bundle
+read-only. The worker adds its certificates to the bundled public trust roots;
+normal certificate-chain and hostname validation remain enabled. The file must
+contain at least one valid PEM certificate. The worker reports a configuration
+error at startup if it cannot read or parse the bundle. Updating the bundle
+requires restarting the worker.
+
+For example, add this to a Compose override after creating the host-side CA
+bundle:
+
+```yaml
+services:
+  worker:
+    environment:
+      ARC_WORKER_CONTROL_CA_FILE: /etc/arc/trust/ingress-ca.pem
+    volumes:
+      - ./deploy/trust/ingress-ca.pem:/etc/arc/trust/ingress-ca.pem:ro
+```
+
 For the Docker-secrets and TLS ingress POC, generate a certificate/key and
 secret files, then start with both Compose files:
 
@@ -50,8 +70,9 @@ docker compose -f compose.yaml -f compose.secrets.yaml --profile worker up --bui
 
 The Nginx ingress forwards WebSocket upgrades to the API and sets
 `X-Forwarded-Proto=https`. Use a certificate/trust chain valid for the worker's
-configured WSS hostname; the generated local certificate is not trusted by
-default and must not be reused as a production certificate.
+configured WSS hostname. For local private-CA testing, provide its CA bundle
+with `ARC_WORKER_CONTROL_CA_FILE`; the generated local certificate is not
+trusted by default and must not be reused as a production certificate.
 
 After configuration, start the worker profile with:
 
@@ -77,15 +98,21 @@ services:
       - "audio"
 ```
 
-Worker capacity can be calibrated conservatively with optional heartbeat
-configuration:
+Worker capacity is reported on each heartbeat. Linux workers use cgroup v1/v2
+CPU accounting and memory limits when those controller files are visible;
+otherwise they report host-wide CPU and memory utilization. Windows workers
+report host-wide utilization. Set the following variables only when a static
+operator override is needed; configured CPU and memory ratios take precedence
+over measured values:
 `ARC_WORKER_INGRESS_BITS_PER_SECOND`,
 `ARC_WORKER_EGRESS_BITS_PER_SECOND`,
 `ARC_WORKER_CPU_UTILIZATION_RATIO`, and
-`ARC_WORKER_MEMORY_UTILIZATION_RATIO`. Bandwidth limits are absolute POC limits.
-CPU and memory ratios must be from `0.0` to `1.0`; a configured ratio at or
-above `0.90` rejects new placement. Unknown or absent limits remain unbounded
-and do not replace real performance calibration.
+`ARC_WORKER_MEMORY_UTILIZATION_RATIO`. Bandwidth limits are absolute POC limits
+and still require operator calibration. CPU and memory ratios must be from
+`0.0` to `1.0`; a ratio at or above `0.90` rejects new placement. If the
+operating system cannot provide a metric, that metric remains unknown and its
+pressure guard is unbounded; the worker logs a startup warning when no value is
+available.
 
 `docker compose down` stops and removes the containers but preserves database
 data. `docker compose down --volumes` also permanently removes the local
@@ -145,8 +172,10 @@ the required runtime OS/GStreamer license and package closure.
   trusted ingress that terminates WSS, overwrites `X-Forwarded-Proto`, and
   keeps the API reachable only on its trusted network. Production still
   requires a production secret-store adapter.
-- The worker image includes GStreamer core, base, good, bad, and ALSA runtime
-  packages for the current Phase 1 paths. The selected plugins and complete
-  package/license closure require release-time inventory and review.
+- The worker image includes GStreamer core, base, good, and ALSA runtime
+  packages. It copies only the LGPL SRT plugin from the Debian bad-plugin
+  package's non-shipped extraction stage and installs the MPL-2.0 SRT runtime
+  library. The complete package/license closure still requires release-time
+  inventory and review.
 - Keep `.env` local; it is ignored by Git. The example password is a
   placeholder, not a credential.

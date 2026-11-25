@@ -62,6 +62,8 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    env:
+      ARC_POSTGRES_PASSWORD: ci-placeholder-only
     steps:
       - uses: actions/checkout@v4
       - name: Compose default configuration

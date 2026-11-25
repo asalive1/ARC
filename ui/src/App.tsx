@@ -452,21 +452,16 @@ export function App() {
             sx={{ minHeight: 64, px: 2, borderBottom: 1, borderColor: "divider" }}
           >
             <Box
+              component="img"
+              src={
+                themeMode === "dark"
+                  ? "/ARC-Light-128.png"
+                  : "/ARC-Dark-128.png"
+              }
+              alt=""
               aria-hidden="true"
-              sx={{
-                width: 30,
-                height: 30,
-                borderRadius: 1.5,
-                display: "grid",
-                placeItems: "center",
-                bgcolor: "primary.main",
-                color: "#07131c",
-                fontSize: 17,
-                fontWeight: 800,
-              }}
-            >
-              A
-            </Box>
+              sx={{ width: 36, height: 36, objectFit: "contain", flexShrink: 0 }}
+            />
             <Box>
               <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
                 ARC
@@ -1104,9 +1099,11 @@ function WorkspaceView({
           aria-label="Decorative placeholder for the planned routing matrix"
           sx={{
             display: "grid",
-            gridTemplateColumns: "repeat(8, minmax(24px, 1fr))",
+            gridTemplateColumns: "repeat(8, minmax(0, 1fr))",
             gap: 0.75,
             p: { xs: 1, md: 2 },
+            width: "100%",
+            maxWidth: 480,
             border: 1,
             borderColor: "divider",
             borderRadius: 1,

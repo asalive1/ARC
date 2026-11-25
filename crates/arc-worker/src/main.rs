@@ -1,4 +1,4 @@
-use std::{env, error::Error, io, sync::Arc, time::Duration};
+use std::{env, error::Error, io, path::PathBuf, sync::Arc, time::Duration};
 
 use arc_application::{MediaPipeline, PipelineSpecification, WorkerRegistry};
 use arc_domain::{Architecture, Platform, WorkerState};
@@ -15,6 +15,10 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+mod resource_telemetry;
+
+use resource_telemetry::{ResourceTelemetry, CPU_SAMPLE_INTERVAL};
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
@@ -30,6 +34,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
         .parse::<Uuid>()
         .map_err(|error| invalid_config("ARC_WORKER_ID", error))?;
     let endpoint = required_env("ARC_WORKER_CONTROL_ENDPOINT")?;
+    let ca_certificates_file = optional_path_env("ARC_WORKER_CONTROL_CA_FILE")?;
     let bearer_token = worker_control_token()?;
     let stable_name =
         env::var("ARC_WORKER_NAME").unwrap_or_else(|_| format!("arc-worker-{worker_id}"));
@@ -55,6 +60,16 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     let memory_utilization_ratio =
         optional_ratio_env("ARC_WORKER_MEMORY_UTILIZATION_RATIO")?;
 
+    let mut resource_telemetry = ResourceTelemetry::new()?;
+    tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
+    let resource_usage = resource_telemetry.sample()?;
+    if cpu_utilization_ratio.is_none() && resource_usage.cpu_utilization_ratio.is_none() {
+        warn!("CPU utilization telemetry is unavailable; CPU pressure admission will be unbounded");
+    }
+    if memory_utilization_ratio.is_none() && resource_usage.memory_utilization_ratio.is_none() {
+        warn!("memory utilization telemetry is unavailable; memory pressure admission will be unbounded");
+    }
+
     let media_pipeline = Arc::new(GstreamerMediaPipeline::new().map_err(port_error)?);
     let mut worker = local_worker(
         worker_id,
@@ -67,8 +82,10 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     worker.capacity.total_capacity_units = capacity_units;
     worker.capacity.ingress_bits_per_second = ingress_bits_per_second;
     worker.capacity.egress_bits_per_second = egress_bits_per_second;
-    worker.capacity.cpu_utilization_ratio = cpu_utilization_ratio;
-    worker.capacity.memory_utilization_ratio = memory_utilization_ratio;
+    worker.capacity.cpu_utilization_ratio =
+        cpu_utilization_ratio.or(resource_usage.cpu_utilization_ratio);
+    worker.capacity.memory_utilization_ratio =
+        memory_utilization_ratio.or(resource_usage.memory_utilization_ratio);
     if worker.capabilities.source_adapters.is_empty()
         || worker.capabilities.destination_adapters.is_empty()
     {
@@ -93,6 +110,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     let client = WorkerControlClient::new(
         WorkerControlClientConfig {
             endpoint,
+            ca_certificates_file,
             worker_id,
             bearer_token,
             allow_insecure_loopback: false,
@@ -133,6 +151,11 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
                 } else {
                     WorkerState::Warming
                 };
+                let resource_usage = resource_telemetry.sample()?;
+                worker.capacity.cpu_utilization_ratio =
+                    cpu_utilization_ratio.or(resource_usage.cpu_utilization_ratio);
+                worker.capacity.memory_utilization_ratio =
+                    memory_utilization_ratio.or(resource_usage.memory_utilization_ratio);
                 worker.last_heartbeat = Utc::now();
                 registry.heartbeat(worker.clone()).await.map_err(port_error)?;
                 if connected {
@@ -151,6 +174,11 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
                 } else {
                     WorkerState::Warming
                 };
+                let resource_usage = resource_telemetry.sample()?;
+                worker.capacity.cpu_utilization_ratio =
+                    cpu_utilization_ratio.or(resource_usage.cpu_utilization_ratio);
+                worker.capacity.memory_utilization_ratio =
+                    memory_utilization_ratio.or(resource_usage.memory_utilization_ratio);
                 worker.last_heartbeat = Utc::now();
                 registry.heartbeat(worker.clone()).await.map_err(port_error)?;
             }
@@ -316,6 +344,15 @@ fn optional_u64_env(name: &str) -> io::Result<Option<u64>> {
         .parse::<u64>()
         .map(Some)
         .map_err(|error| invalid_config(name, error))
+}
+
+fn optional_path_env(name: &str) -> io::Result<Option<PathBuf>> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(PathBuf::from(value))),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(invalid_config(name, error)),
+    }
 }
 
 fn optional_ratio_env(name: &str) -> io::Result<Option<f32>> {

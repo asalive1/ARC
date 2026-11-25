@@ -2114,10 +2114,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let error: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["code"], "assignment_conflict");
+        let cancellation_retry: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cancellation_retry["state"], "cancelled");
+        assert_eq!(cancellation_retry["generation"], generation);
 
         let stale_request = serde_json::json!({
             "pipelineId": Uuid::new_v4(),
@@ -2279,6 +2280,7 @@ mod tests {
         let worker_client = WorkerControlClient::new(
             WorkerControlClientConfig {
                 endpoint: format!("ws://{address}/api/v1/workers/control"),
+                ca_certificates_file: None,
                 worker_id,
                 bearer_token: "worker-secret".to_owned(),
                 allow_insecure_loopback: true,

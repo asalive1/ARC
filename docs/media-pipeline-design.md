@@ -139,8 +139,9 @@ These are deterministic POC placeholders, not measured capacity limits or
 proof that a worker or network can safely carry a stream. Their provisional
 units feed worker placement and reservation, but network bandwidth, memory,
 transport overhead, and variable stream costs are not fully measured yet.
-The POC now admits ingress/egress limits and explicit CPU/memory pressure
-reported by each worker, while normalized capacity units remain provisional.
+The POC now admits ingress/egress limits and OS-derived CPU/memory pressure
+reported by each worker, with optional static overrides; normalized capacity
+units remain provisional.
 Calibrate resource costs and add the missing dimensions before relying on
 estimates for real media admission. Advertise actual
 GStreamer elements/codecs, audio backends, platform, architecture, and hardware

@@ -1,6 +1,6 @@
 # Worker Control Protocol
 
-**Status:** The provider-backed credential verifier, local-only JSON environment provider, conditional API executable wiring, TLS-gated WebSocket session, PostgreSQL-backed command dispatcher, worker WebSocket client, generation-gated Start/Stop handlers, GStreamer media adapter, and opt-in worker Compose profile are implemented. The UI supports a validated single-route assignment lifecycle; multi-route/resource lifecycle UI and production secret stores remain incomplete.
+**Status:** The provider-backed credential verifier, local-only JSON environment provider, conditional API executable wiring, TLS-gated WebSocket session, PostgreSQL-backed command dispatcher, worker WebSocket client with optional private-CA trust, generation-gated Start/Stop handlers, GStreamer media adapter, and opt-in worker Compose profile are implemented. The UI supports a validated single-route assignment lifecycle; multi-route/resource lifecycle UI and production secret stores remain incomplete.
 
 ## Decision
 
@@ -31,6 +31,12 @@ trusted reverse proxy or ingress, which must overwrite `X-Forwarded-Proto` with
 rejects requests without that marker as defense in depth. Do not log the
 Authorization header.
 
+The worker uses bundled public trust roots by default. Deployments using a
+private CA can set `ARC_WORKER_CONTROL_CA_FILE` to a mounted PEM bundle; those
+certificates are added to, not substituted for, public roots. TLS hostname and
+certificate validation remain enabled. An unreadable, empty, or invalid bundle
+prevents worker startup, and replacing the bundle requires a worker restart.
+
 After upgrade, the worker sends a JSON hello such as
 `{"kind":"hello","protocolVersion":1,"workerId":"<worker-uuid>"}` within five
 seconds. The API verifies that the version and identity match the authenticated
@@ -44,6 +50,8 @@ composes the local provider with the authenticated route. When it is absent or
 empty, the worker route is not registered. Compose accepts this setting for the
 API and provides an opt-in worker profile, but requires an independently
 configured trusted WSS ingress; it does not add a TLS proxy or development CA.
+The worker's optional private-CA trust bundle is configured separately and is
+not mounted automatically by Compose.
 
 ## Versioned envelopes
 

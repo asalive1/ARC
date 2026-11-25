@@ -1,5 +1,8 @@
 use std::{
+    fs::File,
+    io::{BufRead, BufReader},
     net::IpAddr,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -15,13 +18,15 @@ use arc_shared::{
     WORKER_PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
+use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_tungstenite::{
-    connect_async_with_config,
+    connect_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig, Message,
     },
+    Connector,
 };
 use uuid::Uuid;
 
@@ -42,6 +47,7 @@ pub enum WorkerCommand {
 #[derive(Clone, Debug)]
 pub struct WorkerControlClientConfig {
     pub endpoint: String,
+    pub ca_certificates_file: Option<PathBuf>,
     pub worker_id: Uuid,
     pub bearer_token: String,
     pub allow_insecure_loopback: bool,
@@ -50,6 +56,7 @@ pub struct WorkerControlClientConfig {
 #[derive(Clone)]
 pub struct WorkerControlClient {
     config: WorkerControlClientConfig,
+    tls_config: Option<Arc<ClientConfig>>,
     generation_store: Arc<dyn AssignmentGenerationStore>,
     media_pipeline: Arc<dyn MediaPipeline>,
     connection_status: watch::Sender<bool>,
@@ -74,9 +81,15 @@ impl WorkerControlClient {
                 "worker identity and bearer credential must be valid",
             ));
         }
+        let tls_config = config
+            .ca_certificates_file
+            .as_deref()
+            .map(custom_tls_config)
+            .transpose()?;
         let (connection_status, _) = watch::channel(false);
         let client = Self {
             config,
+            tls_config,
             generation_store,
             media_pipeline,
             connection_status,
@@ -92,14 +105,19 @@ impl WorkerControlClient {
         let mut websocket_config = WebSocketConfig::default();
         websocket_config.max_message_size = Some(MAX_WORKER_CONTROL_MESSAGE_SIZE);
         websocket_config.max_frame_size = Some(MAX_WORKER_CONTROL_MESSAGE_SIZE);
-        let (mut socket, _) = connect_async_with_config(request, Some(websocket_config), false)
-            .await
-            .map_err(|_| {
-                worker_client_error(
-                    "worker_control_connection_failed",
-                    "worker control connection or handshake failed",
-                )
-            })?;
+        let connector = self
+            .tls_config
+            .as_ref()
+            .map(|config| Connector::Rustls(config.clone()));
+        let (mut socket, _) =
+            connect_async_tls_with_config(request, Some(websocket_config), false, connector)
+                .await
+                .map_err(|_| {
+                    worker_client_error(
+                        "worker_control_connection_failed",
+                        "worker control connection or handshake failed",
+                    )
+                })?;
 
         let hello = WorkerSessionHello {
             kind: WorkerSessionMessageKind::Hello,
@@ -298,6 +316,49 @@ impl WorkerControlClient {
     }
 }
 
+fn custom_tls_config(ca_file: &Path) -> PortResult<Arc<ClientConfig>> {
+    let file = File::open(ca_file).map_err(|error| {
+        worker_client_error(
+            "invalid_worker_control_ca",
+            format!("worker-control CA bundle could not be opened: {error}"),
+        )
+    })?;
+    let roots = custom_ca_roots(BufReader::new(file))?;
+    Ok(Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+fn custom_ca_roots<R: BufRead>(mut reader: R) -> PortResult<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut certificate_count = 0;
+    for certificate in rustls_pemfile::certs(&mut reader) {
+        let certificate = certificate.map_err(|error| {
+            worker_client_error(
+                "invalid_worker_control_ca",
+                format!("worker-control CA PEM bundle could not be parsed: {error}"),
+            )
+        })?;
+        roots.add(certificate).map_err(|error| {
+            worker_client_error(
+                "invalid_worker_control_ca",
+                format!("worker-control CA certificate is invalid: {error}"),
+            )
+        })?;
+        certificate_count += 1;
+    }
+    if certificate_count == 0 {
+        return Err(worker_client_error(
+            "invalid_worker_control_ca",
+            "worker-control CA bundle contains no PEM certificates",
+        ));
+    }
+    Ok(roots)
+}
+
 struct ConnectionStatusGuard(watch::Sender<bool>);
 
 impl Drop for ConnectionStatusGuard {
@@ -373,6 +434,36 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn custom_ca_bundle_adds_roots_without_removing_public_trust() {
+        let bundle = std::io::Cursor::new(include_bytes!(
+            "../tests/fixtures/worker-control-test-ca.pem"
+        ));
+        let roots =
+            custom_ca_roots(BufReader::new(bundle)).expect("valid custom CA bundle is accepted");
+
+        assert_eq!(roots.roots.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
+    }
+
+    #[test]
+    fn custom_ca_file_builds_a_tls_client_config() {
+        let ca_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("worker-control-test-ca.pem");
+
+        custom_tls_config(&ca_file).expect("valid custom CA file builds TLS configuration");
+    }
+
+    #[test]
+    fn custom_ca_bundle_rejects_non_certificate_content() {
+        let bundle = std::io::Cursor::new(&b"not a PEM certificate"[..]);
+        let error =
+            custom_ca_roots(BufReader::new(bundle)).expect_err("invalid CA bundle is rejected");
+
+        assert_eq!(error.code, "invalid_worker_control_ca");
+    }
 
     #[derive(Default)]
     struct TestMediaPipeline {
@@ -668,6 +759,7 @@ mod tests {
         WorkerControlClient::new(
             WorkerControlClientConfig {
                 endpoint,
+                ca_certificates_file: None,
                 worker_id,
                 bearer_token: "local-worker-token".to_owned(),
                 allow_insecure_loopback,
@@ -683,6 +775,7 @@ mod tests {
         let error = WorkerControlClient::new(
             WorkerControlClientConfig {
                 endpoint: "ws://192.0.2.1/api/v1/workers/control".to_owned(),
+                ca_certificates_file: None,
                 worker_id: Uuid::new_v4(),
                 bearer_token: "local-worker-token".to_owned(),
                 allow_insecure_loopback: true,

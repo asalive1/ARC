@@ -44,8 +44,17 @@ pub struct AdapterConfiguration {
 pub struct PipelineSpecification {
     pub pipeline_id: Uuid,
     pub assignment_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<PipelineSourceIdentity>,
     pub requirements: PipelineRequirements,
     pub configuration: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineSourceIdentity {
+    pub source_id: Uuid,
+    pub source_revision: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

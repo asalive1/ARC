@@ -9,9 +9,13 @@ import {
   fetchCapacityRequest,
   fetchLiveness,
   fetchReadiness,
+  fetchRoutes,
   fetchSources,
+  getRouteBatchOperation,
   planRoute,
   planRouteAssignment,
+  setDesiredRoute,
+  setDesiredRoutesBatch,
   startAssignment,
   stopAssignment,
   updateDestination,
@@ -124,6 +128,143 @@ describe("catalog and route API", () => {
 
     await expect(fetchSources("", fetcher)).resolves.toEqual([]);
     expect(fetcher).toHaveBeenCalledWith("/api/v1/sources", undefined);
+  });
+
+  it("reads and validates the current route collection", async () => {
+    const route = {
+      destinationId: "destination-1",
+      sourceId: "source-1",
+      desiredState: "desired",
+      observedState: "running",
+      observedSourceId: "source-1",
+      revision: 3,
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ items: [route] }), { status: 200 }),
+    );
+
+    await expect(fetchRoutes("", fetcher)).resolves.toEqual([route]);
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/routes", undefined);
+  });
+
+  it("rejects malformed route collection entries", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ items: [{ destinationId: "destination-1" }] }), {
+        status: 200,
+      }),
+    );
+
+    await expect(fetchRoutes("", fetcher)).rejects.toThrow(
+      "API returned an invalid route collection",
+    );
+  });
+
+  it("writes desired route state with revision and replacement confirmation", async () => {
+    const input = {
+      sourceId: "source-2",
+      destinationId: "destination-1",
+      expectedRouteRevision: 3,
+      confirmReplace: true,
+    };
+    const route = {
+      destinationId: input.destinationId,
+      sourceId: input.sourceId,
+      desiredState: "desired",
+      observedState: "unknown",
+      observedSourceId: null,
+      revision: 4,
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(route), { status: 200 }),
+    );
+
+    await expect(setDesiredRoute(input, "", fetcher)).resolves.toEqual(route);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/routes",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      },
+    );
+  });
+
+  it("writes an idempotent desired-route batch", async () => {
+    const operation = {
+      operationId: "operation-1",
+      state: "pending",
+      routes: [{
+        destinationId: "destination-1",
+        sourceId: "source-1",
+        desiredState: "desired",
+        observedState: "unknown",
+        observedSourceId: null,
+        revision: 1,
+      }],
+      results: [{
+        sourceId: "source-1",
+        destinationId: "destination-1",
+        pipelineId: "pipeline-1",
+        state: "pending",
+        assignmentId: null,
+        assignmentGeneration: null,
+        errorCode: null,
+        errorMessage: null,
+      }],
+    };
+    const routes = [{
+      sourceId: "source-1",
+      destinationId: "destination-1",
+      expectedRouteRevision: 0,
+      confirmReplace: false,
+    }];
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(operation), { status: 200 }),
+    );
+
+    await expect(
+      setDesiredRoutesBatch(routes, "idempotency-key", "", fetcher),
+    ).resolves.toEqual(operation);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/routes/batch",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": "idempotency-key",
+        },
+        body: JSON.stringify({ routes }),
+      },
+    );
+  });
+
+  it("retrieves a route batch operation with per-route outcomes", async () => {
+    const operation = {
+      operationId: "operation-1",
+      state: "partial",
+      routes: [],
+      results: [{
+        sourceId: "source-1",
+        destinationId: "destination-1",
+        pipelineId: "pipeline-1",
+        state: "failed",
+        assignmentId: null,
+        assignmentGeneration: null,
+        errorCode: "placement_unavailable",
+        errorMessage: "No eligible worker was available",
+      }],
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(operation), { status: 200 }),
+    );
+
+    await expect(
+      getRouteBatchOperation("operation-1", "", fetcher),
+    ).resolves.toEqual(operation);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/operations/routes/operation-1",
+      {},
+    );
   });
 
   it("updates a source by creating a new draft revision", async () => {

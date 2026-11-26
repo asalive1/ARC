@@ -61,9 +61,13 @@ health APIs.
 
 Route replacement, multi-route best-effort batches, and rollback are
 application operations over independent runtime actions, not a fictional
-GStreamer-wide database transaction. Preserve old assignment until replacement
-readiness where product policy permits; disclose hard-cut behavior and
-compensation outcomes.
+GStreamer-wide database transaction. For replacement, persist the previous
+assignment snapshot, prepare the replacement while the previous assignment is
+still running, then stop the previous route and start the replacement. This is
+a hard cut, not a crossfade. A preparation failure leaves the old route active;
+a failed replacement Start triggers durable compensation that plans and starts
+the previous pinned route. Report per-destination progress and clearly surface
+when automatic recovery exhausts its retry budget.
 
 ## POC profiles and sequence
 
@@ -128,6 +132,21 @@ normalized units: one for the source side and one for the destination side.
 ALSA additionally requires Linux and the `alsa` audio backend. No decode,
 conversion, fan-out, signal extraction, delay, or preview work is modeled by
 these paths. Adding those features requires extending the estimator.
+
+Route placement keeps assignments for an already-planned or active source
+revision on its existing worker. Worker pipeline specifications carry an
+optional source identity (source ID and revision). When present, GStreamer
+creates one source graph per identity and connects destination branches through
+a tee. Each branch has a bounded 100-buffer queue that drops its oldest buffers
+when the destination falls behind, and branches can start or stop independently
+without stopping active siblings. Capacity reservations are still charged per
+route. Capacity admission now counts the source-ingestion unit once per
+`(worker, source_id, source_revision)` and retains one destination-branch unit
+per route. Stored reservations keep their full per-route requirements, while
+placement and assignment rechecks apply the shared-source credit consistently.
+An isolated PostgreSQL test covers concurrent placement, additional branch
+capacity, and rejection when the pinned worker is full. Injected branch-failure
+acceptance remains open.
 
 The estimate records 1,536,000 bits/s of outbound audio payload for ALSA
 48 kHz stereo L16 to RTP; it excludes protocol overhead. Other ingress and

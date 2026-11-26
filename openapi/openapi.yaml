@@ -397,7 +397,7 @@ paths:
     post:
       operationId: planRouteAssignment
       summary: Reserve capacity and create a revision-pinned planned assignment
-      description: Without allowWaiting, checks capacity immediately and returns planned or unavailable. With allowWaiting, durably queues the request for at most five minutes in strict FIFO order; older waits block newer immediate admissions too. Waiting does not start media. Worker heartbeats must be no older than 30 seconds. The idempotency key is retained for 24 hours; immediate requests replay their original outcome, while wait requests replay their current status. Reusing the key for a different request or waiting mode returns 409.
+      description: Without allowWaiting, checks capacity immediately and returns planned or unavailable. With allowWaiting, durably queues the request for at most five minutes in strict FIFO order; older waits block newer immediate admissions too. A destination with an existing planned or non-stopped assignment is rejected to prevent overlapping output pipelines. Planning does not start media. Worker heartbeats must be no older than 30 seconds. The idempotency key is retained for 24 hours; immediate requests replay their original outcome, while wait requests replay their current status. Reusing the key for a different request or waiting mode returns 409.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -422,7 +422,7 @@ paths:
         "404":
           $ref: "#/components/responses/ApiError"
         "409":
-          description: A requested endpoint revision is stale or unvalidated, the pipeline already has an assignment, or the Idempotency-Key was reused with a different request body.
+          description: A requested endpoint revision is stale or unvalidated, the pipeline already has an assignment, the destination already has a planned or non-stopped assignment, or the Idempotency-Key was reused with a different request body.
           content:
             application/json:
               schema:
@@ -620,7 +620,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/responses/ApiError"
+                $ref: "#/components/schemas/ApiError"
         "422":
           $ref: "#/components/responses/ApiError"
         "503":
@@ -628,13 +628,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/responses/ApiError"
+                $ref: "#/components/schemas/ApiError"
         "504":
           description: The worker did not acknowledge before timeout. The assignment remains in stopping with its reservation held.
           content:
             application/json:
               schema:
-                $ref: "#/components/responses/ApiError"
+                $ref: "#/components/schemas/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
   /routes:
@@ -654,6 +654,103 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Route"
+    post:
+      operationId: setDesiredRoute
+      summary: Set the desired source for a destination
+      description: Validates the current source/destination profiles and atomically records desired route state. expectedRouteRevision must match the latest route revision, using zero when the destination has no route history. Replacing a different desired source requires confirmReplace. This operation does not start media or change observed state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetDesiredRouteRequest"
+      responses:
+        "200":
+          description: The latest desired route state. A newly saved route has observedState unknown until worker execution reports an observation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Route"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          $ref: "#/components/responses/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /routes/batch:
+    post:
+      operationId: setDesiredRoutesBatch
+      summary: Atomically save and execute a multi-route Take
+      description: >-
+        Validates every source/destination pair and route revision in one
+        transaction. Any validation or revision conflict rolls back the entire
+        desired-state batch. Replacing a different desired source requires
+        confirmReplace. The durable operation then plans and starts each route
+        independently, records per-route outcomes, retries transient worker
+        unavailability, and resumes leased work after API restart. Replays with
+        the same Idempotency-Key and identical routes return the same operation;
+        using the key for a different batch returns 409. Execution is
+        best-effort: a failure for one route does not roll back successful
+        sibling routes. For an explicitly confirmed replacement, the API
+        prepares the new path before stopping the active assignment, then
+        performs a hard cut. Preparation failure leaves the active route
+        running. If the replacement Start fails after Stop, the operation
+        attempts to restore the previous pinned route and reports recovery
+        progress and outcome per destination. Switching is not a seamless
+        crossfade, and recovery can require operator action if its retry budget
+        is exhausted.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetDesiredRoutesBatchRequest"
+      responses:
+        "200":
+          description: The durable operation and current per-route execution outcomes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteBatchOperation"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          $ref: "#/components/responses/ApiError"
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /operations/routes/{operationId}:
+    get:
+      operationId: getRouteBatchOperation
+      summary: Retrieve a durable route Take operation
+      parameters:
+        - name: operationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The durable batch result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteBatchOperation"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
   /routes/validate:
     post:
       operationId: validateRoute
@@ -1294,7 +1391,7 @@ components:
         code:
           type: string
           enum:
-            [invalid_request, not_found, invalid_lifecycle, resource_enabled, database_error, internal_error, stale_route_revision, source_not_validated, destination_not_validated, assignment_conflict, reservation_conflict, invalid_route_revision, invalid_media_profile, invalid_reservation, invalid_pipeline_id]
+            [invalid_request, not_found, invalid_lifecycle, resource_enabled, database_error, internal_error, stale_route_revision, replacement_confirmation_required, source_not_validated, destination_not_validated, assignment_conflict, reservation_conflict, invalid_route_revision, invalid_media_profile, invalid_reservation, invalid_pipeline_id]
         message:
           type: string
     RouteProposal:
@@ -1312,7 +1409,7 @@ components:
           minimum: 0
     Route:
       type: object
-      required: [destinationId, desiredState, observedState, revision]
+      required: [destinationId, sourceId, desiredState, observedState, observedSourceId, revision]
       properties:
         destinationId:
           type: string
@@ -1322,11 +1419,91 @@ components:
           format: uuid
         desiredState:
           type: string
+          description: Controller-desired route state, independent of the worker observation.
         observedState:
           type: string
+          description: Latest route observation; worker assignment Start/Stop changes are recorded only after acknowledgement, or unknown when none exists.
+        observedSourceId:
+          type: [string, "null"]
+          format: uuid
+          description: Source associated with the latest observation; may differ from sourceId while a route change is pending.
         revision:
           type: integer
           minimum: 0
+    SetDesiredRouteRequest:
+      type: object
+      required: [sourceId, destinationId, expectedRouteRevision, confirmReplace]
+      properties:
+        sourceId:
+          type: string
+          format: uuid
+        destinationId:
+          type: string
+          format: uuid
+        expectedRouteRevision:
+          type: integer
+          minimum: 0
+          description: Latest route revision expected by the caller, or zero when no route history exists.
+        confirmReplace:
+          type: boolean
+          description: Must be true to replace a different currently desired source.
+    SetDesiredRoutesBatchRequest:
+      type: object
+      required: [routes]
+      properties:
+        routes:
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Duplicate destinationId values are rejected.
+          items:
+            $ref: "#/components/schemas/SetDesiredRouteRequest"
+    RouteBatchOperation:
+      type: object
+      required: [operationId, state, routes, results]
+      properties:
+        operationId:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [desired_state_applied, pending, running, completed, partial, failed]
+          description: Overall execution state. desired_state_applied is retained for operations created before worker execution was introduced.
+        routes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Route"
+        results:
+          type: array
+          description: Durable independent outcome for each selected destination.
+          items:
+            $ref: "#/components/schemas/RouteBatchItemResult"
+    RouteBatchItemResult:
+      type: object
+      required: [sourceId, destinationId, pipelineId, state, assignmentId, assignmentGeneration, errorCode, errorMessage]
+      properties:
+        sourceId:
+          type: string
+          format: uuid
+        destinationId:
+          type: string
+          format: uuid
+        pipelineId:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [pending, processing, succeeded, failed]
+        assignmentId:
+          type: [string, "null"]
+          format: uuid
+        assignmentGeneration:
+          type: [integer, "null"]
+          minimum: 1
+        errorCode:
+          type: [string, "null"]
+        errorMessage:
+          type: [string, "null"]
     ValidationResult:
       type: object
       required: [valid, errors, warnings]

@@ -141,6 +141,11 @@ after restart/reconnect; do not emit a false transition or replay expired cues.
 - Route replacement is an explicit operation. Prepare/validate, check
   permissions/locks/revisions, apply, observe, then commit the resulting state;
   document that cross-worker/media actions cannot be made database-atomic.
+- For a confirmed replacement, persist the previous assignment, prepare the
+  new path while the previous route remains active, then stop the old path
+  before starting the new one. The switch is a hard cut. If preparation fails,
+  leave the old route active; if the new Start fails after Stop, durably retry
+  restoration of the previous pinned route and expose the recovery result.
 - Support immediate and take workflows, atomic and best-effort batches,
   presets/salvos, undo/rollback, locks/permissions, a virtualized 64x64 matrix,
   and real-time multi-user synchronization as phased routing capabilities.

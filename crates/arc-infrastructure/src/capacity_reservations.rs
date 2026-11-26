@@ -11,6 +11,9 @@ use crate::{
     worker_registry::{error_with, WorkerRow},
 };
 
+// Phase 1 estimates one source unit and one destination-branch unit per route.
+const SHARED_SOURCE_CAPACITY_UNITS: u32 = 1;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityReservation {
     pub id: Uuid,
@@ -57,14 +60,7 @@ pub(crate) async fn select_with_reservations(
     requirements: &PipelineRequirements,
     max_heartbeat_age: Duration,
 ) -> PortResult<PlacementDecision> {
-    let totals: Vec<(Uuid, i64)> = sqlx::query_as(
-        "SELECT worker_id, SUM(capacity_units)::bigint FROM worker_capacity_reservations \
-         WHERE state = 'reserved' GROUP BY worker_id",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|error| error_with("database_error", error))?;
-    let totals: HashMap<_, _> = totals.into_iter().collect();
+    let totals = reservation_capacity_totals(connection, None, None).await?;
     let mut workers = Vec::with_capacity(rows.len());
     for row in rows {
         let mut worker = row.into_worker()?;
@@ -89,6 +85,61 @@ pub(crate) async fn select_with_reservations(
         .map_err(|error| error_with("database_error", error))?;
     select_worker(&workers, requirements, now, max_heartbeat_age)
         .map_err(|error| error_with("invalid_placement", format!("{error:?}")))
+}
+
+pub(crate) async fn reservation_capacity_totals(
+    connection: &mut PgConnection,
+    worker_filter: Option<Uuid>,
+    pending_route: Option<(Uuid, Uuid, i64)>,
+) -> PortResult<HashMap<Uuid, i64>> {
+    let (reservation_id, source_id, source_revision) = pending_route
+        .map(|(reservation_id, source_id, revision)| {
+            (Some(reservation_id), Some(source_id), Some(revision))
+        })
+        .unwrap_or((None, None, None));
+    let totals: Vec<(Uuid, i64)> = sqlx::query_as(
+        "WITH active_reservations AS ( \
+             SELECT reservations.worker_id, reservations.capacity_units, \
+                    COALESCE(assignments.source_id, \
+                        CASE WHEN reservations.id = $3 THEN $4::uuid END) AS source_id, \
+                    COALESCE(assignments.source_revision, \
+                        CASE WHEN reservations.id = $3 THEN $5::bigint END) AS source_revision \
+             FROM worker_capacity_reservations AS reservations \
+             LEFT JOIN pipeline_assignments AS assignments \
+               ON assignments.reservation_id = reservations.id \
+             WHERE reservations.state = 'reserved' \
+               AND ($2::uuid IS NULL OR reservations.worker_id = $2) \
+         ), reservation_totals AS ( \
+             SELECT worker_id, SUM(capacity_units)::bigint AS capacity_units \
+             FROM active_reservations GROUP BY worker_id \
+         ), shared_source_credits AS ( \
+             SELECT worker_id, \
+                    SUM((route_count - 1) * $1)::bigint AS capacity_units \
+             FROM ( \
+                 SELECT worker_id, source_id, source_revision, \
+                        COUNT(*)::bigint AS route_count \
+                 FROM active_reservations \
+                 WHERE source_id IS NOT NULL AND source_revision IS NOT NULL \
+                 GROUP BY worker_id, source_id, source_revision \
+                 HAVING COUNT(*) > 1 \
+             ) AS source_groups \
+             GROUP BY worker_id \
+         ) \
+         SELECT reservation_totals.worker_id, \
+                reservation_totals.capacity_units \
+                  - COALESCE(shared_source_credits.capacity_units, 0) \
+         FROM reservation_totals \
+         LEFT JOIN shared_source_credits USING (worker_id)",
+    )
+    .bind(i64::from(SHARED_SOURCE_CAPACITY_UNITS))
+    .bind(worker_filter)
+    .bind(reservation_id)
+    .bind(source_id)
+    .bind(source_revision)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|error| error_with("database_error", error))?;
+    Ok(totals.into_iter().collect())
 }
 
 impl PgCapacityReservations {
@@ -123,6 +174,7 @@ impl PgCapacityReservations {
             pipeline_id,
             requirements,
             max_heartbeat_age,
+            None,
         )
         .await?;
         transaction
@@ -229,15 +281,44 @@ pub(crate) async fn reserve_in_transaction(
     pipeline_id: Uuid,
     requirements: &PipelineRequirements,
     max_heartbeat_age: Duration,
+    source_identity: Option<(Uuid, i64)>,
 ) -> PortResult<ReservationDecision> {
     validate_reservation(pipeline_id, requirements, max_heartbeat_age)?;
-    let rows = sqlx::query_as::<_, WorkerRow>(
-        "SELECT id, stable_name, platform, architecture, version, state, \
-             capabilities, capacity, last_heartbeat FROM workers ORDER BY id FOR UPDATE",
-    )
-    .fetch_all(&mut **transaction)
-    .await
+    if source_identity.is_some() {
+        sqlx::query("SELECT id FROM workers ORDER BY id FOR UPDATE")
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+    }
+    let required_worker_id = match source_identity {
+        Some((source_id, source_revision)) => {
+            source_worker_affinity(transaction, source_id, source_revision).await?
+        }
+        None => None,
+    };
+    let rows = if let Some(worker_id) = required_worker_id {
+        sqlx::query_as::<_, WorkerRow>(
+            "SELECT id, stable_name, platform, architecture, version, state, \
+                 capabilities, capacity, last_heartbeat FROM workers WHERE id = $1 FOR UPDATE",
+        )
+        .bind(worker_id)
+        .fetch_all(&mut **transaction)
+        .await
+    } else {
+        sqlx::query_as::<_, WorkerRow>(
+            "SELECT id, stable_name, platform, architecture, version, state, \
+                 capabilities, capacity, last_heartbeat FROM workers ORDER BY id FOR UPDATE",
+        )
+        .fetch_all(&mut **transaction)
+        .await
+    }
     .map_err(|error| error_with("database_error", error))?;
+    if required_worker_id.is_some() && rows.is_empty() {
+        return Err(error_with(
+            "source_worker_unavailable",
+            "the worker hosting this source revision is no longer registered",
+        ));
+    }
     let already_reserved: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM worker_capacity_reservations \
              WHERE pipeline_id = $1 AND state = 'reserved')",
@@ -253,8 +334,40 @@ pub(crate) async fn reserve_in_transaction(
         });
     }
 
-    let decision =
-        select_with_reservations(&mut **transaction, rows, requirements, max_heartbeat_age).await?;
+    let has_reserved_source = if let Some((source_id, source_revision)) = source_identity {
+        sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM pipeline_assignments AS assignments \
+                 JOIN worker_capacity_reservations AS reservations \
+                   ON reservations.id = assignments.reservation_id \
+                 WHERE assignments.resource_type = 'pipeline' \
+                   AND assignments.source_id = $1 \
+                   AND assignments.source_revision = $2 \
+                   AND reservations.state = 'reserved' \
+             )",
+        )
+        .bind(source_id)
+        .bind(source_revision)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| error_with("database_error", error))?
+    } else {
+        false
+    };
+    let mut placement_requirements = requirements.clone();
+    if has_reserved_source {
+        placement_requirements.capacity_units = placement_requirements
+            .capacity_units
+            .saturating_sub(SHARED_SOURCE_CAPACITY_UNITS);
+    }
+
+    let decision = select_with_reservations(
+        &mut **transaction,
+        rows,
+        &placement_requirements,
+        max_heartbeat_age,
+    )
+    .await?;
     let worker_id = match decision {
         PlacementDecision::Selected { worker_id } => worker_id,
         PlacementDecision::Unavailable { rejections } => {
@@ -280,6 +393,35 @@ pub(crate) async fn reserve_in_transaction(
     .await
     .map_err(|error| error_with("database_error", error))?;
     Ok(ReservationDecision::Reserved(reservation))
+}
+
+async fn source_worker_affinity(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_id: Uuid,
+    source_revision: i64,
+) -> PortResult<Option<Uuid>> {
+    let worker_ids: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT DISTINCT worker_id FROM pipeline_assignments \
+         WHERE resource_type = 'pipeline' AND source_id = $1 AND source_revision = $2 \
+           AND ((desired_state = 'planned' AND observed_state <> 'cancelled') \
+             OR desired_state = 'running' \
+             OR (desired_state = 'stopped' AND observed_state = 'stopping')) \
+         ORDER BY worker_id",
+    )
+    .bind(source_id)
+    .bind(source_revision)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| error_with("database_error", error))?;
+
+    match worker_ids.as_slice() {
+        [] => Ok(None),
+        [Some(worker_id)] => Ok(Some(*worker_id)),
+        _ => Err(error_with(
+            "source_worker_affinity_conflict",
+            "active routes for this source revision do not have one registered worker placement",
+        )),
+    }
 }
 
 #[cfg(test)]

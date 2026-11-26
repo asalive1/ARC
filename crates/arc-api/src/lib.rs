@@ -1,4 +1,4 @@
-use arc_application::{PipelineSpecification, PortError, WorkerAuthenticator};
+use arc_application::{PipelineSpecification, PortError, PortResult, WorkerAuthenticator};
 use arc_domain::{
     estimate_pipeline_requirements, validate_destination_profile, validate_source_profile,
     DestinationMediaProfile, MediaProfileError, SourceMediaProfile,
@@ -11,6 +11,10 @@ use arc_infrastructure::{
     capacity_wait::{CapacityWaitRequest, PgCapacityWait, QueueProgress},
     pipeline_planning::{PgPipelinePlanner, PipelinePlanningDecision, RouteRevision},
     postgres::PgPool,
+    routes::{
+        DesiredRouteChange, PgRoutes, RouteBatchItemCompletion, RouteBatchOperation,
+        RouteBatchWorkItem, RouteRecord, RouteWriteError,
+    },
 };
 use arc_shared::{WorkerCommandEnvelope, WORKER_PROTOCOL_VERSION};
 use arc_worker::{CommandDispatchResult, WorkerCommand};
@@ -29,13 +33,14 @@ use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
-mod worker_control_runtime;
 mod admin_auth;
+mod worker_control_runtime;
 pub use admin_auth::AdminAuth;
 pub use worker_control_runtime::WorkerCommandDispatcher;
 use worker_control_runtime::MAX_WORKER_CONTROL_MESSAGE_SIZE;
 
 const MAX_PLANNING_HEARTBEAT_AGE_SECONDS: i64 = 30;
+const MAX_ROUTE_BATCH_ATTEMPTS: i32 = 60;
 const WORKER_CONTROL_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_CONTROL_ROUTE: &str = "/api/v1/workers/control";
 
@@ -67,12 +72,24 @@ fn database_routes() -> Router {
             "/api/v1/destinations/{destination_id}",
             put(update_destination),
         )
+        .route("/api/v1/routes", get(list_routes).post(set_desired_route))
+        .route("/api/v1/routes/batch", post(set_desired_routes_batch))
+        .route(
+            "/api/v1/operations/routes/{operation_id}",
+            get(get_route_batch_operation),
+        )
         .route(
             "/api/v1/routes/plan-assignment",
             post(plan_route_assignment),
         )
-        .route("/api/v1/capacity-requests/{request_id}", get(get_capacity_request))
-        .route("/api/v1/capacity-requests/{request_id}/cancel", post(cancel_capacity_request))
+        .route(
+            "/api/v1/capacity-requests/{request_id}",
+            get(get_capacity_request),
+        )
+        .route(
+            "/api/v1/capacity-requests/{request_id}/cancel",
+            post(cancel_capacity_request),
+        )
         .route(
             "/api/v1/pipelines/{pipeline_id}/assignment",
             get(get_pipeline_assignment),
@@ -87,15 +104,9 @@ pub fn router_with_database(pool: PgPool) -> Router {
     with_capacity_processor(database_routes().layer(Extension(pool.clone())), pool)
 }
 
-pub fn router_with_database_and_admin_auth(
-    pool: PgPool,
-    admin_auth: AdminAuth,
-) -> Router {
+pub fn router_with_database_and_admin_auth(pool: PgPool, admin_auth: AdminAuth) -> Router {
     let protected = database_routes()
-        .route(
-            "/api/v1/auth/password",
-            put(admin_auth::change_password),
-        )
+        .route("/api/v1/auth/password", put(admin_auth::change_password))
         .layer(Extension(pool.clone()))
         .layer(Extension(admin_auth.clone()));
     with_capacity_processor(
@@ -147,8 +158,9 @@ pub fn router_with_database_and_worker_dispatcher(
             Some(dispatcher.clone()),
         ))
         .layer(Extension(pool.clone()))
-        .layer(Extension(dispatcher));
-    with_capacity_processor(routes, pool)
+        .layer(Extension(dispatcher.clone()));
+    let routes = with_capacity_processor(routes, pool.clone());
+    with_route_batch_processor(routes, pool, dispatcher)
 }
 
 pub fn router_with_database_worker_dispatcher_and_admin_auth(
@@ -166,10 +178,7 @@ pub fn router_with_database_worker_dispatcher_and_admin_auth(
             "/api/v1/assignments/{assignment_id}/stop",
             post(stop_assignment),
         )
-        .route(
-            "/api/v1/auth/password",
-            put(admin_auth::change_password),
-        )
+        .route("/api/v1/auth/password", put(admin_auth::change_password))
         .layer(Extension(pool.clone()))
         .layer(Extension(dispatcher.clone()))
         .layer(Extension(admin_auth.clone()));
@@ -177,9 +186,10 @@ pub fn router_with_database_worker_dispatcher_and_admin_auth(
         .merge(admin_auth::public_routes(admin_auth))
         .merge(worker_control_router(
             authenticator,
-            Some(dispatcher),
+            Some(dispatcher.clone()),
         ));
-    with_capacity_processor(routes, pool)
+    let routes = with_capacity_processor(routes, pool.clone());
+    with_route_batch_processor(routes, pool, dispatcher)
 }
 
 struct CapacityProcessor(tokio::task::JoinHandle<()>);
@@ -198,12 +208,19 @@ fn with_capacity_processor(router: Router, pool: PgPool) -> Router {
             if listener.is_none() {
                 match tokio::time::timeout(Duration::from_secs(1), queue.listen()).await {
                     Ok(Ok(connection)) => listener = Some(connection),
-                    Ok(Err(error)) => tracing::warn!(code = error.code, "capacity listener unavailable"),
+                    Ok(Err(error)) => {
+                        tracing::warn!(code = error.code, "capacity listener unavailable")
+                    }
                     Err(_) => tracing::warn!("capacity listener timed out"),
                 }
             }
             let failed = loop {
-                match queue.process_one(chrono::Duration::seconds(MAX_PLANNING_HEARTBEAT_AGE_SECONDS)).await {
+                match queue
+                    .process_one(chrono::Duration::seconds(
+                        MAX_PLANNING_HEARTBEAT_AGE_SECONDS,
+                    ))
+                    .await
+                {
                     Ok(QueueProgress::Advanced) => tokio::task::yield_now().await,
                     Ok(QueueProgress::Blocked | QueueProgress::Empty) => break false,
                     Err(error) => {
@@ -230,6 +247,1026 @@ fn with_capacity_processor(router: Router, pool: PgPool) -> Router {
         }
     });
     router.layer(Extension(Arc::new(CapacityProcessor(task))))
+}
+
+struct RouteBatchProcessor(tokio::task::JoinHandle<()>);
+
+impl Drop for RouteBatchProcessor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn with_route_batch_processor(
+    router: Router,
+    pool: PgPool,
+    dispatcher: Arc<WorkerCommandDispatcher>,
+) -> Router {
+    let task = tokio::spawn(async move {
+        let routes = PgRoutes::new(pool.clone());
+        loop {
+            match process_next_route_batch_item(&routes, &pool, &dispatcher).await {
+                Ok(true) => tokio::task::yield_now().await,
+                Ok(false) => tokio::time::sleep(Duration::from_secs(1)).await,
+                Err(error) => {
+                    tracing::warn!(code = error.code, %error.message, "route batch processing failed");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    });
+    router.layer(Extension(Arc::new(RouteBatchProcessor(task))))
+}
+
+async fn process_next_route_batch_item(
+    routes: &PgRoutes,
+    pool: &PgPool,
+    dispatcher: &Arc<WorkerCommandDispatcher>,
+) -> PortResult<bool> {
+    let item = routes
+        .claim_next_batch_item()
+        .await
+        .map_err(route_batch_storage_error)?;
+    let Some(item) = item else {
+        return Ok(false);
+    };
+
+    match routes.is_batch_item_current(&item).await {
+        Ok(true) => {}
+        Ok(false) => {
+            routes
+                .finish_batch_item(
+                    &item,
+                    RouteBatchItemCompletion::Failed {
+                        assignment: None,
+                        error_code: "route_changed",
+                        error_message: "The desired route changed after this Take was saved.",
+                    },
+                )
+                .await
+                .map_err(route_batch_storage_error)?;
+            return Ok(true);
+        }
+        Err(error) => {
+            tracing::warn!(error = ?error, "could not verify the desired route before execution");
+            routes
+                .finish_batch_item(
+                    &item,
+                    RouteBatchItemCompletion::Retry {
+                        assignment: None,
+                        error_code: "route_batch_storage_error",
+                        error_message: "The operation could not verify route state and will retry.",
+                        delay_seconds: 5,
+                    },
+                )
+                .await
+                .map_err(route_batch_storage_error)?;
+            return Ok(true);
+        }
+    }
+
+    let assignments = PgAssignments::new(pool.clone());
+    let assignment = match assignments.get_by_pipeline(item.pipeline_id).await {
+        Ok(Some(snapshot)) => snapshot.assignment,
+        Ok(None) => {
+            let planner = PgPipelinePlanner::new(pool.clone());
+            let route = RouteRevision {
+                source_id: item.source_id,
+                source_revision: item.source_revision,
+                destination_id: item.destination_id,
+                destination_revision: item.destination_revision,
+            };
+            let max_heartbeat_age = chrono::Duration::seconds(MAX_PLANNING_HEARTBEAT_AGE_SECONDS);
+            let decision = match item.replacement_assignment_id {
+                Some(replacement_assignment_id) => {
+                    planner
+                        .plan_replacement_with_idempotency_key(
+                            item.planning_key,
+                            item.pipeline_id,
+                            route,
+                            max_heartbeat_age,
+                            replacement_assignment_id,
+                        )
+                        .await
+                }
+                None => {
+                    planner
+                        .plan_with_idempotency_key(
+                            item.planning_key,
+                            item.pipeline_id,
+                            route,
+                            max_heartbeat_age,
+                        )
+                        .await
+                }
+            };
+            match decision {
+                Ok(PipelinePlanningDecision::Planned(planned)) => planned.assignment,
+                Ok(PipelinePlanningDecision::Unavailable { rejections, .. }) => {
+                    let message = format!("No eligible worker was available: {rejections:?}");
+                    routes
+                        .finish_batch_item(
+                            &item,
+                            RouteBatchItemCompletion::Failed {
+                                assignment: None,
+                                error_code: "placement_unavailable",
+                                error_message: &message,
+                            },
+                        )
+                        .await
+                        .map_err(route_batch_storage_error)?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    tracing::warn!(code = error.code, %error.message, "route batch planning failed");
+                    finish_route_batch_error(routes, &item, None, error.code, &error.message)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(code = error.code, %error.message, "route batch assignment lookup failed");
+            finish_route_batch_error(routes, &item, None, error.code, &error.message).await?;
+            return Ok(true);
+        }
+    };
+
+    if item.replacement_assignment_id.is_some() {
+        process_replacement_batch_item(routes, pool, dispatcher, &item, assignment).await?;
+        return Ok(true);
+    }
+
+    match start_assignment_for(
+        pool.clone(),
+        Arc::clone(dispatcher),
+        assignment.id,
+        assignment.generation,
+    )
+    .await
+    {
+        Ok(snapshot) => routes
+            .finish_batch_item(
+                &item,
+                RouteBatchItemCompletion::Succeeded {
+                    assignment_id: snapshot.assignment.id,
+                    generation: snapshot.assignment.generation,
+                },
+            )
+            .await
+            .map_err(route_batch_storage_error)?,
+        Err(error) => {
+            tracing::warn!(code = error.code, message = %error.message, "route batch worker start failed");
+            finish_route_batch_error(
+                routes,
+                &item,
+                Some((assignment.id, assignment.generation)),
+                error.code,
+                &error.message,
+            )
+            .await?;
+        }
+    }
+    Ok(true)
+}
+
+async fn process_replacement_batch_item(
+    routes: &PgRoutes,
+    pool: &PgPool,
+    dispatcher: &Arc<WorkerCommandDispatcher>,
+    item: &RouteBatchWorkItem,
+    target: PlannedAssignment,
+) -> PortResult<()> {
+    let assignments = PgAssignments::new(pool.clone());
+    let replacement_id = item
+        .replacement_assignment_id
+        .expect("replacement item has a previous assignment");
+    let previous = match assignments.get_by_id(replacement_id).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return finish_replacement_failure(
+                routes,
+                item,
+                &target,
+                None,
+                "replacement_assignment_missing",
+                "The previous assignment no longer exists; no replacement was started.",
+            )
+            .await;
+        }
+        Err(error) => {
+            return finish_route_batch_error(
+                routes,
+                item,
+                Some((target.id, target.generation)),
+                error.code,
+                &error.message,
+            )
+            .await;
+        }
+    };
+    if previous
+        .assignment
+        .route
+        .as_ref()
+        .is_none_or(|route| route.destination_id != item.destination_id)
+    {
+        return finish_replacement_failure(
+            routes,
+            item,
+            &target,
+            Some(&previous.assignment),
+            "replacement_assignment_conflict",
+            "The previous assignment does not match this destination; no replacement was started.",
+        )
+        .await;
+    }
+
+    let target_snapshot = match assignments.get_by_id(target.id).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return finish_replacement_failure(
+                routes,
+                item,
+                &target,
+                Some(&previous.assignment),
+                "replacement_assignment_missing",
+                "The planned replacement assignment no longer exists.",
+            )
+            .await;
+        }
+        Err(error) => {
+            return finish_route_batch_error(
+                routes,
+                item,
+                Some((target.id, target.generation)),
+                error.code,
+                &error.message,
+            )
+            .await;
+        }
+    };
+
+    if item.error_code.as_deref() == Some("replacement_rollback_pending")
+        || target_snapshot.desired_state == "cancelled"
+    {
+        return restore_previous_route(routes, pool, dispatcher, item, &target, previous).await;
+    }
+    if item.error_code.as_deref() == Some("replacement_cleanup_pending") {
+        let cleanup = cleanup_replacement_target(
+            pool.clone(),
+            Arc::clone(dispatcher),
+            target.id,
+            target.generation,
+        )
+        .await;
+        if let Err(error) = cleanup {
+            return finish_route_batch_retry(
+                routes,
+                item,
+                Some((target.id, target.generation)),
+                "replacement_cleanup_pending",
+                &format!("Replacement cleanup is still pending: {}", error.message),
+                5,
+            )
+            .await;
+        }
+        let refreshed_previous = assignments
+            .get_by_id(replacement_id)
+            .await
+            .map_err(|error| PortError {
+                code: error.code,
+                message: error.message,
+            })?
+            .ok_or_else(|| PortError {
+                code: "replacement_assignment_missing",
+                message: "the previous assignment disappeared during cleanup".to_owned(),
+            })?;
+        if assignment_is_stopped(&refreshed_previous) {
+            return defer_replacement_rollback(
+                routes,
+                item,
+                &target,
+                "replacement_cleanup_failed",
+                item.error_message
+                    .as_deref()
+                    .unwrap_or("Replacement failed and the previous route must be restored."),
+            )
+            .await;
+        }
+        let previous = if refreshed_previous.desired_state == "stopped"
+            && refreshed_previous.observed_state == "stopping"
+        {
+            assignments
+                .reset_failed_stop(replacement_id, previous.assignment.generation)
+                .await
+                .map_err(|error| PortError {
+                    code: error.code,
+                    message: error.message,
+                })?
+        } else {
+            refreshed_previous
+        };
+        return finish_replacement_failure(
+            routes,
+            item,
+            &target,
+            Some(&previous.assignment),
+            "replacement_prepare_failed",
+            item.error_message.as_deref().unwrap_or(
+                "Replacement failed before the previous route was stopped; the previous route remains active.",
+            ),
+        )
+        .await;
+    }
+
+    if !matches!(
+        (
+            target_snapshot.desired_state.as_str(),
+            target_snapshot.observed_state.as_str()
+        ),
+        ("running", "running")
+    ) {
+        if let Err(error) = prepare_assignment_for(Arc::clone(dispatcher), &target).await {
+            tracing::warn!(code = error.code, message = %error.message, "route replacement preparation failed");
+            let latest_previous = assignments
+                .get_by_id(replacement_id)
+                .await
+                .map_err(|storage| PortError {
+                    code: storage.code,
+                    message: storage.message,
+                })?
+                .ok_or_else(|| PortError {
+                    code: "replacement_assignment_missing",
+                    message: "the previous assignment disappeared during preparation".to_owned(),
+                })?;
+            if assignment_is_stopped(&latest_previous)
+                || latest_previous.observed_state == "stopping"
+            {
+                let cleanup = cleanup_replacement_target(
+                    pool.clone(),
+                    Arc::clone(dispatcher),
+                    target.id,
+                    target.generation,
+                )
+                .await;
+                let message = format!(
+                    "Replacement preparation failed ({}: {}); restoring the previous route.",
+                    error.code, error.message
+                );
+                if let Err(cleanup_error) = cleanup {
+                    return finish_route_batch_retry(
+                        routes,
+                        item,
+                        Some((target.id, target.generation)),
+                        "replacement_rollback_pending",
+                        &format!("{message} Cleanup is pending: {}", cleanup_error.message),
+                        1,
+                    )
+                    .await;
+                }
+                return defer_replacement_rollback(routes, item, &target, error.code, &message)
+                    .await;
+            }
+            if is_retryable_route_error(error.code) && item.attempts < MAX_ROUTE_BATCH_ATTEMPTS {
+                return finish_route_batch_error(
+                    routes,
+                    item,
+                    Some((target.id, target.generation)),
+                    error.code,
+                    &error.message,
+                )
+                .await;
+            }
+            if latest_previous.desired_state == "stopped"
+                && latest_previous.observed_state == "stopping"
+            {
+                assignments
+                    .reset_failed_stop(replacement_id, latest_previous.assignment.generation)
+                    .await
+                    .map_err(|reset| PortError {
+                        code: reset.code,
+                        message: reset.message,
+                    })?;
+            }
+            if let Err(cleanup_error) = cleanup_replacement_target(
+                pool.clone(),
+                Arc::clone(dispatcher),
+                target.id,
+                target.generation,
+            )
+            .await
+            {
+                return finish_route_batch_retry(
+                    routes,
+                    item,
+                    Some((target.id, target.generation)),
+                    "replacement_cleanup_pending",
+                    &format!(
+                        "Replacement preparation failed ({}: {}). Cleanup is pending: {}",
+                        error.code, error.message, cleanup_error.message
+                    ),
+                    5,
+                )
+                .await;
+            }
+            return finish_replacement_failure(
+                routes,
+                item,
+                &target,
+                Some(&latest_previous.assignment),
+                "replacement_prepare_failed",
+                &format!(
+                    "Replacement preparation failed ({}: {}); the previous route was not stopped.",
+                    error.code, error.message
+                ),
+            )
+            .await;
+        }
+    }
+
+    let previous = previous;
+    if !assignment_is_stopped(&previous) {
+        match stop_assignment_for(
+            pool.clone(),
+            Arc::clone(dispatcher),
+            replacement_id,
+            previous.assignment.generation,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(code = error.code, message = %error.message, "route replacement could not stop the previous assignment");
+                let latest_previous = assignments
+                    .get_by_id(replacement_id)
+                    .await
+                    .map_err(|storage| PortError {
+                        code: storage.code,
+                        message: storage.message,
+                    })?
+                    .ok_or_else(|| PortError {
+                        code: "replacement_assignment_missing",
+                        message: "the previous assignment disappeared while stopping".to_owned(),
+                    })?;
+                if is_retryable_route_error(error.code) && item.attempts < MAX_ROUTE_BATCH_ATTEMPTS
+                {
+                    return finish_route_batch_error(
+                        routes,
+                        item,
+                        Some((target.id, target.generation)),
+                        error.code,
+                        &error.message,
+                    )
+                    .await;
+                }
+                if latest_previous.desired_state == "stopped"
+                    && latest_previous.observed_state == "stopping"
+                {
+                    assignments
+                        .reset_failed_stop(replacement_id, previous.assignment.generation)
+                        .await
+                        .map_err(|reset| PortError {
+                            code: reset.code,
+                            message: reset.message,
+                        })?;
+                }
+                if let Err(cleanup_error) = cleanup_replacement_target(
+                    pool.clone(),
+                    Arc::clone(dispatcher),
+                    target.id,
+                    target.generation,
+                )
+                .await
+                {
+                    return finish_route_batch_retry(
+                        routes,
+                        item,
+                        Some((target.id, target.generation)),
+                        "replacement_cleanup_pending",
+                        &format!(
+                            "The previous route could not be stopped ({}: {}). Cleanup is pending: {}",
+                            error.code, error.message, cleanup_error.message
+                        ),
+                        5,
+                    )
+                    .await;
+                }
+                return finish_replacement_failure(
+                    routes,
+                    item,
+                    &target,
+                    Some(&latest_previous.assignment),
+                    "replacement_stop_failed",
+                    &format!(
+                        "The previous route could not be stopped ({}: {}); the replacement was not started.",
+                        error.code, error.message
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    match start_assignment_for(
+        pool.clone(),
+        Arc::clone(dispatcher),
+        target.id,
+        target.generation,
+    )
+    .await
+    {
+        Ok(snapshot) => routes
+            .finish_batch_item(
+                item,
+                RouteBatchItemCompletion::Succeeded {
+                    assignment_id: snapshot.assignment.id,
+                    generation: snapshot.assignment.generation,
+                },
+            )
+            .await
+            .map_err(route_batch_storage_error),
+        Err(error) => {
+            tracing::warn!(code = error.code, message = %error.message, "replacement Start failed after the previous route was stopped");
+            if is_retryable_route_error(error.code) && item.attempts < MAX_ROUTE_BATCH_ATTEMPTS {
+                return finish_route_batch_error(
+                    routes,
+                    item,
+                    Some((target.id, target.generation)),
+                    error.code,
+                    &error.message,
+                )
+                .await;
+            }
+            if let Err(cleanup_error) = cleanup_replacement_target(
+                pool.clone(),
+                Arc::clone(dispatcher),
+                target.id,
+                target.generation,
+            )
+            .await
+            {
+                let message = format!(
+                    "Replacement Start failed ({}: {}); restoring the previous route. Cleanup is pending: {}",
+                    error.code, error.message, cleanup_error.message
+                );
+                return finish_route_batch_retry(
+                    routes,
+                    item,
+                    Some((target.id, target.generation)),
+                    "replacement_rollback_pending",
+                    &message,
+                    1,
+                )
+                .await;
+            }
+            defer_replacement_rollback(
+                routes,
+                item,
+                &target,
+                error.code,
+                &format!(
+                    "Replacement Start failed ({}: {}); restoring the previous route.",
+                    error.code, error.message
+                ),
+            )
+            .await
+        }
+    }
+}
+
+async fn restore_previous_route(
+    routes: &PgRoutes,
+    pool: &PgPool,
+    dispatcher: &Arc<WorkerCommandDispatcher>,
+    item: &RouteBatchWorkItem,
+    target: &PlannedAssignment,
+    mut previous: AssignmentSnapshot,
+) -> PortResult<()> {
+    if let Err(error) = cleanup_replacement_target(
+        pool.clone(),
+        Arc::clone(dispatcher),
+        target.id,
+        target.generation,
+    )
+    .await
+    {
+        return retry_or_fail_replacement_rollback(
+            routes,
+            item,
+            target,
+            &format!(
+                "{} Cleanup is still pending: {}",
+                item.error_message
+                    .as_deref()
+                    .unwrap_or("Replacement failed; restoring the previous route."),
+                error.message
+            ),
+        )
+        .await;
+    }
+
+    let assignments = PgAssignments::new(pool.clone());
+    previous = assignments
+        .get_by_id(previous.assignment.id)
+        .await
+        .map_err(|error| PortError {
+            code: error.code,
+            message: error.message,
+        })?
+        .ok_or_else(|| PortError {
+            code: "replacement_assignment_missing",
+            message: "the previous assignment disappeared during recovery".to_owned(),
+        })?;
+    if previous.desired_state == "running"
+        && matches!(
+            previous.observed_state.as_str(),
+            "starting" | "running" | "failed" | "degraded"
+        )
+    {
+        return finish_replacement_failure(
+            routes,
+            item,
+            target,
+            Some(&previous.assignment),
+            "replacement_failed_previous_preserved",
+            "Replacement failed; the previous route remains assigned and was not stopped.",
+        )
+        .await;
+    }
+    if !assignment_is_stopped(&previous) {
+        match stop_assignment_for(
+            pool.clone(),
+            Arc::clone(dispatcher),
+            previous.assignment.id,
+            previous.assignment.generation,
+        )
+        .await
+        {
+            Ok(snapshot) => previous = snapshot,
+            Err(error) => {
+                return retry_or_fail_replacement_rollback(
+                    routes,
+                    item,
+                    target,
+                    &format!(
+                        "{} Previous route is waiting for Stop: {}",
+                        item.error_message
+                            .as_deref()
+                            .unwrap_or("Replacement failed; restoring the previous route."),
+                        error.message
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+    let Some(route_config) = previous.assignment.route.clone() else {
+        return finish_replacement_failure(
+            routes,
+            item,
+            target,
+            Some(&previous.assignment),
+            "replacement_rollback_failed",
+            "The previous assignment has no pinned route snapshot; manual recovery is required.",
+        )
+        .await;
+    };
+
+    let rollback_pipeline_id = Uuid::new_v5(
+        &item.operation_id,
+        format!("route-batch-restore:{}", item.destination_id).as_bytes(),
+    );
+    let rollback_assignment = match assignments.get_by_pipeline(rollback_pipeline_id).await {
+        Ok(Some(snapshot))
+            if snapshot.desired_state != "cancelled" && snapshot.desired_state != "stopped" =>
+        {
+            snapshot.assignment
+        }
+        Ok(Some(_)) | Ok(None) => {
+            let planner = PgPipelinePlanner::new(pool.clone());
+            match planner
+                .plan_pinned_route(
+                    rollback_pipeline_id,
+                    route_config,
+                    previous.assignment.requirements.clone(),
+                    chrono::Duration::seconds(MAX_PLANNING_HEARTBEAT_AGE_SECONDS),
+                )
+                .await
+            {
+                Ok(PipelinePlanningDecision::Planned(planned)) => planned.assignment,
+                Ok(PipelinePlanningDecision::Unavailable { rejections, .. }) => {
+                    return retry_or_fail_replacement_rollback(
+                        routes,
+                        item,
+                        target,
+                        &format!(
+                            "{} No worker can restore the previous route yet: {rejections:?}",
+                            item.error_message
+                                .as_deref()
+                                .unwrap_or("Replacement failed; restoring the previous route.")
+                        ),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return retry_or_fail_replacement_rollback(
+                        routes,
+                        item,
+                        target,
+                        &format!(
+                            "{} Recovery planning failed: {}",
+                            item.error_message
+                                .as_deref()
+                                .unwrap_or("Replacement failed; restoring the previous route."),
+                            error.message
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(error) => {
+            return retry_or_fail_replacement_rollback(
+                routes,
+                item,
+                target,
+                &format!(
+                    "{} Recovery lookup failed: {}",
+                    item.error_message
+                        .as_deref()
+                        .unwrap_or("Replacement failed; restoring the previous route."),
+                    error.message
+                ),
+            )
+            .await;
+        }
+    };
+
+    match start_assignment_for(
+        pool.clone(),
+        Arc::clone(dispatcher),
+        rollback_assignment.id,
+        rollback_assignment.generation,
+    )
+    .await
+    {
+        Ok(snapshot) => {
+            let message = format!(
+                "{} The previous route was restored.",
+                item.error_message
+                    .as_deref()
+                    .unwrap_or("Replacement failed.")
+            );
+            routes
+                .finish_batch_item(
+                    item,
+                    RouteBatchItemCompletion::Failed {
+                        assignment: Some((snapshot.assignment.id, snapshot.assignment.generation)),
+                        error_code: "replacement_failed_restored",
+                        error_message: &message,
+                    },
+                )
+                .await
+                .map_err(route_batch_storage_error)
+        }
+        Err(error) => {
+            retry_or_fail_replacement_rollback(
+                routes,
+                item,
+                target,
+                &format!(
+                    "{} Restoring the previous route is still pending: {}",
+                    item.error_message
+                        .as_deref()
+                        .unwrap_or("Replacement failed."),
+                    error.message
+                ),
+            )
+            .await
+        }
+    }
+}
+
+async fn cleanup_replacement_target(
+    pool: PgPool,
+    dispatcher: Arc<WorkerCommandDispatcher>,
+    assignment_id: Uuid,
+    generation: i64,
+) -> Result<(), ApiError> {
+    let assignments = PgAssignments::new(pool.clone());
+    let snapshot = assignments
+        .get_by_id(assignment_id)
+        .await
+        .map_err(ApiError::assignment)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "assignment_not_found",
+            message: "replacement assignment disappeared during cleanup".to_owned(),
+        })?;
+    match (
+        snapshot.desired_state.as_str(),
+        snapshot.observed_state.as_str(),
+    ) {
+        ("cancelled", "cancelled") | ("stopped", "stopped") => Ok(()),
+        ("planned", "not_started") => {
+            match dispatcher
+                .dispatch(stop_command(&snapshot.assignment))
+                .await
+            {
+                Ok(CommandDispatchResult::Applied | CommandDispatchResult::Duplicate) => {
+                    assignments
+                        .cancel_unstarted(assignment_id, generation)
+                        .await
+                        .map_err(ApiError::assignment)
+                }
+                Ok(CommandDispatchResult::Stale { current_generation }) => {
+                    Err(ApiError::worker_dispatch(PortError {
+                        code: "stale_worker_command",
+                        message: format!(
+                            "worker has already accepted generation {current_generation}"
+                        ),
+                    }))
+                }
+                Err(error) => Err(ApiError::worker_dispatch(error)),
+            }
+        }
+        ("running", "starting" | "running" | "failed" | "degraded") | ("stopped", "stopping") => {
+            let stopped = stop_assignment_for(pool, dispatcher, assignment_id, generation).await?;
+            if stopped.observed_state == "stopped" {
+                Ok(())
+            } else {
+                Err(ApiError::assignment(PortError {
+                    code: "assignment_conflict",
+                    message: "replacement cleanup did not reach the stopped state".to_owned(),
+                }))
+            }
+        }
+        _ => Err(ApiError::assignment(PortError {
+            code: "assignment_conflict",
+            message: "replacement assignment is not in a recoverable cleanup state".to_owned(),
+        })),
+    }
+}
+
+fn assignment_is_stopped(snapshot: &AssignmentSnapshot) -> bool {
+    snapshot.desired_state == "stopped" && snapshot.observed_state == "stopped"
+}
+
+fn is_retryable_route_error(code: &'static str) -> bool {
+    matches!(
+        code,
+        "database_error"
+            | "worker_session_unavailable"
+            | "worker_session_replaced"
+            | "worker_session_busy"
+            | "worker_session_ended"
+            | "worker_command_ack_timeout"
+            | "worker_session_registration_failed"
+    )
+}
+
+async fn finish_replacement_failure(
+    routes: &PgRoutes,
+    item: &RouteBatchWorkItem,
+    target: &PlannedAssignment,
+    recovery_assignment: Option<&PlannedAssignment>,
+    error_code: &'static str,
+    error_message: &str,
+) -> PortResult<()> {
+    routes
+        .finish_batch_item(
+            item,
+            RouteBatchItemCompletion::Failed {
+                assignment: recovery_assignment
+                    .map(|assignment| (assignment.id, assignment.generation))
+                    .or(Some((target.id, target.generation))),
+                error_code,
+                error_message,
+            },
+        )
+        .await
+        .map_err(route_batch_storage_error)
+}
+
+async fn finish_route_batch_retry(
+    routes: &PgRoutes,
+    item: &RouteBatchWorkItem,
+    assignment: Option<(Uuid, i64)>,
+    error_code: &'static str,
+    error_message: &str,
+    delay_seconds: i64,
+) -> PortResult<()> {
+    routes
+        .finish_batch_item(
+            item,
+            RouteBatchItemCompletion::Retry {
+                assignment,
+                error_code,
+                error_message,
+                delay_seconds,
+            },
+        )
+        .await
+        .map_err(route_batch_storage_error)
+}
+
+async fn defer_replacement_rollback(
+    routes: &PgRoutes,
+    item: &RouteBatchWorkItem,
+    target: &PlannedAssignment,
+    _cause_code: &'static str,
+    error_message: &str,
+) -> PortResult<()> {
+    finish_route_batch_retry(
+        routes,
+        item,
+        Some((target.id, target.generation)),
+        "replacement_rollback_pending",
+        error_message,
+        1,
+    )
+    .await
+}
+
+async fn retry_or_fail_replacement_rollback(
+    routes: &PgRoutes,
+    item: &RouteBatchWorkItem,
+    target: &PlannedAssignment,
+    error_message: &str,
+) -> PortResult<()> {
+    if item.attempts >= MAX_ROUTE_BATCH_ATTEMPTS {
+        return finish_replacement_failure(
+            routes,
+            item,
+            target,
+            None,
+            "replacement_rollback_failed",
+            &format!(
+                "{error_message} Automatic recovery reached its retry limit; manual recovery is required."
+            ),
+        )
+        .await;
+    }
+    finish_route_batch_retry(
+        routes,
+        item,
+        Some((target.id, target.generation)),
+        "replacement_rollback_pending",
+        error_message,
+        5,
+    )
+    .await
+}
+
+async fn finish_route_batch_error(
+    routes: &PgRoutes,
+    item: &RouteBatchWorkItem,
+    assignment: Option<(Uuid, i64)>,
+    error_code: &'static str,
+    error_message: &str,
+) -> PortResult<()> {
+    let retryable = matches!(
+        error_code,
+        "database_error"
+            | "worker_session_unavailable"
+            | "worker_session_replaced"
+            | "worker_session_busy"
+            | "worker_session_ended"
+            | "worker_command_ack_timeout"
+            | "worker_session_registration_failed"
+    );
+    let completion = if retryable && item.attempts < MAX_ROUTE_BATCH_ATTEMPTS {
+        RouteBatchItemCompletion::Retry {
+            assignment,
+            error_code,
+            error_message: "Worker execution is temporarily unavailable; this route will retry.",
+            delay_seconds: 5,
+        }
+    } else if retryable {
+        RouteBatchItemCompletion::Failed {
+            assignment,
+            error_code: "worker_unavailable",
+            error_message: "The worker did not become available before the route retry limit.",
+        }
+    } else {
+        RouteBatchItemCompletion::Failed {
+            assignment,
+            error_code,
+            error_message,
+        }
+    };
+    routes
+        .finish_batch_item(item, completion)
+        .await
+        .map_err(route_batch_storage_error)
+}
+
+fn route_batch_storage_error(error: RouteWriteError) -> PortError {
+    PortError {
+        code: "route_batch_storage_error",
+        message: format!("{error:?}"),
+    }
 }
 
 #[derive(Clone)]
@@ -316,13 +1353,7 @@ async fn worker_control(
         .max_message_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
         .max_frame_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
-            handle_worker_control(
-                socket,
-                worker_id,
-                dispatcher,
-                authenticator,
-                bearer_token,
-            )
+            handle_worker_control(socket, worker_id, dispatcher, authenticator, bearer_token)
         })
         .into_response()
 }
@@ -475,8 +1506,7 @@ async fn liveness() -> Json<Value> {
 async fn readiness(
     Extension(pool): Extension<PgPool>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let result: Result<i32, sqlx::Error> =
-        sqlx::query_scalar("SELECT 1").fetch_one(&pool).await;
+    let result: Result<i32, sqlx::Error> = sqlx::query_scalar("SELECT 1").fetch_one(&pool).await;
     match result {
         Ok(_) => Ok(Json(json!({ "status": "ready", "database": "ready" }))),
         Err(error) => {
@@ -652,6 +1682,115 @@ async fn list_destinations(
         .await
         .map(Json)
         .map_err(|error| ApiError::database("list destinations", error))
+}
+
+#[derive(Serialize)]
+struct RouteCollection {
+    items: Vec<RouteRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetDesiredRouteRequest {
+    source_id: Uuid,
+    destination_id: Uuid,
+    expected_route_revision: i64,
+    #[serde(default)]
+    confirm_replace: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetDesiredRoutesBatchRequest {
+    routes: Vec<SetDesiredRouteRequest>,
+}
+
+async fn list_routes(
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<RouteCollection>, ApiError> {
+    PgRoutes::new(pool)
+        .list_current()
+        .await
+        .map(|items| Json(RouteCollection { items }))
+        .map_err(|error| ApiError::database("list routes", error))
+}
+
+async fn set_desired_route(
+    Extension(pool): Extension<PgPool>,
+    Json(request): Json<SetDesiredRouteRequest>,
+) -> Result<Json<RouteRecord>, ApiError> {
+    if request.expected_route_revision < 0 {
+        return Err(ApiError::invalid_request(
+            "expectedRouteRevision must be zero or greater",
+        ));
+    }
+
+    PgRoutes::new(pool)
+        .set_desired_route(
+            request.source_id,
+            request.destination_id,
+            request.expected_route_revision,
+            request.confirm_replace,
+        )
+        .await
+        .map(Json)
+        .map_err(ApiError::route_write)
+}
+
+async fn set_desired_routes_batch(
+    headers: HeaderMap,
+    Extension(pool): Extension<PgPool>,
+    Json(request): Json<SetDesiredRoutesBatchRequest>,
+) -> Result<Json<RouteBatchOperation>, ApiError> {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|key| !key.is_nil())
+        .ok_or_else(|| {
+            ApiError::invalid_request("Idempotency-Key header must be a non-nil UUID")
+        })?;
+    if request
+        .routes
+        .iter()
+        .any(|route| route.expected_route_revision < 0)
+    {
+        return Err(ApiError::invalid_request(
+            "expectedRouteRevision must be zero or greater",
+        ));
+    }
+
+    let changes = request
+        .routes
+        .into_iter()
+        .map(|route| DesiredRouteChange {
+            source_id: route.source_id,
+            destination_id: route.destination_id,
+            expected_route_revision: route.expected_route_revision,
+            confirm_replace: route.confirm_replace,
+        })
+        .collect();
+    PgRoutes::new(pool)
+        .set_desired_routes_batch(idempotency_key, changes)
+        .await
+        .map(Json)
+        .map_err(ApiError::route_write)
+}
+
+async fn get_route_batch_operation(
+    Path(operation_id): Path<Uuid>,
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<RouteBatchOperation>, ApiError> {
+    PgRoutes::new(pool)
+        .get_route_batch_operation(operation_id)
+        .await
+        .map_err(ApiError::route_write)?
+        .map(Json)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: "The requested route operation does not exist".to_owned(),
+        })
 }
 
 async fn validate_destination_draft(
@@ -884,13 +2023,24 @@ async fn start_assignment(
     Extension(dispatcher): Extension<Arc<WorkerCommandDispatcher>>,
     Json(request): Json<AssignmentGenerationRequest>,
 ) -> Result<Json<AssignmentSnapshot>, ApiError> {
+    start_assignment_for(pool, dispatcher, assignment_id, request.generation)
+        .await
+        .map(Json)
+}
+
+async fn start_assignment_for(
+    pool: PgPool,
+    dispatcher: Arc<WorkerCommandDispatcher>,
+    assignment_id: Uuid,
+    generation: i64,
+) -> Result<AssignmentSnapshot, ApiError> {
     let assignments = PgAssignments::new(pool);
     let snapshot = assignments
-        .begin_start(assignment_id, request.generation)
+        .begin_start(assignment_id, generation)
         .await
         .map_err(ApiError::assignment)?;
     if snapshot.observed_state == "running" {
-        return Ok(Json(snapshot));
+        return Ok(snapshot);
     }
 
     let command = start_command(&snapshot.assignment)?;
@@ -903,9 +2053,10 @@ async fn start_assignment(
                     | "worker_session_replaced"
                     | "worker_session_busy"
                     | "worker_command_too_large"
+                    | "worker_command_failed"
             ) {
                 assignments
-                    .reset_start(assignment_id, request.generation)
+                    .reset_start(assignment_id, generation)
                     .await
                     .map_err(ApiError::assignment)?;
             }
@@ -915,13 +2066,12 @@ async fn start_assignment(
 
     match result {
         CommandDispatchResult::Applied | CommandDispatchResult::Duplicate => assignments
-            .mark_started(assignment_id, request.generation)
+            .mark_started(assignment_id, generation)
             .await
-            .map(Json)
             .map_err(ApiError::assignment),
         CommandDispatchResult::Stale { current_generation } => {
             assignments
-                .reset_start(assignment_id, request.generation)
+                .reset_start(assignment_id, generation)
                 .await
                 .map_err(ApiError::assignment)?;
             Err(ApiError::worker_dispatch(PortError {
@@ -938,13 +2088,24 @@ async fn stop_assignment(
     Extension(dispatcher): Extension<Arc<WorkerCommandDispatcher>>,
     Json(request): Json<AssignmentGenerationRequest>,
 ) -> Result<Json<AssignmentSnapshot>, ApiError> {
+    stop_assignment_for(pool, dispatcher, assignment_id, request.generation)
+        .await
+        .map(Json)
+}
+
+async fn stop_assignment_for(
+    pool: PgPool,
+    dispatcher: Arc<WorkerCommandDispatcher>,
+    assignment_id: Uuid,
+    generation: i64,
+) -> Result<AssignmentSnapshot, ApiError> {
     let assignments = PgAssignments::new(pool);
     let snapshot = assignments
-        .begin_stop(assignment_id, request.generation)
+        .begin_stop(assignment_id, generation)
         .await
         .map_err(ApiError::assignment)?;
     if snapshot.observed_state == "stopped" {
-        return Ok(Json(snapshot));
+        return Ok(snapshot);
     }
 
     match dispatcher
@@ -952,9 +2113,8 @@ async fn stop_assignment(
         .await
     {
         Ok(CommandDispatchResult::Applied | CommandDispatchResult::Duplicate) => assignments
-            .mark_stopped(assignment_id, request.generation)
+            .mark_stopped(assignment_id, generation)
             .await
-            .map(Json)
             .map_err(ApiError::assignment),
         Ok(CommandDispatchResult::Stale { current_generation }) => {
             Err(ApiError::worker_dispatch(PortError {
@@ -966,14 +2126,61 @@ async fn stop_assignment(
     }
 }
 
-fn start_command(
+async fn prepare_assignment_for(
+    dispatcher: Arc<WorkerCommandDispatcher>,
     assignment: &PlannedAssignment,
-) -> Result<WorkerCommandEnvelope<WorkerCommand>, ApiError> {
+) -> Result<(), ApiError> {
+    match dispatcher.dispatch(prepare_command(assignment)?).await {
+        Ok(CommandDispatchResult::Applied | CommandDispatchResult::Duplicate) => Ok(()),
+        Ok(CommandDispatchResult::Stale { current_generation }) => {
+            Err(ApiError::worker_dispatch(PortError {
+                code: "stale_worker_command",
+                message: format!("worker has already accepted generation {current_generation}"),
+            }))
+        }
+        Err(error) => Err(ApiError::worker_dispatch(error)),
+    }
+}
+
+fn pipeline_specification(
+    assignment: &PlannedAssignment,
+) -> Result<PipelineSpecification, ApiError> {
     let route = assignment.route.as_ref().ok_or_else(|| ApiError {
         status: StatusCode::CONFLICT,
         code: "assignment_conflict",
         message: "assignment has no pinned route configuration to start".to_owned(),
     })?;
+    Ok(PipelineSpecification {
+        pipeline_id: assignment.pipeline_id,
+        assignment_generation: assignment.generation,
+        source_identity: Some(arc_application::PipelineSourceIdentity {
+            source_id: route.source_id,
+            source_revision: route.source_revision,
+        }),
+        requirements: assignment.requirements.clone(),
+        configuration: route.configuration.clone(),
+    })
+}
+
+fn prepare_command(
+    assignment: &PlannedAssignment,
+) -> Result<WorkerCommandEnvelope<WorkerCommand>, ApiError> {
+    Ok(WorkerCommandEnvelope {
+        protocol_version: WORKER_PROTOCOL_VERSION,
+        command_id: Uuid::new_v5(&assignment.id, b"prepare"),
+        worker_id: assignment.worker_id,
+        pipeline_id: assignment.pipeline_id,
+        assignment_id: assignment.id,
+        generation: assignment.generation,
+        payload: WorkerCommand::Prepare {
+            specification: pipeline_specification(assignment)?,
+        },
+    })
+}
+
+fn start_command(
+    assignment: &PlannedAssignment,
+) -> Result<WorkerCommandEnvelope<WorkerCommand>, ApiError> {
     Ok(WorkerCommandEnvelope {
         protocol_version: WORKER_PROTOCOL_VERSION,
         command_id: assignment.id,
@@ -982,12 +2189,7 @@ fn start_command(
         assignment_id: assignment.id,
         generation: assignment.generation,
         payload: WorkerCommand::Start {
-            specification: PipelineSpecification {
-                pipeline_id: assignment.pipeline_id,
-                assignment_generation: assignment.generation,
-                requirements: assignment.requirements.clone(),
-                configuration: route.configuration.clone(),
-            },
+            specification: pipeline_specification(assignment)?,
         },
     })
 }
@@ -1073,6 +2275,68 @@ impl ApiError {
         }
     }
 
+    fn route_write(error: RouteWriteError) -> Self {
+        match error {
+            RouteWriteError::InvalidBatch => Self::invalid_request(
+                "A route batch must contain 1 to 64 routes with no duplicate destinations",
+            ),
+            RouteWriteError::InvalidIdempotencyKey => {
+                Self::invalid_request("Idempotency-Key header must be a non-nil UUID")
+            }
+            RouteWriteError::IdempotencyKeyReused => Self {
+                status: StatusCode::CONFLICT,
+                code: "idempotency_key_reused",
+                message: "This idempotency key was already used for a different route batch"
+                    .to_owned(),
+            },
+            RouteWriteError::SourceNotFound | RouteWriteError::DestinationNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                code: "not_found",
+                message: "The requested source or destination does not exist".to_owned(),
+            },
+            RouteWriteError::SourceNotValidated => Self {
+                status: StatusCode::CONFLICT,
+                code: "source_not_validated",
+                message: "Validate the source before assigning it to a route".to_owned(),
+            },
+            RouteWriteError::DestinationNotValidated => Self {
+                status: StatusCode::CONFLICT,
+                code: "destination_not_validated",
+                message: "Validate the destination before assigning a route".to_owned(),
+            },
+            RouteWriteError::StaleRouteRevision { expected, current } => Self {
+                status: StatusCode::CONFLICT,
+                code: "stale_route_revision",
+                message: format!(
+                    "Expected route revision {expected}, but the current revision is {current}"
+                ),
+            },
+            RouteWriteError::ReplacementNotConfirmed => Self {
+                status: StatusCode::CONFLICT,
+                code: "replacement_confirmation_required",
+                message: "Confirm replacement of the currently desired route".to_owned(),
+            },
+            RouteWriteError::InvalidMediaProfile(error) => Self::invalid_media_profile(error),
+            RouteWriteError::InvalidStoredProfile(error) => {
+                tracing::error!(%error, "stored route media profile is invalid");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "internal_error",
+                    message: "A stored media profile could not be read".to_owned(),
+                }
+            }
+            RouteWriteError::InvalidStoredOperation(error) => {
+                tracing::error!(%error, "stored route operation is invalid");
+                Self {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "internal_error",
+                    message: "A stored route operation could not be read".to_owned(),
+                }
+            }
+            RouteWriteError::Database(error) => Self::database("desired route operation", error),
+        }
+    }
+
     fn serialize_profile(error: serde_json::Error) -> Self {
         tracing::error!(%error, "media profile serialization failed");
         Self {
@@ -1083,11 +2347,11 @@ impl ApiError {
     }
 
     fn database(operation: &'static str, error: impl std::fmt::Display) -> Self {
-        tracing::error!(%error, operation, "catalog database operation failed");
+        tracing::error!(%error, operation, "database operation failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "database_error",
-            message: "Catalog database operation failed".to_owned(),
+            message: "Database operation failed".to_owned(),
         }
     }
 
@@ -1098,7 +2362,10 @@ impl ApiError {
             | "source_not_validated"
             | "destination_not_validated"
             | "assignment_conflict"
+            | "destination_in_use"
             | "reservation_conflict"
+            | "source_worker_affinity_conflict"
+            | "source_worker_unavailable"
             | "idempotency_key_reused" => (StatusCode::CONFLICT, error.code),
             "invalid_route_revision" | "invalid_media_profile" | "invalid_reservation" => {
                 (StatusCode::UNPROCESSABLE_ENTITY, error.code)
@@ -1225,24 +2492,23 @@ mod tests {
         Architecture, DestinationMediaProfile, Platform, SourceMediaProfile, Worker,
         WorkerCapabilities, WorkerCapacity, WorkerState,
     };
+    use arc_gstreamer::GstreamerMediaPipeline;
     use arc_infrastructure::{
         assignments::PgAssignments,
         catalog,
         postgres::{connect_postgres, migrate},
+        routes::{PgRoutes, RouteBatchItemCompletion},
         worker_fencing::PgAssignmentGenerationStore,
         worker_registry::PgWorkerRegistry,
     };
-    use arc_gstreamer::GstreamerMediaPipeline;
-    use arc_worker::{
-        CommandDispatchResult, WorkerControlClient, WorkerControlClientConfig,
-    };
-    use gstreamer_app::AppSink;
+    use arc_worker::{CommandDispatchResult, WorkerControlClient, WorkerControlClientConfig};
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
     use chrono::Utc;
     use futures_util::{SinkExt, StreamExt};
+    use gstreamer_app::AppSink;
     use serde_json::Value;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2010,10 +3276,1229 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("readiness response reads");
-        let value: Value =
-            serde_json::from_slice(&body).expect("readiness response is JSON");
+        let value: Value = serde_json::from_slice(&body).expect("readiness response is JSON");
         assert_eq!(value["status"], "ready");
         assert_eq!(value["database"], "ready");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn routes_api_returns_latest_desired_and_observed_state_per_destination() {
+        let pool = connect_postgres(&env::var("DATABASE_URL").expect("DATABASE_URL is set"))
+            .await
+            .expect("database connects");
+        migrate(&pool).await.expect("database migrates");
+
+        let source_a =
+            catalog::create_source(&pool, "Route list source A", "test", serde_json::json!({}))
+                .await
+                .expect("first source persists");
+        let source_b =
+            catalog::create_source(&pool, "Route list source B", "test", serde_json::json!({}))
+                .await
+                .expect("second source persists");
+        let destination_a = catalog::create_destination(
+            &pool,
+            "Route list destination A",
+            "test",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("first destination persists");
+        let destination_b = catalog::create_destination(
+            &pool,
+            "Route list destination B",
+            "test",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("second destination persists");
+
+        let removed_route_id = Uuid::new_v4();
+        let desired_route_id = Uuid::new_v4();
+        let unknown_route_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO route_instances \
+             (id, source_id, destination_id, route_revision, global_revision, desired_state) \
+             VALUES ($1, $2, $3, 1, 1, 'removed'), \
+                    ($4, $5, $3, 2, 2, 'desired'), \
+                    ($6, $2, $7, 1, 3, 'desired')",
+        )
+        .bind(removed_route_id)
+        .bind(source_a.id)
+        .bind(destination_a.id)
+        .bind(desired_route_id)
+        .bind(source_b.id)
+        .bind(unknown_route_id)
+        .bind(destination_b.id)
+        .execute(&pool)
+        .await
+        .expect("route history persists");
+        sqlx::query(
+            "INSERT INTO route_events \
+             (id, route_instance_id, observed_state, occurred_at) \
+             VALUES ($1, $2, 'stopped', now() - interval '1 second'), \
+                    ($3, $4, 'running', now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(removed_route_id)
+        .bind(Uuid::new_v4())
+        .bind(desired_route_id)
+        .execute(&pool)
+        .await
+        .expect("route observations persist");
+
+        let response = router_with_database(pool)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/routes")
+                    .body(Body::empty())
+                    .expect("route collection request builds"),
+            )
+            .await
+            .expect("route collection request completes");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("route collection response reads");
+        let value: Value = serde_json::from_slice(&body).expect("response is JSON");
+        let items = value["items"].as_array().expect("items is an array");
+
+        let destination_a_id = destination_a.id.to_string();
+        let destination_a_routes: Vec<_> = items
+            .iter()
+            .filter(|item| item["destinationId"].as_str() == Some(destination_a_id.as_str()))
+            .collect();
+        assert_eq!(destination_a_routes.len(), 1);
+        assert_eq!(destination_a_routes[0]["sourceId"], source_b.id.to_string());
+        assert_eq!(destination_a_routes[0]["desiredState"], "desired");
+        assert_eq!(destination_a_routes[0]["observedState"], "running");
+        assert_eq!(
+            destination_a_routes[0]["observedSourceId"],
+            source_b.id.to_string()
+        );
+        assert_eq!(destination_a_routes[0]["revision"], 2);
+
+        let destination_b_id = destination_b.id.to_string();
+        let destination_b_route = items
+            .iter()
+            .find(|item| item["destinationId"].as_str() == Some(destination_b_id.as_str()))
+            .expect("second destination is listed");
+        assert_eq!(destination_b_route["desiredState"], "desired");
+        assert_eq!(destination_b_route["observedState"], "unknown");
+        assert!(destination_b_route["observedSourceId"].is_null());
+        assert_eq!(destination_b_route["revision"], 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn route_write_requires_revision_and_explicit_replacement_confirmation() {
+        let pool = connect_postgres(&env::var("DATABASE_URL").expect("DATABASE_URL is set"))
+            .await
+            .expect("database connects");
+        migrate(&pool).await.expect("database migrates");
+
+        let source_profile = serde_json::json!({
+            "kind": "rtp_l16",
+            "bindAddress": "0.0.0.0",
+            "port": 5000,
+            "payloadType": 96
+        });
+        let destination_profile = serde_json::json!({
+            "kind": "rtp_l16",
+            "address": "127.0.0.1",
+            "port": 5002,
+            "payloadType": 96
+        });
+        let source_a = catalog::create_source(
+            &pool,
+            "Route write source A",
+            "rtp_l16",
+            source_profile.clone(),
+        )
+        .await
+        .expect("first source persists");
+        let source_b =
+            catalog::create_source(&pool, "Route write source B", "rtp_l16", source_profile)
+                .await
+                .expect("second source persists");
+        let destination = catalog::create_destination(
+            &pool,
+            "Route write destination",
+            "rtp_l16",
+            destination_profile,
+        )
+        .await
+        .expect("destination persists");
+        catalog::validate_source_draft(&pool, source_a.id)
+            .await
+            .expect("first source validates");
+        catalog::validate_source_draft(&pool, source_b.id)
+            .await
+            .expect("second source validates");
+        catalog::validate_destination_draft(&pool, destination.id)
+            .await
+            .expect("destination validates");
+        let app = router_with_database(pool.clone());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sourceId": source_a.id,
+                            "destinationId": destination.id,
+                            "expectedRouteRevision": 0
+                        })
+                        .to_string(),
+                    ))
+                    .expect("initial route request builds"),
+            )
+            .await
+            .expect("initial route request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("initial route response reads");
+        let route: Value = serde_json::from_slice(&body).expect("route response is JSON");
+        assert_eq!(route["sourceId"], source_a.id.to_string());
+        assert_eq!(route["desiredState"], "desired");
+        assert_eq!(route["observedState"], "unknown");
+        assert_eq!(route["revision"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sourceId": source_a.id,
+                            "destinationId": destination.id,
+                            "expectedRouteRevision": 1
+                        })
+                        .to_string(),
+                    ))
+                    .expect("idempotent route request builds"),
+            )
+            .await
+            .expect("idempotent route request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("idempotent response reads");
+        let repeated: Value =
+            serde_json::from_slice(&body).expect("idempotent route response is JSON");
+        assert_eq!(repeated["revision"], 1);
+
+        let original_route_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM route_instances WHERE destination_id = $1 AND route_revision = 1",
+        )
+        .bind(destination.id)
+        .fetch_one(&pool)
+        .await
+        .expect("original route id reads");
+        sqlx::query(
+            "INSERT INTO route_events (id, route_instance_id, observed_state) \
+             VALUES ($1, $2, 'running')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(original_route_id)
+        .execute(&pool)
+        .await
+        .expect("original route observation persists");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sourceId": source_b.id,
+                            "destinationId": destination.id,
+                            "expectedRouteRevision": 1
+                        })
+                        .to_string(),
+                    ))
+                    .expect("unconfirmed replacement request builds"),
+            )
+            .await
+            .expect("unconfirmed replacement request completes");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replacement error response reads");
+        let error: Value = serde_json::from_slice(&body).expect("error response is JSON");
+        assert_eq!(error["code"], "replacement_confirmation_required");
+
+        let routes = PgRoutes::new(pool.clone())
+            .list_current()
+            .await
+            .expect("route state reads after rejected replacement");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].source_id, source_a.id);
+        assert_eq!(routes[0].revision, 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sourceId": source_b.id,
+                            "destinationId": destination.id,
+                            "expectedRouteRevision": 0,
+                            "confirmReplace": true
+                        })
+                        .to_string(),
+                    ))
+                    .expect("stale replacement request builds"),
+            )
+            .await
+            .expect("stale replacement request completes");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("stale replacement response reads");
+        let error: Value = serde_json::from_slice(&body).expect("stale error is JSON");
+        assert_eq!(error["code"], "stale_route_revision");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sourceId": source_b.id,
+                            "destinationId": destination.id,
+                            "expectedRouteRevision": 1,
+                            "confirmReplace": true
+                        })
+                        .to_string(),
+                    ))
+                    .expect("confirmed replacement request builds"),
+            )
+            .await
+            .expect("confirmed replacement request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("confirmed replacement response reads");
+        let route: Value = serde_json::from_slice(&body).expect("route response is JSON");
+        assert_eq!(route["sourceId"], source_b.id.to_string());
+        assert_eq!(route["desiredState"], "desired");
+        assert_eq!(route["observedState"], "running");
+        assert_eq!(route["observedSourceId"], source_a.id.to_string());
+        assert_eq!(route["revision"], 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn desired_route_batch_is_atomic_idempotent_and_retrievable() {
+        let pool = connect_postgres(&env::var("DATABASE_URL").expect("DATABASE_URL is set"))
+            .await
+            .expect("database connects");
+        migrate(&pool).await.expect("database migrates");
+
+        let source_profile = serde_json::json!({
+            "kind": "rtp_l16",
+            "bindAddress": "0.0.0.0",
+            "port": 5000,
+            "payloadType": 96
+        });
+        let destination_profile = serde_json::json!({
+            "kind": "rtp_l16",
+            "address": "127.0.0.1",
+            "port": 5002,
+            "payloadType": 96
+        });
+        let source_a =
+            catalog::create_source(&pool, "Batch source A", "rtp_l16", source_profile.clone())
+                .await
+                .expect("first source persists");
+        let source_b = catalog::create_source(&pool, "Batch source B", "rtp_l16", source_profile)
+            .await
+            .expect("second source persists");
+        let destination_a = catalog::create_destination(
+            &pool,
+            "Batch destination A",
+            "rtp_l16",
+            destination_profile.clone(),
+        )
+        .await
+        .expect("first destination persists");
+        let destination_b = catalog::create_destination(
+            &pool,
+            "Batch destination B",
+            "rtp_l16",
+            destination_profile,
+        )
+        .await
+        .expect("second destination persists");
+        for source_id in [source_a.id, source_b.id] {
+            catalog::validate_source_draft(&pool, source_id)
+                .await
+                .expect("source validates");
+        }
+        for destination_id in [destination_a.id, destination_b.id] {
+            catalog::validate_destination_draft(&pool, destination_id)
+                .await
+                .expect("destination validates");
+        }
+        let app = router_with_database(pool.clone());
+
+        let invalid_revision_key = Uuid::new_v4();
+        let invalid_revision_batch = serde_json::json!({
+            "routes": [
+                {
+                    "sourceId": source_a.id,
+                    "destinationId": destination_a.id,
+                    "expectedRouteRevision": 0,
+                    "confirmReplace": false
+                },
+                {
+                    "sourceId": source_b.id,
+                    "destinationId": destination_b.id,
+                    "expectedRouteRevision": 1,
+                    "confirmReplace": false
+                }
+            ]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", invalid_revision_key.to_string())
+                    .body(Body::from(invalid_revision_batch.to_string()))
+                    .expect("invalid batch request builds"),
+            )
+            .await
+            .expect("invalid batch request completes");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let route_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM route_instances WHERE destination_id IN ($1, $2)",
+        )
+        .bind(destination_a.id)
+        .bind(destination_b.id)
+        .fetch_one(&pool)
+        .await
+        .expect("route count reads after rollback");
+        assert_eq!(route_count, 0);
+
+        let idempotency_key = Uuid::new_v4();
+        let first_route = serde_json::json!({
+            "sourceId": source_a.id,
+            "destinationId": destination_a.id,
+            "expectedRouteRevision": 0,
+            "confirmReplace": false
+        });
+        let second_route = serde_json::json!({
+            "sourceId": source_b.id,
+            "destinationId": destination_b.id,
+            "expectedRouteRevision": 0,
+            "confirmReplace": false
+        });
+        let request_body = serde_json::json!({
+            "routes": [first_route, second_route]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", idempotency_key.to_string())
+                    .body(Body::from(request_body.to_string()))
+                    .expect("valid batch request builds"),
+            )
+            .await
+            .expect("valid batch request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("batch response reads");
+        let operation: Value = serde_json::from_slice(&body).expect("batch response is JSON");
+        assert_eq!(operation["state"], "pending");
+        assert_eq!(operation["routes"].as_array().unwrap().len(), 2);
+        assert_eq!(operation["results"].as_array().unwrap().len(), 2);
+        assert!(operation["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["state"] == "pending"));
+        let operation_id = operation["operationId"]
+            .as_str()
+            .expect("operation ID is present")
+            .to_owned();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", idempotency_key.to_string())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "routes": [second_route, first_route]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("replay request builds"),
+            )
+            .await
+            .expect("replay request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replay response reads");
+        let replay: Value = serde_json::from_slice(&body).expect("replay is JSON");
+        assert_eq!(replay["operationId"], operation_id);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM route_instances WHERE destination_id IN ($1, $2)",
+            )
+            .bind(destination_a.id)
+            .bind(destination_b.id)
+            .fetch_one(&pool)
+            .await
+            .expect("route count reads after replay"),
+            2
+        );
+
+        let changed_batch = serde_json::json!({
+            "routes": [{
+                "sourceId": source_b.id,
+                "destinationId": destination_a.id,
+                "expectedRouteRevision": 0,
+                "confirmReplace": false
+            }]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", idempotency_key.to_string())
+                    .body(Body::from(changed_batch.to_string()))
+                    .expect("changed replay request builds"),
+            )
+            .await
+            .expect("changed replay request completes");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("changed replay response reads");
+        let error: Value = serde_json::from_slice(&body).expect("error response is JSON");
+        assert_eq!(error["code"], "idempotency_key_reused");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/operations/routes/{operation_id}"))
+                    .body(Body::empty())
+                    .expect("operation read request builds"),
+            )
+            .await
+            .expect("operation read request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("operation read response reads");
+        let stored_operation: Value =
+            serde_json::from_slice(&body).expect("stored operation is JSON");
+        assert_eq!(stored_operation, operation);
+
+        let routes = PgRoutes::new(pool.clone());
+        let first = routes
+            .claim_next_batch_item()
+            .await
+            .expect("first route batch item claims")
+            .expect("route batch item exists");
+        sqlx::query(
+            "UPDATE route_batch_items SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' \
+             WHERE operation_id = $1 AND destination_id = $2",
+        )
+        .bind(first.operation_id)
+        .bind(first.destination_id)
+        .execute(&pool)
+        .await
+        .expect("processing lease expires for recovery test");
+        let reclaimed = routes
+            .claim_next_batch_item()
+            .await
+            .expect("expired route batch item is reclaimed")
+            .expect("expired route batch item is available");
+        assert_eq!(reclaimed.destination_id, first.destination_id);
+        assert_ne!(reclaimed.lease_token, first.lease_token);
+        assert!(routes
+            .finish_batch_item(
+                &first,
+                RouteBatchItemCompletion::Succeeded {
+                    assignment_id: Uuid::new_v4(),
+                    generation: 1,
+                },
+            )
+            .await
+            .is_err());
+        routes
+            .finish_batch_item(
+                &reclaimed,
+                RouteBatchItemCompletion::Succeeded {
+                    assignment_id: Uuid::new_v4(),
+                    generation: 1,
+                },
+            )
+            .await
+            .expect("recovered batch item completes");
+        let second = routes
+            .claim_next_batch_item()
+            .await
+            .expect("second route batch item claims")
+            .expect("second route batch item exists");
+        routes
+            .finish_batch_item(
+                &second,
+                RouteBatchItemCompletion::Failed {
+                    assignment: None,
+                    error_code: "test_failure",
+                    error_message: "test route failure",
+                },
+            )
+            .await
+            .expect("failed route result is recorded");
+        let partial = routes
+            .get_route_batch_operation(operation_id.parse().expect("operation ID is UUID"))
+            .await
+            .expect("route operation can be reloaded")
+            .expect("route operation exists");
+        assert_eq!(partial.state, "partial");
+        assert_eq!(
+            partial
+                .results
+                .iter()
+                .filter(|result| result.state == "succeeded")
+                .count(),
+            1
+        );
+        assert_eq!(
+            partial
+                .results
+                .iter()
+                .filter(|result| result.state == "failed")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn route_batch_execution_dispatches_and_records_worker_acknowledgement() {
+        let pool = connect_postgres(&env::var("DATABASE_URL").expect("DATABASE_URL is set"))
+            .await
+            .expect("database connects");
+        migrate(&pool).await.expect("database migrates");
+        sqlx::query("TRUNCATE TABLE workers CASCADE")
+            .execute(&pool)
+            .await
+            .expect("worker state is isolated");
+
+        let worker_id = Uuid::new_v4();
+        let mut worker = Worker {
+            id: worker_id,
+            stable_name: format!("route-batch-{worker_id}"),
+            version: "0.1.0".to_owned(),
+            state: WorkerState::Registering,
+            capabilities: WorkerCapabilities {
+                platform: Some(Platform::Linux),
+                architecture: Some(Architecture::X86_64),
+                source_adapters: BTreeSet::from(["rtp_l16".to_owned()]),
+                destination_adapters: BTreeSet::from(["rtp_l16".to_owned()]),
+                ..WorkerCapabilities::default()
+            },
+            capacity: WorkerCapacity {
+                total_capacity_units: 8,
+                assigned_capacity_units: 0,
+                cpu_utilization_ratio: None,
+                memory_utilization_ratio: None,
+                ingress_bits_per_second: None,
+                egress_bits_per_second: None,
+            },
+            last_heartbeat: Utc::now(),
+        };
+        let registry = PgWorkerRegistry::new(pool.clone());
+        registry
+            .register(worker.clone())
+            .await
+            .expect("worker registers");
+        worker.state = WorkerState::Accepting;
+        registry
+            .heartbeat(worker)
+            .await
+            .expect("worker becomes eligible");
+
+        let address = IpAddr::from([127, 0, 0, 1]);
+        let source_profile = SourceMediaProfile::RtpL16 {
+            bind_address: address,
+            port: 5200,
+            payload_type: 96,
+        };
+        let destination_profile = DestinationMediaProfile::RtpL16 {
+            address,
+            port: 5202,
+            payload_type: 96,
+        };
+        let source = catalog::create_source(
+            &pool,
+            "Route batch source",
+            source_profile.adapter_id(),
+            serde_json::to_value(&source_profile).expect("source profile serializes"),
+        )
+        .await
+        .expect("source creates");
+        let source = catalog::validate_source_draft(&pool, source.id)
+            .await
+            .expect("source validates");
+        let destination = catalog::create_destination(
+            &pool,
+            "Route batch destination",
+            destination_profile.adapter_id(),
+            serde_json::to_value(&destination_profile).expect("destination profile serializes"),
+        )
+        .await
+        .expect("destination creates");
+        let destination = catalog::validate_destination_draft(&pool, destination.id)
+            .await
+            .expect("destination validates");
+        let replacement_sources = [5204, 5206]
+            .into_iter()
+            .map(|port| SourceMediaProfile::RtpL16 {
+                bind_address: address,
+                port,
+                payload_type: 96,
+            })
+            .collect::<Vec<_>>();
+        let mut replacement_source_ids = Vec::new();
+        for (index, profile) in replacement_sources.iter().enumerate() {
+            let source = catalog::create_source(
+                &pool,
+                &format!("Replacement source {index}"),
+                profile.adapter_id(),
+                serde_json::to_value(profile).expect("replacement profile serializes"),
+            )
+            .await
+            .expect("replacement source creates");
+            let source = catalog::validate_source_draft(&pool, source.id)
+                .await
+                .expect("replacement source validates");
+            replacement_source_ids.push(source.id);
+        }
+
+        let dispatcher = Arc::new(WorkerCommandDispatcher::new_with_lease_pool(
+            Arc::new(PgAssignmentGenerationStore::new(pool.clone())),
+            pool.clone(),
+        ));
+        let app = router_with_database_and_worker_dispatcher(
+            pool.clone(),
+            Arc::new(TestWorkerAuthenticator {
+                worker_id,
+                token: "worker-secret",
+                available: true,
+            }),
+            dispatcher,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("API listener binds");
+        let api_address = listener.local_addr().expect("API listener has an address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("API server runs");
+        });
+
+        let (mut socket, _) = connect_async(worker_websocket_request(
+            api_address,
+            worker_id,
+            "worker-secret",
+            "https",
+        ))
+        .await
+        .expect("worker control connection upgrades");
+        let hello = arc_shared::WorkerSessionHello {
+            kind: arc_shared::WorkerSessionMessageKind::Hello,
+            protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
+            worker_id,
+        };
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&hello)
+                    .expect("worker hello serializes")
+                    .into(),
+            ))
+            .await
+            .expect("worker hello sends");
+        let welcome = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("worker welcome arrives")
+            .expect("control session remains open")
+            .expect("worker welcome is received");
+        assert!(matches!(welcome, ClientMessage::Text(_)));
+
+        let idempotency_key = Uuid::new_v4();
+        let request = serde_json::json!({
+            "routes": [{
+                "sourceId": source.id,
+                "destinationId": destination.id,
+                "expectedRouteRevision": 0,
+                "confirmReplace": false
+            }]
+        });
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", idempotency_key.to_string())
+                    .body(Body::from(request.to_string()))
+                    .expect("route batch request builds"),
+            )
+            .await
+            .expect("route batch request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("route batch response reads");
+        let operation: Value =
+            serde_json::from_slice(&body).expect("route batch response is valid JSON");
+        let operation_id = Uuid::parse_str(
+            operation["operationId"]
+                .as_str()
+                .expect("operation ID is returned"),
+        )
+        .expect("operation ID is valid");
+
+        let command_message =
+            tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+                .await
+                .expect("route batch dispatch reaches the worker")
+                .expect("worker session remains open")
+                .expect("worker receives route batch command");
+        let ClientMessage::Text(command_message) = command_message else {
+            panic!("expected a text Start command");
+        };
+        let command: Value =
+            serde_json::from_str(command_message.as_str()).expect("worker command is valid JSON");
+        let command_id = Uuid::parse_str(
+            command["commandId"]
+                .as_str()
+                .expect("worker command ID is present"),
+        )
+        .expect("worker command ID is valid");
+        let acknowledgement = arc_shared::WorkerCommandAcknowledgement {
+            kind: arc_shared::WorkerSessionMessageKind::CommandAck,
+            protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
+            worker_id,
+            command_id,
+            outcome: arc_shared::WorkerCommandOutcome::Completed,
+            current_generation: None,
+            error_code: None,
+            error_message: None,
+        };
+        socket
+            .send(ClientMessage::Text(
+                serde_json::to_string(&acknowledgement)
+                    .expect("worker acknowledgement serializes")
+                    .into(),
+            ))
+            .await
+            .expect("worker acknowledgement sends");
+
+        let routes = PgRoutes::new(pool.clone());
+        let operation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let operation = routes
+                    .get_route_batch_operation(operation_id)
+                    .await
+                    .expect("operation status reads")
+                    .expect("operation remains persisted");
+                if operation.state == "completed" {
+                    break operation;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("route batch records the worker acknowledgement");
+        assert_eq!(operation.results.len(), 1);
+        assert_eq!(operation.results[0].state, "succeeded");
+        assert!(operation.results[0].assignment_id.is_some());
+        assert_eq!(operation.results[0].destination_id, destination.id);
+
+        let previous_assignment_id = operation.results[0]
+            .assignment_id
+            .expect("initial assignment ID is returned");
+        let previous_assignment = PgAssignments::new(pool.clone())
+            .get_by_id(previous_assignment_id)
+            .await
+            .expect("initial assignment reads")
+            .expect("initial assignment exists");
+        assert_eq!(previous_assignment.observed_state, "running");
+
+        let make_acknowledgement =
+            |command_id: Uuid,
+             outcome: arc_shared::WorkerCommandOutcome,
+             error_code: Option<&str>,
+             error_message: Option<&str>| {
+                arc_shared::WorkerCommandAcknowledgement {
+                    kind: arc_shared::WorkerSessionMessageKind::CommandAck,
+                    protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
+                    worker_id,
+                    command_id,
+                    outcome,
+                    current_generation: None,
+                    error_code: error_code.map(str::to_owned),
+                    error_message: error_message.map(str::to_owned),
+                }
+            };
+        macro_rules! next_worker_command {
+            ($description:literal) => {{
+                let message =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+                        .await
+                        .expect($description)
+                        .expect("worker session remains open")
+                        .expect("worker command is valid websocket data");
+                let ClientMessage::Text(message) = message else {
+                    panic!("expected a text worker command");
+                };
+                serde_json::from_str::<Value>(message.as_str())
+                    .expect("worker command is valid JSON")
+            }};
+        }
+        macro_rules! acknowledge_worker_command {
+            ($command:expr, $outcome:expr, $code:expr, $message:expr) => {{
+                let command_id = Uuid::parse_str(
+                    $command["commandId"]
+                        .as_str()
+                        .expect("worker command ID is present"),
+                )
+                .expect("worker command ID is valid");
+                let acknowledgement = make_acknowledgement(command_id, $outcome, $code, $message);
+                socket
+                    .send(ClientMessage::Text(
+                        serde_json::to_string(&acknowledgement)
+                            .expect("worker acknowledgement serializes")
+                            .into(),
+                    ))
+                    .await
+                    .expect("worker acknowledgement sends");
+            }};
+        }
+
+        let prepare_failure_key = Uuid::new_v4();
+        let prepare_failure_request = serde_json::json!({
+            "routes": [{
+                "sourceId": replacement_source_ids[0],
+                "destinationId": destination.id,
+                "expectedRouteRevision": 1,
+                "confirmReplace": true
+            }]
+        });
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", prepare_failure_key.to_string())
+                    .body(Body::from(prepare_failure_request.to_string()))
+                    .expect("replacement request builds"),
+            )
+            .await
+            .expect("replacement request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let prepare_failure_body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replacement response reads");
+        let prepare_failure_operation: Value =
+            serde_json::from_slice(&prepare_failure_body).expect("replacement response is JSON");
+        let prepare_failure_operation_id = Uuid::parse_str(
+            prepare_failure_operation["operationId"]
+                .as_str()
+                .expect("replacement operation ID is returned"),
+        )
+        .expect("replacement operation ID is valid");
+
+        let prepare_command = next_worker_command!("replacement Prepare reaches the worker");
+        assert_eq!(prepare_command["payload"]["kind"], "prepare");
+        acknowledge_worker_command!(
+            prepare_command,
+            arc_shared::WorkerCommandOutcome::Failed,
+            Some("gstreamer_pipeline_prepare_failed"),
+            Some("injected replacement preparation failure")
+        );
+        let cleanup_command = next_worker_command!("failed preparation is cleaned up");
+        assert_eq!(cleanup_command["payload"]["kind"], "stop");
+        acknowledge_worker_command!(
+            cleanup_command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+
+        let prepare_failure_operation =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let operation = routes
+                        .get_route_batch_operation(prepare_failure_operation_id)
+                        .await
+                        .expect("replacement status reads")
+                        .expect("replacement operation remains persisted");
+                    if operation.state == "failed" {
+                        break operation;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("preparation failure is recorded");
+        assert_eq!(
+            prepare_failure_operation.results[0].error_code.as_deref(),
+            Some("replacement_prepare_failed")
+        );
+        let previous_after_prepare_failure = PgAssignments::new(pool.clone())
+            .get_by_id(previous_assignment_id)
+            .await
+            .expect("previous assignment status reads")
+            .expect("previous assignment remains");
+        assert_eq!(previous_after_prepare_failure.desired_state, "running");
+        assert_eq!(previous_after_prepare_failure.observed_state, "running");
+
+        let start_failure_key = Uuid::new_v4();
+        let start_failure_request = serde_json::json!({
+            "routes": [{
+                "sourceId": replacement_source_ids[1],
+                "destinationId": destination.id,
+                "expectedRouteRevision": 2,
+                "confirmReplace": true
+            }]
+        });
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", start_failure_key.to_string())
+                    .body(Body::from(start_failure_request.to_string()))
+                    .expect("replacement request builds"),
+            )
+            .await
+            .expect("replacement request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let start_failure_body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replacement response reads");
+        let start_failure_operation: Value =
+            serde_json::from_slice(&start_failure_body).expect("replacement response is JSON");
+        let start_failure_operation_id = Uuid::parse_str(
+            start_failure_operation["operationId"]
+                .as_str()
+                .expect("replacement operation ID is returned"),
+        )
+        .expect("replacement operation ID is valid");
+
+        let prepare_command = next_worker_command!("second replacement Prepare reaches the worker");
+        assert_eq!(prepare_command["payload"]["kind"], "prepare");
+        acknowledge_worker_command!(
+            prepare_command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let stop_command = next_worker_command!("previous route Stop reaches the worker");
+        assert_eq!(stop_command["payload"]["kind"], "stop");
+        assert_eq!(
+            stop_command["assignmentId"],
+            previous_assignment_id.to_string()
+        );
+        acknowledge_worker_command!(
+            stop_command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let failed_start_command = next_worker_command!("replacement Start reaches the worker");
+        assert_eq!(failed_start_command["payload"]["kind"], "start");
+        acknowledge_worker_command!(
+            failed_start_command,
+            arc_shared::WorkerCommandOutcome::Failed,
+            Some("gstreamer_pipeline_start_failed"),
+            Some("injected replacement start failure")
+        );
+        let failed_start_cleanup = next_worker_command!("failed replacement is stopped");
+        assert_eq!(failed_start_cleanup["payload"]["kind"], "stop");
+        acknowledge_worker_command!(
+            failed_start_cleanup,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let restore_command = next_worker_command!("previous route restoration reaches the worker");
+        assert_eq!(restore_command["payload"]["kind"], "start");
+        assert_eq!(
+            restore_command["payload"]["specification"]["configuration"]["source"],
+            serde_json::to_value(&source_profile).expect("original profile serializes")
+        );
+        acknowledge_worker_command!(
+            restore_command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+
+        let start_failure_operation =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let operation = routes
+                        .get_route_batch_operation(start_failure_operation_id)
+                        .await
+                        .expect("replacement status reads")
+                        .expect("replacement operation remains persisted");
+                    if operation.state == "failed" {
+                        break operation;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("failed Start recovery is recorded");
+        assert_eq!(
+            start_failure_operation.results[0].error_code.as_deref(),
+            Some("replacement_failed_restored")
+        );
+        let restored_route = routes
+            .list_current()
+            .await
+            .expect("current route reads")
+            .into_iter()
+            .find(|route| route.destination_id == destination.id)
+            .expect("destination route exists");
+        assert_eq!(restored_route.observed_state, "running");
+        assert_eq!(restored_route.observed_source_id, Some(source.id));
+
+        let success_key = Uuid::new_v4();
+        let success_request = serde_json::json!({
+            "routes": [{
+                "sourceId": replacement_source_ids[0],
+                "destinationId": destination.id,
+                "expectedRouteRevision": restored_route.revision,
+                "confirmReplace": true
+            }]
+        });
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", success_key.to_string())
+                    .body(Body::from(success_request.to_string()))
+                    .expect("replacement request builds"),
+            )
+            .await
+            .expect("replacement request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let success_body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("replacement response reads");
+        let success_operation: Value =
+            serde_json::from_slice(&success_body).expect("replacement response is JSON");
+        let success_operation_id = Uuid::parse_str(
+            success_operation["operationId"]
+                .as_str()
+                .expect("replacement operation ID is returned"),
+        )
+        .expect("replacement operation ID is valid");
+
+        let prepare_command =
+            next_worker_command!("successful replacement Prepare reaches the worker");
+        assert_eq!(prepare_command["payload"]["kind"], "prepare");
+        acknowledge_worker_command!(
+            prepare_command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let stop_command = next_worker_command!("restored route Stop reaches the worker");
+        assert_eq!(stop_command["payload"]["kind"], "stop");
+        acknowledge_worker_command!(
+            stop_command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let start_command = next_worker_command!("successful replacement Start reaches the worker");
+        assert_eq!(start_command["payload"]["kind"], "start");
+        acknowledge_worker_command!(
+            start_command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+
+        let success_operation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let operation = routes
+                    .get_route_batch_operation(success_operation_id)
+                    .await
+                    .expect("replacement status reads")
+                    .expect("replacement operation remains persisted");
+                if operation.state == "completed" {
+                    break operation;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("successful replacement is recorded");
+        assert_eq!(success_operation.results[0].state, "succeeded");
+        let replaced_route = routes
+            .list_current()
+            .await
+            .expect("current route reads")
+            .into_iter()
+            .find(|route| route.destination_id == destination.id)
+            .expect("destination route exists");
+        assert_eq!(replaced_route.observed_state, "running");
+        assert_eq!(
+            replaced_route.observed_source_id,
+            Some(replacement_source_ids[0])
+        );
+
+        server.abort();
     }
 
     #[tokio::test]
@@ -2091,7 +4576,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires an isolated PostgreSQL database"]
     async fn capacity_wait_api_recovers_and_processes_fifo() {
-        async fn call(app: &axum::Router, method: &str, path: &str, key: Option<Uuid>, body: Option<Value>) -> (StatusCode, Value) {
+        async fn call(
+            app: &axum::Router,
+            method: &str,
+            path: &str,
+            key: Option<Uuid>,
+            body: Option<Value>,
+        ) -> (StatusCode, Value) {
             let mut request = Request::builder().method(method).uri(path);
             if let Some(key) = key {
                 request = request.header("idempotency-key", key.to_string());
@@ -2099,13 +4590,23 @@ mod tests {
             if body.is_some() {
                 request = request.header("content-type", "application/json");
             }
-            let response = app.clone().oneshot(request.body(Body::from(body.map(|b| b.to_string()).unwrap_or_default())).unwrap()).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             let status = response.status();
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             (status, serde_json::from_slice(&body).unwrap())
         }
 
-        let pool = connect_postgres(&env::var("DATABASE_URL").unwrap()).await.unwrap();
+        let pool = connect_postgres(&env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
         migrate(&pool).await.unwrap();
         // The ignored API tests share an isolated PostgreSQL database.
         sqlx::query("TRUNCATE TABLE workers CASCADE")
@@ -2113,66 +4614,176 @@ mod tests {
             .await
             .unwrap();
         let source_profile = SourceMediaProfile::RtpL16 {
-            bind_address: IpAddr::from([0, 0, 0, 0]), port: 5000, payload_type: 96,
+            bind_address: IpAddr::from([0, 0, 0, 0]),
+            port: 5000,
+            payload_type: 96,
         };
         let destination_profile = DestinationMediaProfile::RtpL16 {
-            address: IpAddr::from([127, 0, 0, 1]), port: 5002, payload_type: 96,
+            address: IpAddr::from([127, 0, 0, 1]),
+            port: 5002,
+            payload_type: 96,
         };
-        let source = catalog::create_source(&pool, "wait API source", source_profile.adapter_id(), serde_json::to_value(&source_profile).unwrap()).await.unwrap();
-        let source = catalog::validate_source_draft(&pool, source.id).await.unwrap();
-        let destination = catalog::create_destination(&pool, "wait API destination", destination_profile.adapter_id(), serde_json::to_value(&destination_profile).unwrap()).await.unwrap();
-        let destination = catalog::validate_destination_draft(&pool, destination.id).await.unwrap();
-        let body = |pipeline: Uuid, wait: bool| serde_json::json!({
-            "pipelineId": pipeline, "sourceId": source.id, "sourceRevision": source.current_revision,
-            "destinationId": destination.id, "destinationRevision": destination.current_revision, "allowWaiting": wait
-        });
+        let source = catalog::create_source(
+            &pool,
+            "wait API source",
+            source_profile.adapter_id(),
+            serde_json::to_value(&source_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let source = catalog::validate_source_draft(&pool, source.id)
+            .await
+            .unwrap();
+        let destination = catalog::create_destination(
+            &pool,
+            "wait API destination",
+            destination_profile.adapter_id(),
+            serde_json::to_value(&destination_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let destination = catalog::validate_destination_draft(&pool, destination.id)
+            .await
+            .unwrap();
+        let body = |pipeline: Uuid, wait: bool| {
+            serde_json::json!({
+                "pipelineId": pipeline, "sourceId": source.id, "sourceRevision": source.current_revision,
+                "destinationId": destination.id, "destinationRevision": destination.current_revision, "allowWaiting": wait
+            })
+        };
         let app = router_with_database(pool.clone());
-        let (status, immediate) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(Uuid::new_v4()), Some(body(Uuid::new_v4(), false))).await;
+        let (status, immediate) = call(
+            &app,
+            "POST",
+            "/api/v1/routes/plan-assignment",
+            Some(Uuid::new_v4()),
+            Some(body(Uuid::new_v4(), false)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(immediate["state"], "unavailable");
         assert!(immediate.get("requestId").is_none());
         let key = Uuid::new_v4();
         let request = body(Uuid::new_v4(), true);
-        let (_, waiting) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(key), Some(request.clone())).await;
+        let (_, waiting) = call(
+            &app,
+            "POST",
+            "/api/v1/routes/plan-assignment",
+            Some(key),
+            Some(request.clone()),
+        )
+        .await;
         assert_eq!(waiting["state"], "waiting");
         assert!(waiting["expiresAt"].is_string());
         let id = waiting["requestId"].as_str().unwrap();
         let path = format!("/api/v1/capacity-requests/{id}");
         let (_, cancelled) = call(&app, "POST", &format!("{path}/cancel"), None, None).await;
         assert_eq!(cancelled["state"], "cancelled");
-        let (_, replay) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(key), Some(request.clone())).await;
+        let (_, replay) = call(
+            &app,
+            "POST",
+            "/api/v1/routes/plan-assignment",
+            Some(key),
+            Some(request.clone()),
+        )
+        .await;
         assert_eq!(replay["state"], "cancelled");
         let mut changed = request.clone();
         changed["allowWaiting"] = false.into();
-        assert_eq!(call(&app, "POST", "/api/v1/routes/plan-assignment", Some(key), Some(changed)).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/api/v1/routes/plan-assignment",
+                Some(key),
+                Some(changed)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
 
         let expired_key = Uuid::new_v4();
         let expired_body = body(Uuid::new_v4(), true);
-        let (_, expired) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(expired_key), Some(expired_body.clone())).await;
+        let (_, expired) = call(
+            &app,
+            "POST",
+            "/api/v1/routes/plan-assignment",
+            Some(expired_key),
+            Some(expired_body.clone()),
+        )
+        .await;
         let expired_id = Uuid::parse_str(expired["requestId"].as_str().unwrap()).unwrap();
         sqlx::query("UPDATE capacity_wait_requests SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE request_id = $1")
             .bind(expired_id).execute(&pool).await.unwrap();
-        let (_, expired) = call(&app, "GET", &format!("/api/v1/capacity-requests/{expired_id}"), None, None).await;
+        let (_, expired) = call(
+            &app,
+            "GET",
+            &format!("/api/v1/capacity-requests/{expired_id}"),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(expired["state"], "unavailable");
         assert_eq!(expired["reason"], "expired");
-        let (_, replay) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(expired_key), Some(expired_body)).await;
+        let (_, replay) = call(
+            &app,
+            "POST",
+            "/api/v1/routes/plan-assignment",
+            Some(expired_key),
+            Some(expired_body),
+        )
+        .await;
         assert_eq!(replay["state"], "unavailable");
         assert_eq!(replay["reason"], "expired");
 
-        let (_, first) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(Uuid::new_v4()), Some(body(Uuid::new_v4(), true))).await;
-        let (_, second) = call(&app, "POST", "/api/v1/routes/plan-assignment", Some(Uuid::new_v4()), Some(body(Uuid::new_v4(), true))).await;
-        let first_path = format!("/api/v1/capacity-requests/{}", first["requestId"].as_str().unwrap());
-        let second_path = format!("/api/v1/capacity-requests/{}", second["requestId"].as_str().unwrap());
+        let (_, first) = call(
+            &app,
+            "POST",
+            "/api/v1/routes/plan-assignment",
+            Some(Uuid::new_v4()),
+            Some(body(Uuid::new_v4(), true)),
+        )
+        .await;
+        let (_, second) = call(
+            &app,
+            "POST",
+            "/api/v1/routes/plan-assignment",
+            Some(Uuid::new_v4()),
+            Some(body(Uuid::new_v4(), true)),
+        )
+        .await;
+        let first_path = format!(
+            "/api/v1/capacity-requests/{}",
+            first["requestId"].as_str().unwrap()
+        );
+        let second_path = format!(
+            "/api/v1/capacity-requests/{}",
+            second["requestId"].as_str().unwrap()
+        );
         drop(app);
         let worker_id = Uuid::new_v4();
         let registry = PgWorkerRegistry::new(pool.clone());
         let mut worker = Worker {
-            id: worker_id, stable_name: format!("wait-api-{worker_id}"), version: "1".into(),
+            id: worker_id,
+            stable_name: format!("wait-api-{worker_id}"),
+            version: "1".into(),
             state: WorkerState::Registering,
-            capabilities: WorkerCapabilities { platform: Some(Platform::Linux), architecture: Some(Architecture::X86_64),
-                source_adapters: BTreeSet::from(["rtp_l16".into()]), destination_adapters: BTreeSet::from(["rtp_l16".into()]), ..WorkerCapabilities::default() },
-            capacity: WorkerCapacity { total_capacity_units: 2, assigned_capacity_units: 0, cpu_utilization_ratio: None,
-                memory_utilization_ratio: None, ingress_bits_per_second: None, egress_bits_per_second: None },
+            capabilities: WorkerCapabilities {
+                platform: Some(Platform::Linux),
+                architecture: Some(Architecture::X86_64),
+                source_adapters: BTreeSet::from(["rtp_l16".into()]),
+                destination_adapters: BTreeSet::from(["rtp_l16".into()]),
+                ..WorkerCapabilities::default()
+            },
+            capacity: WorkerCapacity {
+                total_capacity_units: 2,
+                assigned_capacity_units: 0,
+                cpu_utilization_ratio: None,
+                memory_utilization_ratio: None,
+                ingress_bits_per_second: None,
+                egress_bits_per_second: None,
+            },
             last_heartbeat: Utc::now(),
         };
         registry.register(worker.clone()).await.unwrap();
@@ -2182,29 +4793,55 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let (_, status) = call(&app, "GET", &first_path, None, None).await;
-                if status["state"] == "planned" { break; }
+                if status["state"] == "planned" {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-        }).await.unwrap();
-        assert_eq!(call(&app, "GET", &second_path, None, None).await.1["state"], "waiting");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            call(&app, "GET", &second_path, None, None).await.1["state"],
+            "waiting"
+        );
         sqlx::query("ALTER TABLE workers DISABLE TRIGGER capacity_workers_changed")
-            .execute(&pool).await.unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         worker.capacity.total_capacity_units = 4;
         registry.heartbeat(worker).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let (_, status) = call(&app, "GET", &second_path, None, None).await;
-                if status["state"] == "planned" { break; }
+                if status["state"] == "planned" {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         sqlx::query("ALTER TABLE workers ENABLE TRIGGER capacity_workers_changed")
-            .execute(&pool).await.unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
         let (_, terminal) = call(&app, "POST", &format!("{second_path}/cancel"), None, None).await;
         assert_eq!(terminal["state"], "planned");
         assert!(terminal["assignment"]["id"].is_string());
-        assert_eq!(call(&app, "GET", &format!("/api/v1/capacity-requests/{}", Uuid::new_v4()), None, None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            call(
+                &app,
+                "GET",
+                &format!("/api/v1/capacity-requests/{}", Uuid::new_v4()),
+                None,
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
@@ -2361,6 +4998,32 @@ mod tests {
         let changed_error: Value = serde_json::from_slice(&changed_body).unwrap();
         assert_eq!(changed_error["code"], "idempotency_key_reused");
 
+        let competing_request = serde_json::json!({
+            "pipelineId": Uuid::new_v4(),
+            "sourceId": source.id,
+            "sourceRevision": source.current_revision,
+            "destinationId": destination.id,
+            "destinationRevision": destination.current_revision,
+        });
+        let competing_response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/plan-assignment")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(competing_request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(competing_response.status(), StatusCode::CONFLICT);
+        let competing_body = to_bytes(competing_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let competing_error: Value = serde_json::from_slice(&competing_body).unwrap();
+        assert_eq!(competing_error["code"], "destination_in_use");
+
         let assignment_id = value["assignment"]["id"].as_str().unwrap();
         let generation = value["assignment"]["generation"].as_i64().unwrap();
 
@@ -2486,14 +5149,12 @@ mod tests {
         gstreamer::init().expect("GStreamer initializes");
 
         let loopback = Ipv4Addr::LOCALHOST;
-        let rtp_reservation =
-            UdpSocket::bind((loopback, 0)).expect("RTP source port reserves");
+        let rtp_reservation = UdpSocket::bind((loopback, 0)).expect("RTP source port reserves");
         let rtp_port = rtp_reservation
             .local_addr()
             .expect("RTP source port is available")
             .port();
-        let srt_reservation =
-            UdpSocket::bind((loopback, 0)).expect("SRT listener port reserves");
+        let srt_reservation = UdpSocket::bind((loopback, 0)).expect("SRT listener port reserves");
         let srt_port = srt_reservation
             .local_addr()
             .expect("SRT listener port is available")
@@ -2524,9 +5185,15 @@ mod tests {
             last_heartbeat: Utc::now(),
         };
         let registry = PgWorkerRegistry::new(pool.clone());
-        registry.register(worker.clone()).await.expect("worker registers");
+        registry
+            .register(worker.clone())
+            .await
+            .expect("worker registers");
         worker.state = WorkerState::Accepting;
-        registry.heartbeat(worker).await.expect("worker becomes eligible");
+        registry
+            .heartbeat(worker)
+            .await
+            .expect("worker becomes eligible");
 
         let source_profile = SourceMediaProfile::RtpMp2t {
             bind_address: loopback.into(),
@@ -2561,10 +5228,7 @@ mod tests {
             .expect("destination validates");
 
         let receiver_source = gstreamer::ElementFactory::make("srtsrc")
-            .property(
-                "uri",
-                format!("srt://127.0.0.1:{srt_port}?mode=listener"),
-            )
+            .property("uri", format!("srt://127.0.0.1:{srt_port}?mode=listener"))
             .build()
             .expect("SRT receiver builds");
         let receiver_sink = AppSink::builder().sync(false).build();
@@ -2608,7 +5272,8 @@ mod tests {
                 .expect("API server runs");
         });
 
-        let media_pipeline = Arc::new(GstreamerMediaPipeline::new().expect("worker GStreamer initializes"));
+        let media_pipeline =
+            Arc::new(GstreamerMediaPipeline::new().expect("worker GStreamer initializes"));
         let worker_client = WorkerControlClient::new(
             WorkerControlClientConfig {
                 endpoint: format!("ws://{address}/api/v1/workers/control"),
@@ -2831,6 +5496,10 @@ mod tests {
         let destination = catalog::validate_destination_draft(&pool, destination.id)
             .await
             .expect("destination validates");
+        PgRoutes::new(pool.clone())
+            .set_desired_route(source.id, destination.id, 0, false)
+            .await
+            .expect("desired route saves");
         let second_destination_profile = DestinationMediaProfile::RtpL16 {
             address,
             port: 5104,
@@ -2960,6 +5629,17 @@ mod tests {
                 .expect("reset destination state reads");
         assert_eq!(reset_source_state, "disabled");
         assert_eq!(reset_destination_state, "disabled");
+        let observations_before_start: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM route_events AS event \
+             JOIN route_instances AS route ON route.id = event.route_instance_id \
+             WHERE route.source_id = $1 AND route.destination_id = $2",
+        )
+        .bind(source.id)
+        .bind(destination.id)
+        .fetch_one(&pool)
+        .await
+        .expect("route observations read");
+        assert_eq!(observations_before_start, 0);
 
         let (mut socket, _) = connect_async(worker_websocket_request(
             address,
@@ -2999,31 +5679,27 @@ mod tests {
             .expect("start request builds");
         let start_app = app.clone();
         let start_task = tokio::spawn(async move { start_app.oneshot(start_request).await });
-        let message = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            socket.next(),
-        )
-        .await
-        {
-            Ok(Some(Ok(message))) => message,
-            Ok(Some(Err(error))) => panic!("worker control message fails: {error}"),
-            Ok(None) => panic!("worker control session closes before Start"),
-            Err(_) if start_task.is_finished() => {
-                let response = start_task
-                    .await
-                    .expect("start request task joins")
-                    .expect("start request completes");
-                let status = response.status();
-                let body = to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .expect("failed Start response reads");
-                panic!(
-                    "Start endpoint returned {status} without dispatching a command: {}",
-                    String::from_utf8_lossy(&body)
-                );
-            }
-            Err(_) => panic!("worker does not receive Start command before timeout"),
-        };
+        let message =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), socket.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(error))) => panic!("worker control message fails: {error}"),
+                Ok(None) => panic!("worker control session closes before Start"),
+                Err(_) if start_task.is_finished() => {
+                    let response = start_task
+                        .await
+                        .expect("start request task joins")
+                        .expect("start request completes");
+                    let status = response.status();
+                    let body = to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("failed Start response reads");
+                    panic!(
+                        "Start endpoint returned {status} without dispatching a command: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                Err(_) => panic!("worker does not receive Start command before timeout"),
+            };
         let ClientMessage::Text(message) = message else {
             panic!("expected a text Start command");
         };
@@ -3047,6 +5723,11 @@ mod tests {
             command["payload"]["specification"]["configuration"]["source"],
             serde_json::to_value(source_profile).expect("source profile serializes")
         );
+        let routes_before_start_ack = PgRoutes::new(pool.clone())
+            .list_current()
+            .await
+            .expect("route state reads before Start acknowledgement");
+        assert_eq!(routes_before_start_ack[0].observed_state, "unknown");
         let starting_source_state: String =
             sqlx::query_scalar("SELECT desired_state FROM sources WHERE id = $1")
                 .bind(source.id)
@@ -3069,6 +5750,8 @@ mod tests {
             command_id: assignment_id,
             outcome: arc_shared::WorkerCommandOutcome::Completed,
             current_generation: None,
+            error_code: None,
+            error_message: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -3091,6 +5774,32 @@ mod tests {
             serde_json::from_slice(&start_body).expect("start response is valid JSON");
         assert_eq!(started["desiredState"], "running");
         assert_eq!(started["observedState"], "running");
+
+        let routes_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/routes")
+                    .body(Body::empty())
+                    .expect("routes request builds"),
+            )
+            .await
+            .expect("routes request completes");
+        assert_eq!(routes_response.status(), StatusCode::OK);
+        let routes_body = to_bytes(routes_response.into_body(), usize::MAX)
+            .await
+            .expect("routes response reads");
+        let routes: Value =
+            serde_json::from_slice(&routes_body).expect("routes response is valid JSON");
+        assert_eq!(routes["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(routes["items"][0]["sourceId"], source.id.to_string());
+        assert_eq!(routes["items"][0]["desiredState"], "desired");
+        assert_eq!(routes["items"][0]["observedState"], "running");
+        assert_eq!(
+            routes["items"][0]["observedSourceId"],
+            source.id.to_string()
+        );
 
         let repeat_start = app
             .clone()
@@ -3169,9 +5878,7 @@ mod tests {
 
         let second_start_request = Request::builder()
             .method("POST")
-            .uri(format!(
-                "/api/v1/assignments/{second_assignment_id}/start"
-            ))
+            .uri(format!("/api/v1/assignments/{second_assignment_id}/start"))
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({ "generation": second_generation }).to_string(),
@@ -3206,6 +5913,8 @@ mod tests {
             command_id: second_assignment_id,
             outcome: arc_shared::WorkerCommandOutcome::Completed,
             current_generation: None,
+            error_code: None,
+            error_message: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -3277,6 +5986,38 @@ mod tests {
                 .await
                 .expect("reservation state reads");
         assert_eq!(reservation_state, "reserved");
+        let routes_before_stop_ack = PgRoutes::new(pool.clone())
+            .list_current()
+            .await
+            .expect("route state reads before Stop acknowledgement");
+        assert_eq!(routes_before_stop_ack[0].observed_state, "running");
+        let competing_plan = serde_json::json!({
+            "pipelineId": Uuid::new_v4(),
+            "sourceId": source.id,
+            "sourceRevision": source.current_revision,
+            "destinationId": destination.id,
+            "destinationRevision": destination.current_revision,
+        });
+        let competing_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/plan-assignment")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(competing_plan.to_string()))
+                    .expect("competing plan request builds"),
+            )
+            .await
+            .expect("competing plan request completes");
+        assert_eq!(competing_response.status(), StatusCode::CONFLICT);
+        let competing_body = to_bytes(competing_response.into_body(), usize::MAX)
+            .await
+            .expect("competing plan response reads");
+        let competing_error: Value =
+            serde_json::from_slice(&competing_body).expect("competing plan error is valid JSON");
+        assert_eq!(competing_error["code"], "destination_in_use");
 
         let acknowledgement = arc_shared::WorkerCommandAcknowledgement {
             kind: arc_shared::WorkerSessionMessageKind::CommandAck,
@@ -3285,6 +6026,8 @@ mod tests {
             command_id: stop_command_id,
             outcome: arc_shared::WorkerCommandOutcome::Completed,
             current_generation: None,
+            error_code: None,
+            error_message: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -3307,6 +6050,29 @@ mod tests {
             serde_json::from_slice(&stop_body).expect("stop response is valid JSON");
         assert_eq!(stopped["desiredState"], "stopped");
         assert_eq!(stopped["observedState"], "stopped");
+        let routes_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/routes")
+                    .body(Body::empty())
+                    .expect("stopped routes request builds"),
+            )
+            .await
+            .expect("stopped routes request completes");
+        assert_eq!(routes_response.status(), StatusCode::OK);
+        let routes_body = to_bytes(routes_response.into_body(), usize::MAX)
+            .await
+            .expect("stopped routes response reads");
+        let routes: Value =
+            serde_json::from_slice(&routes_body).expect("stopped routes response is valid JSON");
+        assert_eq!(routes["items"][0]["desiredState"], "desired");
+        assert_eq!(routes["items"][0]["observedState"], "stopped");
+        assert_eq!(
+            routes["items"][0]["observedSourceId"],
+            source.id.to_string()
+        );
         let stopped_source_state: String =
             sqlx::query_scalar("SELECT desired_state FROM sources WHERE id = $1")
                 .bind(source.id)
@@ -3376,9 +6142,7 @@ mod tests {
 
         let second_stop_request = Request::builder()
             .method("POST")
-            .uri(format!(
-                "/api/v1/assignments/{second_assignment_id}/stop"
-            ))
+            .uri(format!("/api/v1/assignments/{second_assignment_id}/stop"))
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({ "generation": second_generation }).to_string(),
@@ -3412,6 +6176,8 @@ mod tests {
             command_id: second_stop_command_id,
             outcome: arc_shared::WorkerCommandOutcome::Completed,
             current_generation: None,
+            error_code: None,
+            error_message: None,
         };
         socket
             .send(ClientMessage::Text(

@@ -78,15 +78,38 @@ where
 {
     let worker_id = command.worker_id;
     let command_id = command.command_id;
-    let decision = dispatch_if_fresh(store, authenticated_worker_id, command, handler).await?;
-    let (outcome, current_generation) = match decision {
-        CommandDispatchResult::Applied | CommandDispatchResult::Duplicate => {
-            (WorkerCommandOutcome::Completed, None)
-        }
-        CommandDispatchResult::Stale { current_generation } => {
-            (WorkerCommandOutcome::Stale, Some(current_generation))
-        }
+    command
+        .validate_for_worker(authenticated_worker_id)
+        .map_err(command_validation_error)?;
+    let identity = WorkerCommandIdentity {
+        command_id,
+        worker_id,
+        pipeline_id: command.pipeline_id,
+        assignment_id: command.assignment_id,
+        generation: command.generation,
     };
+    let (outcome, current_generation, error_code, error_message) =
+        match store.begin_command(identity).await? {
+            CommandFenceDecision::Duplicate => (WorkerCommandOutcome::Completed, None, None, None),
+            CommandFenceDecision::Stale { current_generation } => (
+                WorkerCommandOutcome::Stale,
+                Some(current_generation),
+                None,
+                None,
+            ),
+            CommandFenceDecision::Process => match handler(command).await {
+                Ok(()) => {
+                    store.complete_command(command_id).await?;
+                    (WorkerCommandOutcome::Completed, None, None, None)
+                }
+                Err(error) => (
+                    WorkerCommandOutcome::Failed,
+                    None,
+                    Some(error.code.to_owned()),
+                    Some(error.message.chars().take(512).collect()),
+                ),
+            },
+        };
     Ok(WorkerCommandAcknowledgement {
         kind: WorkerSessionMessageKind::CommandAck,
         protocol_version: WORKER_PROTOCOL_VERSION,
@@ -94,6 +117,8 @@ where
         command_id,
         outcome,
         current_generation,
+        error_code,
+        error_message,
     })
 }
 
@@ -321,6 +346,49 @@ mod tests {
         assert_eq!(stale.outcome, WorkerCommandOutcome::Stale);
         assert_eq!(stale.current_generation, Some(4));
         assert_eq!(*handled.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_receiver_acknowledges_execution_failure_without_completing_command() {
+        let store = TestGenerationStore::default();
+        let worker_id = Uuid::new_v4();
+        let pipeline_id = Uuid::new_v4();
+        let assignment_id = Uuid::new_v4();
+        let command_id = Uuid::new_v4();
+        let acknowledgement = receive_worker_command(
+            &store,
+            worker_id,
+            command(worker_id, pipeline_id, assignment_id, 1, command_id),
+            |_| async {
+                Err(PortError {
+                    code: "media_start_failed",
+                    message: "pipeline failed to start".to_owned(),
+                })
+            },
+        )
+        .await
+        .expect("execution failure is acknowledged");
+
+        assert_eq!(acknowledgement.outcome, WorkerCommandOutcome::Failed);
+        assert_eq!(acknowledgement.current_generation, None);
+        assert_eq!(
+            acknowledgement.error_code.as_deref(),
+            Some("media_start_failed")
+        );
+        assert_eq!(
+            acknowledgement.error_message.as_deref(),
+            Some("pipeline failed to start")
+        );
+
+        let retried = receive_worker_command(
+            &store,
+            worker_id,
+            command(worker_id, pipeline_id, assignment_id, 1, command_id),
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("incomplete command can be retried");
+        assert_eq!(retried.outcome, WorkerCommandOutcome::Completed);
     }
 
     #[tokio::test]

@@ -6,7 +6,10 @@ use serde_json::Value;
 use sqlx::{types::Json, FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::worker_registry::{error_with, WorkerRow};
+use crate::{
+    capacity_reservations::reservation_capacity_totals,
+    worker_registry::{error_with, WorkerRow},
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,14 +258,11 @@ impl PgAssignments {
             });
         }
 
-        let reserved: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(capacity_units), 0)::bigint FROM worker_capacity_reservations \
-             WHERE worker_id = $1 AND state = 'reserved'",
-        )
-        .bind(worker_id)
-        .fetch_one(&mut **transaction)
-        .await
-        .map_err(|error| error_with("database_error", error))?;
+        let pending_route =
+            route.map(|route| (reservation_id, route.source_id, route.source_revision));
+        let totals =
+            reservation_capacity_totals(&mut **transaction, Some(worker_id), pending_route).await?;
+        let reserved = totals.get(&worker_id).copied().unwrap_or_default();
         let assigned = i128::from(worker.capacity.assigned_capacity_units) + i128::from(reserved);
         if assigned > i128::from(worker.capacity.total_capacity_units) || reserved < 0 {
             return Err(PortError {
@@ -365,7 +365,8 @@ impl PgAssignments {
              destination_revision, media_path, route_configuration, desired_state, \
              observed_state FROM pipeline_assignments \
              WHERE resource_type = 'pipeline' AND worker_id = $1 \
-             AND ((desired_state = 'running' AND observed_state IN ('starting', 'running')) \
+             AND ((desired_state = 'running' AND observed_state IN \
+                   ('starting', 'running', 'failed', 'degraded')) \
                OR (desired_state = 'stopped' AND observed_state = 'stopping')) \
              ORDER BY id",
         )
@@ -373,10 +374,7 @@ impl PgAssignments {
         .fetch_all(&self.pool)
         .await
         .map_err(|error| error_with("database_error", error))?;
-        rows
-            .into_iter()
-            .map(AssignmentSnapshot::try_from)
-            .collect()
+        rows.into_iter().map(AssignmentSnapshot::try_from).collect()
     }
 
     pub async fn get_by_pipeline(
@@ -457,11 +455,7 @@ impl PgAssignments {
             message: "pipeline assignment does not exist".to_owned(),
         })?;
         let initial_snapshot = AssignmentSnapshot::try_from(row)?;
-        lock_route_resources(
-            &mut transaction,
-            initial_snapshot.assignment.route.as_ref(),
-        )
-        .await?;
+        lock_route_resources(&mut transaction, initial_snapshot.assignment.route.as_ref()).await?;
         let row = sqlx::query_as::<_, AssignmentSnapshotRow>(
             "SELECT id, resource_id AS pipeline_id, worker_id, generation, \
              reservation_id, requirements, source_id, source_revision, destination_id, \
@@ -535,29 +529,41 @@ impl PgAssignments {
         assignment_id: Uuid,
         generation: i64,
     ) -> PortResult<AssignmentSnapshot> {
-        let updated = sqlx::query(
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        let row = sqlx::query_as::<_, AssignmentSnapshotRow>(
             "UPDATE pipeline_assignments SET observed_state = 'running', \
              updated_at = clock_timestamp() \
              WHERE id = $1 AND resource_type = 'pipeline' AND generation = $2 \
-             AND desired_state = 'running' AND observed_state IN ('starting', 'running')",
+             AND desired_state = 'running' AND observed_state IN ('starting', 'running') \
+             RETURNING id, resource_id AS pipeline_id, worker_id, generation, \
+             reservation_id, requirements, source_id, source_revision, destination_id, \
+             destination_revision, media_path, route_configuration, desired_state, observed_state",
         )
         .bind(assignment_id)
         .bind(generation)
-        .execute(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|error| error_with("database_error", error))?;
-        if updated.rows_affected() != 1 {
-            return Err(PortError {
-                code: "assignment_conflict",
-                message: "assignment state changed before Start was acknowledged".to_owned(),
-            });
-        }
-        self.get_by_id(assignment_id)
-            .await?
-            .ok_or_else(|| PortError {
-                code: "assignment_not_found",
-                message: "pipeline assignment does not exist".to_owned(),
-            })
+        let row = row.ok_or_else(|| PortError {
+            code: "assignment_conflict",
+            message: "assignment state changed before Start was acknowledged".to_owned(),
+        })?;
+        let snapshot = AssignmentSnapshot::try_from(row)?;
+        record_route_observation(
+            &mut transaction,
+            snapshot.assignment.route.as_ref(),
+            "running",
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        Ok(snapshot)
     }
 
     pub async fn reset_start(&self, assignment_id: Uuid, generation: i64) -> PortResult<()> {
@@ -588,11 +594,7 @@ impl PgAssignments {
                 message: "assignment generation does not match the requested generation".to_owned(),
             });
         }
-        lock_route_resources(
-            &mut transaction,
-            initial_snapshot.assignment.route.as_ref(),
-        )
-        .await?;
+        lock_route_resources(&mut transaction, initial_snapshot.assignment.route.as_ref()).await?;
         let row = sqlx::query_as::<_, AssignmentSnapshotRow>(
             "SELECT id, resource_id AS pipeline_id, worker_id, generation, \
              reservation_id, requirements, source_id, source_revision, destination_id, \
@@ -732,6 +734,79 @@ impl PgAssignments {
         Ok(snapshot)
     }
 
+    pub async fn reset_failed_stop(
+        &self,
+        assignment_id: Uuid,
+        generation: i64,
+    ) -> PortResult<AssignmentSnapshot> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        let row = sqlx::query_as::<_, AssignmentSnapshotRow>(
+            "SELECT id, resource_id AS pipeline_id, worker_id, generation, \
+             reservation_id, requirements, source_id, source_revision, destination_id, \
+             destination_revision, media_path, route_configuration, desired_state, \
+             observed_state FROM pipeline_assignments \
+             WHERE id = $1 AND resource_type = 'pipeline'",
+        )
+        .bind(assignment_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| error_with("database_error", error))?
+        .ok_or_else(|| PortError {
+            code: "assignment_not_found",
+            message: "pipeline assignment does not exist".to_owned(),
+        })?;
+        let initial_snapshot = AssignmentSnapshot::try_from(row)?;
+        if initial_snapshot.assignment.generation != generation {
+            return Err(PortError {
+                code: "assignment_conflict",
+                message: "assignment generation does not match the requested generation".to_owned(),
+            });
+        }
+        lock_route_resources(&mut transaction, initial_snapshot.assignment.route.as_ref()).await?;
+        let row = sqlx::query_as::<_, AssignmentSnapshotRow>(
+            "UPDATE pipeline_assignments SET desired_state = 'running', \
+             observed_state = 'degraded', updated_at = clock_timestamp() \
+             WHERE id = $1 AND generation = $2 AND desired_state = 'stopped' \
+               AND observed_state = 'stopping' \
+             RETURNING id, resource_id AS pipeline_id, worker_id, generation, \
+             reservation_id, requirements, source_id, source_revision, destination_id, \
+             destination_revision, media_path, route_configuration, desired_state, \
+             observed_state",
+        )
+        .bind(assignment_id)
+        .bind(generation)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| error_with("database_error", error))?
+        .ok_or_else(|| PortError {
+            code: "assignment_conflict",
+            message: "assignment state changed before failed Stop could be recovered".to_owned(),
+        })?;
+        let snapshot = AssignmentSnapshot::try_from(row)?;
+        record_route_observation(
+            &mut transaction,
+            snapshot.assignment.route.as_ref(),
+            "degraded",
+        )
+        .await?;
+        set_route_resources_desired_state(
+            &mut transaction,
+            assignment_id,
+            snapshot.assignment.route.as_ref(),
+            true,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| error_with("database_error", error))?;
+        Ok(snapshot)
+    }
+
     pub async fn mark_stopped(
         &self,
         assignment_id: Uuid,
@@ -764,11 +839,7 @@ impl PgAssignments {
             message: "pipeline assignment does not exist".to_owned(),
         })?;
         let initial_snapshot = AssignmentSnapshot::try_from(initial_row)?;
-        lock_route_resources(
-            &mut transaction,
-            initial_snapshot.assignment.route.as_ref(),
-        )
-        .await?;
+        lock_route_resources(&mut transaction, initial_snapshot.assignment.route.as_ref()).await?;
         sqlx::query("SELECT id FROM workers WHERE id = $1 FOR UPDATE")
             .bind(initial_snapshot.assignment.worker_id)
             .fetch_one(&mut *transaction)
@@ -805,7 +876,8 @@ impl PgAssignments {
                 message: "assignment state changed before Stop was acknowledged".to_owned(),
             });
         }
-        if snapshot.observed_state == "stopping" {
+        let newly_stopped = snapshot.observed_state == "stopping";
+        if newly_stopped {
             let updated = sqlx::query(
                 "UPDATE pipeline_assignments SET observed_state = 'stopped', \
                  updated_at = clock_timestamp() \
@@ -823,6 +895,12 @@ impl PgAssignments {
                     message: "assignment state changed before Stop was acknowledged".to_owned(),
                 });
             }
+            record_route_observation(
+                &mut transaction,
+                snapshot.assignment.route.as_ref(),
+                "stopped",
+            )
+            .await?;
         }
         release_reservation_in_transaction(&mut transaction, snapshot.assignment.reservation_id)
             .await?;
@@ -879,11 +957,7 @@ impl PgAssignments {
                 .map_err(|error| error_with("database_error", error))?;
             return Ok(());
         }
-        lock_route_resources(
-            &mut transaction,
-            initial_snapshot.assignment.route.as_ref(),
-        )
-        .await?;
+        lock_route_resources(&mut transaction, initial_snapshot.assignment.route.as_ref()).await?;
         sqlx::query("SELECT id FROM workers WHERE id = $1 FOR UPDATE")
             .bind(initial_snapshot.assignment.worker_id)
             .fetch_one(&mut *transaction)
@@ -919,6 +993,31 @@ impl PgAssignments {
             .map_err(|error| error_with("database_error", error))?;
         Ok(())
     }
+}
+
+async fn record_route_observation(
+    transaction: &mut Transaction<'_, Postgres>,
+    route: Option<&PlannedRouteConfig>,
+    observed_state: &str,
+) -> PortResult<()> {
+    let Some(route) = route else {
+        return Ok(());
+    };
+
+    sqlx::query(
+        "INSERT INTO route_events (id, route_instance_id, observed_state) \
+         SELECT $1, id, $4 FROM route_instances \
+         WHERE source_id = $2 AND destination_id = $3 \
+         ORDER BY route_revision DESC LIMIT 1",
+    )
+    .bind(Uuid::new_v4())
+    .bind(route.source_id)
+    .bind(route.destination_id)
+    .bind(observed_state)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| error_with("database_error", error))?;
+    Ok(())
 }
 
 async fn lock_route_resources(

@@ -100,10 +100,7 @@ impl WorkerCommandDispatcher {
         result
     }
 
-    pub(crate) async fn start_session(
-        &self,
-        worker_id: Uuid,
-    ) -> PortResult<WorkerControlSession> {
+    pub(crate) async fn start_session(&self, worker_id: Uuid) -> PortResult<WorkerControlSession> {
         let session_id = Uuid::new_v4();
         if let Some(pool) = &self.lease_pool {
             sqlx::query(
@@ -120,9 +117,7 @@ impl WorkerCommandDispatcher {
             .await
             .map_err(|error| PortError {
                 code: "worker_session_registration_failed",
-                message: format!(
-                    "worker control session lease could not be registered: {error}"
-                ),
+                message: format!("worker control session lease could not be registered: {error}"),
             })?;
         }
         let (command_sender, commands) = mpsc::channel(WORKER_COMMAND_QUEUE_CAPACITY);
@@ -219,6 +214,18 @@ impl WorkerCommandDispatcher {
                                     "stale_worker_command",
                                     "worker rejected a stale command generation",
                                 )),
+                                WorkerCommandOutcome::Failed => Err(session_error(
+                                    "worker_command_failed",
+                                    format!(
+                                        "{}: {}",
+                                        acknowledgement.error_code.as_deref().unwrap_or(
+                                            "worker_command_failed"
+                                        ),
+                                        acknowledgement.error_message.as_deref().unwrap_or(
+                                            "worker reported an execution failure"
+                                        )
+                                    ),
+                                )),
                             };
                             let _ = completion.send(result);
                         }
@@ -280,9 +287,7 @@ impl WorkerCommandDispatcher {
             .await
             .map_err(|error| PortError {
                 code: "worker_session_registration_failed",
-                message: format!(
-                    "worker control session lease could not be read: {error}"
-                ),
+                message: format!("worker control session lease could not be read: {error}"),
             })?;
             if current != Some(session_id) {
                 return Err(session_error(
@@ -369,10 +374,10 @@ impl WorkerCommandDispatcher {
     }
 }
 
-fn session_error(code: &'static str, message: &'static str) -> PortError {
+fn session_error(code: &'static str, message: impl Into<String>) -> PortError {
     PortError {
         code,
-        message: message.to_owned(),
+        message: message.into(),
     }
 }
 

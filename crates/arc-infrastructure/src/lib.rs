@@ -4,6 +4,7 @@ pub mod capacity_wait;
 pub mod catalog;
 pub mod pipeline_planning;
 pub mod postgres;
+pub mod routes;
 pub mod scheduler;
 pub mod worker_auth;
 pub mod worker_fencing;

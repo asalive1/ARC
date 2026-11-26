@@ -12,9 +12,15 @@ import {
   Card,
   CardContent,
   Chip,
+  Checkbox,
   CircularProgress,
   CssBaseline,
   Divider,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
   FormControlLabel,
   MenuItem,
   Paper,
@@ -26,6 +32,8 @@ import {
   createTheme,
 } from "@mui/material";
 
+import { CrosspointMatrix } from "./CrosspointMatrix";
+import { stageRouteSelection, type StagedRoute } from "./routeStaging";
 import {
   ApiRequestError,
   bootstrapAdmin,
@@ -40,11 +48,15 @@ import {
   fetchReadiness,
   fetchPipelineAssignment,
   fetchCapacityRequest,
+  fetchRoutes,
   fetchSources,
+  getRouteBatchOperation,
   loginAdmin,
   logoutAdmin,
   planRoute,
   planRouteAssignment,
+  setDesiredRoute,
+  setDesiredRoutesBatch,
   startAssignment as startAssignmentRequest,
   stopAssignment as stopAssignmentRequest,
   updateDestination as updateDestinationRequest,
@@ -56,7 +68,9 @@ import {
   type DestinationMediaProfile,
   type DestinationRecord,
   type PlanRouteAssignmentInput,
+  type RouteRecord,
   type RoutePlan,
+  type SetDesiredRouteInput,
   type SourceMediaProfile,
   type SourceRecord,
 } from "./api";
@@ -531,6 +545,10 @@ function WorkspaceApp({
     queryKey: ["destinations"],
     queryFn: () => fetchDestinations(apiBaseUrl),
   });
+  const routes = useQuery({
+    queryKey: ["routes"],
+    queryFn: () => fetchRoutes(apiBaseUrl),
+  });
   const createSource = useMutation({
     mutationFn: (input: {
       friendlyName: string;
@@ -796,7 +814,7 @@ function WorkspaceApp({
         <Box
           component="aside"
           sx={{
-            width: { xs: 188, md: 218 },
+            width: { xs: 220, md: 250 },
             flexShrink: 0,
             display: "flex",
             flexDirection: "column",
@@ -809,7 +827,7 @@ function WorkspaceApp({
             direction="row"
             spacing={1.25}
             alignItems="center"
-            sx={{ minHeight: 64, px: 2, borderBottom: 1, borderColor: "divider" }}
+            sx={{ minHeight: 88, px: 2, borderBottom: 1, borderColor: "divider" }}
           >
             <Box
               component="img"
@@ -820,7 +838,7 @@ function WorkspaceApp({
               }
               alt=""
               aria-hidden="true"
-              sx={{ width: 36, height: 36, objectFit: "contain", flexShrink: 0 }}
+              sx={{ width: 64, height: 64, objectFit: "contain", flexShrink: 0 }}
             />
             <Box>
               <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
@@ -833,31 +851,7 @@ function WorkspaceApp({
           </Stack>
 
           <Stack spacing={0.5} sx={{ px: 1.25, py: 2, flex: 1 }}>
-            <Typography
-              variant="overline"
-              color="text.secondary"
-              sx={{ px: 1.25, letterSpacing: 1.2 }}
-            >
-              Workspace
-            </Typography>
-            {navigation.slice(0, 1).map((item) => (
-              <NavigationItem
-                key={item.id}
-                label={item.label}
-                badge={item.badge}
-                selected={section === item.id}
-                onClick={() => setSection(item.id)}
-              />
-            ))}
-
-            <Typography
-              variant="overline"
-              color="text.secondary"
-              sx={{ px: 1.25, pt: 2.5, letterSpacing: 1.2 }}
-            >
-              Management
-            </Typography>
-            {navigation.slice(1).map((item) => (
+            {navigation.map((item) => (
               <NavigationItem
                 key={item.id}
                 label={item.label}
@@ -886,23 +880,17 @@ function WorkspaceApp({
           <Box
             component="header"
             sx={{
-              minHeight: 56,
+              minHeight: 88,
               px: { xs: 2, md: 3 },
               display: "flex",
               alignItems: "center",
-              justifyContent: "space-between",
+              justifyContent: "flex-end",
               gap: 2,
               borderBottom: 1,
               borderColor: "divider",
               bgcolor: "background.paper",
             }}
           >
-            <Typography variant="body2" color="text.secondary">
-              Local workspace <Box component="span" sx={{ px: 1 }}>›</Box>
-              <Box component="span" sx={{ color: "text.primary" }}>
-                {sectionTitles[section]}
-              </Box>
-            </Typography>
             <Stack direction="row" spacing={2} alignItems="center">
               <Stack direction="row" spacing={1} alignItems="center">
                 <Box
@@ -941,9 +929,6 @@ function WorkspaceApp({
                   </Typography>
                 }
               />
-              <Button size="small" onClick={() => void onLogout()}>
-                Sign out
-              </Button>
             </Stack>
           </Box>
 
@@ -979,13 +964,6 @@ function WorkspaceApp({
                 spacing={1}
               >
                 <Box>
-                  <Typography
-                    variant="overline"
-                    color="primary.main"
-                    sx={{ letterSpacing: 1.3, fontWeight: 700 }}
-                  >
-                    Operations workspace
-                  </Typography>
                   <Typography variant="h4" component="h1" sx={{ fontWeight: 650 }}>
                     {sectionTitles[section]}
                   </Typography>
@@ -1013,6 +991,9 @@ function WorkspaceApp({
                 <WorkspaceView
                   sources={sources.data ?? []}
                   destinations={destinations.data ?? []}
+                  routes={routes.data ?? []}
+                  routesLoading={routes.isLoading}
+                  routesError={routes.isError ? routes.error.message : ""}
                   selectedSourceId={selectedSource?.id ?? ""}
                   selectedDestinationId={selectedDestination?.id ?? ""}
                   assignmentRequest={assignmentRequest}
@@ -1212,6 +1193,9 @@ function NavigationItem({
 function WorkspaceView({
   sources,
   destinations,
+  routes,
+  routesLoading,
+  routesError,
   selectedSourceId,
   selectedDestinationId,
   assignmentRequest,
@@ -1225,6 +1209,9 @@ function WorkspaceView({
 }: {
   sources: SourceRecord[];
   destinations: DestinationRecord[];
+  routes: RouteRecord[];
+  routesLoading: boolean;
+  routesError: string;
   selectedSourceId: string;
   selectedDestinationId: string;
   assignmentRequest: PlanRouteAssignmentInput | undefined;
@@ -1250,12 +1237,115 @@ function WorkspaceView({
   const activePipelineId = assignmentRequest?.pipelineId;
   const capacityRequestId = assignmentRequest?.capacityRequestId;
   const [allowWaiting, setAllowWaiting] = useState(!!assignmentRequest?.allowWaiting);
+  const [routeMode, setRouteMode] = useState<"immediate" | "take">("immediate");
+  const [pendingTake, setPendingTake] = useState<StagedRoute[]>([]);
+  const [takeIdempotencyKey, setTakeIdempotencyKey] = useState<string>();
+  const [confirmTakeReplacements, setConfirmTakeReplacements] = useState(false);
+  const [routeBatchOrigin, setRouteBatchOrigin] = useState<"immediate" | "take">(
+    "take",
+  );
   const resultMatchesSelection =
     selectedSource !== undefined &&
     selectedDestination !== undefined &&
     routePlan.variables !== undefined &&
     JSON.stringify(routePlan.variables.source) === JSON.stringify(selectedSource.configuration) &&
     JSON.stringify(routePlan.variables.destination) === JSON.stringify(selectedDestination.configuration);
+  const [replaceRoute, setReplaceRoute] = useState<{
+    input: SetDesiredRouteInput;
+    sourceName: string;
+    destinationName: string;
+    replacedSourceName: string;
+    action: "save" | "execute";
+  } | null>(null);
+  const destinationRoute = routes.find(
+    (route) => route.destinationId === selectedDestination?.id,
+  );
+  const routeRequiresReplacement = (
+    currentRoute: RouteRecord | undefined,
+    sourceId: string,
+  ) =>
+    currentRoute !== undefined &&
+    ((currentRoute.desiredState === "desired" &&
+      currentRoute.sourceId !== sourceId) ||
+      (currentRoute.observedState !== "stopped" &&
+        currentRoute.observedSourceId !== undefined &&
+        currentRoute.observedSourceId !== sourceId));
+  const pendingTakeReplacements = pendingTake.filter((route) =>
+    routeRequiresReplacement(
+      routes.find((item) => item.destinationId === route.destinationId),
+      route.sourceId,
+    ),
+  );
+  const pendingTakeHasStaleRevision = pendingTake.some((route) => {
+    const currentRevision =
+      routes.find((item) => item.destinationId === route.destinationId)
+        ?.revision ?? 0;
+    return currentRevision !== route.expectedRouteRevision;
+  });
+  const routeReplacementRequired =
+    selectedSource !== undefined &&
+    routeRequiresReplacement(destinationRoute, selectedSource.id);
+  const routeAlreadyRunning =
+    destinationRoute?.observedState === "running" &&
+    destinationRoute.observedSourceId === selectedSource?.id;
+  const routeExecutionBlockReason =
+    destinationRoute &&
+    destinationRoute.desiredState !== "desired" &&
+    destinationRoute.observedState !== "stopped"
+      ? "This destination has route history that is still transitioning. Wait for it to stop before starting another source."
+      : undefined;
+  const routeWrite = useMutation({
+    mutationFn: (input: SetDesiredRouteInput) =>
+      setDesiredRoute(input, apiBaseUrl),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["routes"] });
+    },
+  });
+  const routeBatch = useMutation({
+    mutationFn: (input: {
+      routes: SetDesiredRouteInput[];
+      idempotencyKey: string;
+    }) =>
+      setDesiredRoutesBatch(
+        input.routes,
+        input.idempotencyKey,
+        apiBaseUrl,
+      ),
+    onSuccess: async () => {
+      setPendingTake([]);
+      setTakeIdempotencyKey(undefined);
+      setConfirmTakeReplacements(false);
+      await queryClient.invalidateQueries({ queryKey: ["routes"] });
+    },
+    onError: async (error) => {
+      if (error instanceof ApiRequestError && error.status === 409) {
+        await queryClient.invalidateQueries({ queryKey: ["routes"] });
+      }
+    },
+  });
+  const routeBatchStatus = useQuery({
+    queryKey: ["route-batch-operation", routeBatch.data?.operationId],
+    queryFn: () =>
+      getRouteBatchOperation(routeBatch.data!.operationId, apiBaseUrl),
+    enabled: routeBatch.data?.operationId !== undefined,
+    refetchInterval: (query) =>
+      query.state.data?.state === "pending" ||
+      query.state.data?.state === "running"
+        ? 1000
+        : false,
+    retry: false,
+  });
+  const routeBatchExecutionPending =
+    routeBatchStatus.data?.state === "pending" ||
+    routeBatchStatus.data?.state === "running" ||
+    routeBatch.data?.state === "pending" ||
+    routeBatch.data?.state === "running";
+  useEffect(() => {
+    const state = routeBatchStatus.data?.state;
+    if (state === "completed" || state === "partial" || state === "failed") {
+      void queryClient.invalidateQueries({ queryKey: ["routes"] });
+    }
+  }, [queryClient, routeBatchStatus.data?.state]);
   const assignmentPlan = useMutation({
     mutationFn: (input: PlanRouteAssignmentInput) =>
       planRouteAssignment(input, apiBaseUrl),
@@ -1384,6 +1474,80 @@ function WorkspaceView({
       ]);
     },
   });
+  const lifecycleActionPending =
+    start.isPending || stop.isPending || cancel.isPending;
+  const executeRoute = useMutation({
+    mutationFn: async (input: {
+      source: SourceRecord;
+      destination: DestinationRecord;
+    }) => {
+      const existingRoute = routes.find(
+        (route) => route.destinationId === input.destination.id,
+      );
+      if (
+        !existingRoute ||
+        existingRoute.desiredState !== "desired" ||
+        existingRoute.sourceId !== input.source.id
+      ) {
+        await routeWrite.mutateAsync({
+          sourceId: input.source.id,
+          destinationId: input.destination.id,
+          expectedRouteRevision: existingRoute?.revision ?? 0,
+          confirmReplace: false,
+        });
+      }
+
+      const assignmentInput: PlanRouteAssignmentInput = {
+        pipelineId: createPipelineId(),
+        idempotencyKey: createPipelineId(),
+        sourceId: input.source.id,
+        sourceRevision: input.source.currentRevision,
+        destinationId: input.destination.id,
+        destinationRevision: input.destination.currentRevision,
+      };
+      const planResult = await assignmentPlan
+        .mutateAsync(assignmentInput)
+        .catch((error: unknown) => {
+          const message =
+            error instanceof Error ? error.message : "unknown planning error";
+          throw new Error(
+            `Desired route is set, but worker planning failed: ${message}`,
+          );
+        });
+      if (planResult.state !== "planned" || !planResult.assignment) {
+        throw new Error(
+          `Desired route is set, but no worker assignment was created${
+            planResult.reason ? `: ${planResult.reason}` : "."
+          }`,
+        );
+      }
+
+      const assignment = planResult.assignment;
+      const snapshot = await start
+        .mutateAsync({
+          pipelineId: assignment.pipelineId,
+          assignmentId: assignment.id,
+          generation: assignment.generation,
+        })
+        .catch((error: unknown) => {
+          const message =
+            error instanceof Error ? error.message : "unknown worker error";
+          throw new Error(
+            `Desired route is set and planned, but worker Start was not confirmed: ${message}`,
+          );
+        });
+      return { snapshot, pipelineId: assignment.pipelineId };
+    },
+    onSuccess: async (result) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["routes"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["pipeline-assignment", result.pipelineId],
+        }),
+      ]);
+      routeWrite.reset();
+    },
+  });
   const assignmentVariables =
     assignmentPlan.variables ?? assignmentRequest;
   const assignmentPlanMatchesSelection =
@@ -1419,6 +1583,7 @@ function WorkspaceView({
     assignmentPlanResult?.state !== "unavailable" &&
     assignmentPlanResult?.state !== "cancelled";
   const canCreateAssignment =
+    routeMode === "immediate" &&
     selectedSource?.lifecycle === "validated" &&
     selectedDestination?.lifecycle === "validated" &&
     !assignmentPlan.isPending &&
@@ -1431,19 +1596,158 @@ function WorkspaceView({
     (!currentAssignment || currentAssignmentIsTerminal) &&
     (assignmentPlanResult?.assignment == null ||
       currentAssignmentIsTerminal);
-
-  const lifecycleActionPending =
-    start.isPending || stop.isPending || cancel.isPending;
+  const canExecuteSelectedRoute =
+    selectedSource?.lifecycle === "validated" &&
+    selectedDestination?.lifecycle === "validated" &&
+    !routesLoading &&
+    !routeWrite.isPending &&
+    !routeBatch.isPending &&
+    !routeBatchExecutionPending &&
+    !assignmentPlan.isPending &&
+    !waitPending &&
+    !lifecycleActionPending &&
+    !executeRoute.isPending &&
+    !routeExecutionBlockReason &&
+    !routeAlreadyRunning &&
+    (routeReplacementRequired ||
+      (canCreateAssignment &&
+        (!destinationRoute ||
+          (destinationRoute.desiredState === "desired" &&
+            destinationRoute.sourceId === selectedSource.id)) &&
+        destinationRoute?.observedState !== "running" &&
+        (!destinationRoute?.observedSourceId ||
+          destinationRoute.observedSourceId === selectedSource.id)));
+  const canSaveTake =
+    routeMode === "take" &&
+    pendingTake.length > 0 &&
+    !routesLoading &&
+    !pendingTakeHasStaleRevision &&
+    pendingTake.every((route) => {
+      const source = sources.find((item) => item.id === route.sourceId);
+      const destination = destinations.find(
+        (item) => item.id === route.destinationId,
+      );
+      return source?.lifecycle === "validated" &&
+        destination?.lifecycle === "validated";
+    }) &&
+    (pendingTakeReplacements.length === 0 || confirmTakeReplacements) &&
+    !routeBatch.isPending &&
+    !routeBatchExecutionPending &&
+    !routeWrite.isPending;
+  const routeBatchResult = routeBatchStatus.data ?? routeBatch.data;
+  const executeRouteMatchesSelection =
+    executeRoute.variables?.source.id === selectedSource?.id &&
+    executeRoute.variables?.destination.id === selectedDestination?.id;
 
   async function invalidateResourceRecords() {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["sources"] }),
       queryClient.invalidateQueries({ queryKey: ["destinations"] }),
+      queryClient.invalidateQueries({ queryKey: ["routes"] }),
     ]);
+  }
+
+  function submitDesiredRoute() {
+    if (
+      routeMode !== "immediate" ||
+      !selectedSource ||
+      !selectedDestination ||
+      !routePlan.isSuccess ||
+      !resultMatchesSelection ||
+      selectedSource.lifecycle !== "validated" ||
+      selectedDestination.lifecycle !== "validated"
+    ) {
+      return;
+    }
+
+    routeWrite.reset();
+    executeRoute.reset();
+    const input: SetDesiredRouteInput = {
+      sourceId: selectedSource.id,
+      destinationId: selectedDestination.id,
+      expectedRouteRevision: destinationRoute?.revision ?? 0,
+      confirmReplace: false,
+    };
+    if (
+      destinationRoute?.desiredState === "desired" &&
+      destinationRoute.sourceId !== selectedSource.id
+    ) {
+      const replacedSource = sources.find(
+        (source) => source.id === destinationRoute.sourceId,
+      );
+      setReplaceRoute({
+        input: { ...input, confirmReplace: true },
+        sourceName: selectedSource.friendlyName,
+        destinationName: selectedDestination.friendlyName,
+        replacedSourceName: replacedSource?.friendlyName ?? "another input",
+        action: "save",
+      });
+      return;
+    }
+    routeWrite.mutate(input);
+  }
+
+  function submitTake() {
+    if (!canSaveTake) return;
+    const idempotencyKey = takeIdempotencyKey ?? createPipelineId();
+    setTakeIdempotencyKey(idempotencyKey);
+    setRouteBatchOrigin("take");
+    routeBatch.mutate({
+      idempotencyKey,
+      routes: pendingTake.map((route) => {
+        const currentRoute = routes.find(
+          (item) => item.destinationId === route.destinationId,
+        );
+        return {
+          sourceId: route.sourceId,
+          destinationId: route.destinationId,
+          expectedRouteRevision: route.expectedRouteRevision,
+          confirmReplace: routeRequiresReplacement(currentRoute, route.sourceId),
+        };
+      }),
+    });
+  }
+
+  function submitImmediateRoute() {
+    if (
+      routeMode !== "immediate" ||
+      !selectedSource ||
+      !selectedDestination ||
+      !canExecuteSelectedRoute
+    ) {
+      return;
+    }
+
+    routeWrite.reset();
+    if (routeReplacementRequired) {
+      const replacedSource = sources.find(
+        (source) =>
+          source.id ===
+          (destinationRoute?.observedSourceId ?? destinationRoute?.sourceId),
+      );
+      setReplaceRoute({
+        input: {
+          sourceId: selectedSource.id,
+          destinationId: selectedDestination.id,
+          expectedRouteRevision: destinationRoute?.revision ?? 0,
+          confirmReplace: true,
+        },
+        sourceName: selectedSource.friendlyName,
+        destinationName: selectedDestination.friendlyName,
+        replacedSourceName: replacedSource?.friendlyName ?? "the current input",
+        action: "execute",
+      });
+      return;
+    }
+    executeRoute.mutate({
+      source: selectedSource,
+      destination: selectedDestination,
+    });
   }
 
   function submitAssignment() {
     if (
+      routeMode !== "immediate" ||
       !selectedSource ||
       !selectedDestination ||
       selectedSource.lifecycle !== "validated" ||
@@ -1508,42 +1812,446 @@ function WorkspaceView({
               />
             </Stack>
             <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-            The multi-route crosspoint editor remains planned. Create and
-            manage a single validated assignment below.
+              Select an input/output crosspoint. Immediate mode starts an
+              eligible route; Take mode stages selections for review.
             </Typography>
           </Box>
-          <Chip label="Matrix editor planned" size="small" />
+          <Chip label="Up to 64 × 64" size="small" />
         </Stack>
-        <Box
-          role="img"
-          aria-label="Decorative placeholder for the planned routing matrix"
+        <CrosspointMatrix
+          sources={sources}
+          destinations={destinations}
+          routes={routes}
+          routesLoading={routesLoading}
+          routesError={routesError}
+          selectedSourceId={selectedSourceId}
+          selectedDestinationId={selectedDestinationId}
+          onSelect={(sourceId, destinationId) => {
+            onSourceChange(sourceId);
+            onDestinationChange(destinationId);
+            if (routeMode === "take") {
+              const staged = stageRouteSelection(pendingTake, {
+                sourceId,
+                destinationId,
+                expectedRouteRevision:
+                  routes.find((route) => route.destinationId === destinationId)
+                    ?.revision ?? 0,
+              });
+              if (staged !== pendingTake) {
+                setPendingTake(staged);
+                setTakeIdempotencyKey(createPipelineId());
+                setConfirmTakeReplacements(false);
+                routeBatch.reset();
+              }
+            }
+          }}
+        />
+        <FormControlLabel
+          control={
+            <Switch
+              checked={routeMode === "take"}
+              disabled={pendingTake.length > 0}
+              onChange={(_, checked) =>
+                setRouteMode(checked ? "take" : "immediate")
+              }
+            />
+          }
+          label={
+            routeMode === "take"
+              ? "Take mode (stage changes)"
+              : "Immediate mode"
+          }
+        />
+        {routeMode === "take" && (
+          <Stack spacing={1.5} sx={{ mt: 2 }}>
+            <Alert severity="info">
+              A Take saves all desired routes atomically, then executes each
+              route independently. Confirmed replacements prepare the new path
+              before stopping the current route; failed preparation leaves the
+              current route untouched. After the hard cut, ARC attempts to
+              restore the previous route if the replacement cannot start.
+              Outcomes appear below; one route does not roll back successful
+              sibling routes.
+            </Alert>
+            {pendingTakeHasStaleRevision && (
+              <Alert severity="warning">
+                A destination changed after staging. Select its crosspoint
+                again to refresh the expected revision, or cancel the Take.
+              </Alert>
+            )}
+            {pendingTake.length === 0 ? (
+              <Typography variant="body2" color="text.secondary">
+                Select crosspoints in the matrix to add them to this Take.
+              </Typography>
+            ) : (
+              <Stack spacing={1}>
+                <Typography variant="subtitle2">
+                  Pending Take ({pendingTake.length})
+                </Typography>
+                {pendingTake.map((route) => {
+                  const source = sources.find(
+                    (item) => item.id === route.sourceId,
+                  );
+                  const destination = destinations.find(
+                    (item) => item.id === route.destinationId,
+                  );
+                  return (
+                    <Paper
+                      key={route.destinationId}
+                      variant="outlined"
+                      sx={{ p: 1.25 }}
+                    >
+                      <Stack
+                        direction="row"
+                        alignItems="center"
+                        justifyContent="space-between"
+                        spacing={1}
+                      >
+                        <Typography variant="body2">
+                          {source?.friendlyName ?? "Unavailable input"} →{" "}
+                          {destination?.friendlyName ?? "Unavailable output"}
+                        </Typography>
+                        <Button
+                          size="small"
+                          onClick={() => {
+                            setPendingTake((current) =>
+                              current.filter(
+                                (item) =>
+                                  item.destinationId !== route.destinationId,
+                              ),
+                            );
+                            setTakeIdempotencyKey(createPipelineId());
+                            setConfirmTakeReplacements(false);
+                            routeBatch.reset();
+                          }}
+                        >
+                          Remove
+                        </Button>
+                      </Stack>
+                    </Paper>
+                  );
+                })}
+              </Stack>
+            )}
+            {pendingTakeReplacements.length > 0 && (
+              <Stack spacing={1}>
+                <Alert severity="warning">
+                  This Take replaces the desired source for{" "}
+                  {pendingTakeReplacements.length} destination
+                  {pendingTakeReplacements.length === 1 ? "" : "s"}. Any
+                  active route will continue while ARC prepares its
+                  replacement. Switching is a hard cut, not a seamless
+                  crossfade; if the new route fails to start, ARC attempts to
+                  restore the previous route.
+                </Alert>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={confirmTakeReplacements}
+                      onChange={(_, checked) =>
+                        setConfirmTakeReplacements(checked)
+                      }
+                    />
+                  }
+                  label="Confirm replacing existing desired routes"
+                />
+              </Stack>
+            )}
+            {routeBatch.isError && (
+              <Alert severity="error">
+                {routeBatch.error instanceof ApiRequestError &&
+                routeBatch.error.status === 409
+                  ? "The batch conflicted with current route state. No changes were saved; refresh and re-stage the Take."
+                  : "The Take could not be confirmed. Retry it to safely reuse its operation key before staging a new Take."}
+              </Alert>
+            )}
+            {routeBatchStatus.isError && (
+              <Alert severity="error">
+                The Take was accepted, but its execution status could not be
+                refreshed. Operation {routeBatch.data?.operationId} remains
+                available for review.
+              </Alert>
+            )}
+            {routeBatch.isSuccess && routeBatchResult && (
+              <Alert
+                severity={
+                  routeBatchResult.state === "completed"
+                    ? "success"
+                    : routeBatchResult.state === "partial"
+                      ? "warning"
+                      : routeBatchResult.state === "failed"
+                        ? "error"
+                        : "info"
+                }
+              >
+                {routeBatchResult.state === "completed"
+                  ? `Take completed; ${routeBatchResult.results?.length ?? routeBatchResult.routes.length} route(s) were acknowledged by workers.`
+                  : routeBatchResult.state === "partial"
+                    ? "Take partially completed. Review the per-route outcomes below."
+                    : routeBatchResult.state === "failed"
+                      ? "Take failed. Review the per-route outcomes below."
+                      : routeBatchResult.state === "desired_state_applied"
+                        ? "Desired routes were saved, but this API has not reported worker execution."
+                        : routeBatchResult.state === "running"
+                          ? "Take execution is in progress. Waiting for worker acknowledgements."
+                          : "Take was durably accepted and is waiting for worker execution."}{" "}
+                (operation {routeBatchResult.operationId}).
+              </Alert>
+            )}
+            {(routeBatchResult?.results ?? []).map((result) => {
+              const source = sources.find((item) => item.id === result.sourceId);
+              const destination = destinations.find(
+                (item) => item.id === result.destinationId,
+              );
+              return (
+                <Alert
+                  key={result.destinationId}
+                  severity={
+                    result.state === "succeeded"
+                      ? "success"
+                      : result.state === "failed"
+                        ? "error"
+                        : "info"
+                  }
+                >
+                  {source?.friendlyName ?? "Unavailable input"} →{" "}
+                  {destination?.friendlyName ?? "Unavailable output"}:{" "}
+                  {result.state === "succeeded"
+                    ? "worker acknowledged Start"
+                    : result.state === "failed"
+                      ? `${result.errorCode ?? "execution_failed"} — ${result.errorMessage ?? "No further details are available."}`
+                      : result.errorMessage ??
+                        (result.state === "processing"
+                          ? "starting on a worker"
+                          : "waiting for a worker")}
+                </Alert>
+              );
+            })}
+            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+              <Button
+                variant="outlined"
+                disabled={pendingTake.length === 0}
+                onClick={() => {
+                  setPendingTake([]);
+                  setTakeIdempotencyKey(undefined);
+                  setConfirmTakeReplacements(false);
+                  routeBatch.reset();
+                }}
+              >
+                Cancel Take
+              </Button>
+              <Button
+                variant="contained"
+                disabled={!canSaveTake}
+                onClick={submitTake}
+              >
+                {routeBatch.isPending ? "Submitting Take…" : "Execute Take"}
+              </Button>
+            </Stack>
+          </Stack>
+        )}
+        <Stack
+          spacing={1.5}
           sx={{
-            display: "grid",
-            gridTemplateColumns: "repeat(8, minmax(0, 1fr))",
-            gap: 0.75,
-            p: { xs: 1, md: 2 },
-            width: "100%",
-            maxWidth: 480,
-            border: 1,
-            borderColor: "divider",
-            borderRadius: 1,
-            bgcolor: "background.default",
+            mt: 2,
+            display: routeMode === "immediate" ? undefined : "none",
           }}
         >
-          {Array.from({ length: 64 }, (_, index) => (
-            <Box
-              key={index}
-              sx={{
-                aspectRatio: "1 / 1",
-                minHeight: 22,
-                border: 1,
-                borderColor: "divider",
-                borderRadius: 0.5,
-                bgcolor: "background.paper",
+          <Typography variant="body2" color="text.secondary">
+            Start selected route assigns a worker and requests Start. For a
+            confirmed replacement, the new path is prepared before the current
+            route is stopped. Switching is a hard cut; if the new route fails
+            to start, ARC attempts to restore the previous route.
+          </Typography>
+          <Button
+            variant="contained"
+            onClick={submitImmediateRoute}
+            disabled={!canExecuteSelectedRoute}
+          >
+            {routeBatch.isPending
+              ? "Submitting replacement…"
+              : routeReplacementRequired
+                ? "Replace selected route"
+                : executeRoute.isPending
+                  ? "Starting route…"
+                  : "Start selected route"}
+          </Button>
+          {routeExecutionBlockReason && (
+            <Alert severity="info">{routeExecutionBlockReason}</Alert>
+          )}
+          {executeRoute.isPending && executeRouteMatchesSelection && (
+            <Alert severity="info">
+              Desired route is set. Planning a worker assignment and waiting
+              for its Start response; media is not confirmed yet.
+            </Alert>
+          )}
+          {executeRoute.isSuccess &&
+            executeRouteMatchesSelection &&
+            (executeRoute.data.snapshot.observedState === "running" ? (
+              <Alert severity="success">
+                Worker confirmed the route as running. The matrix is
+                refreshing observed state.
+              </Alert>
+            ) : (
+              <Alert severity="info">
+                Start returned worker state "
+                {executeRoute.data.snapshot.observedState}". The matrix is
+                refreshing observed state.
+              </Alert>
+            ))}
+          {executeRoute.isError &&
+            executeRouteMatchesSelection && (
+              <Alert severity="error">
+                Unable to start route: {executeRoute.error.message}
+              </Alert>
+            )}
+          {routeBatchOrigin === "immediate" && routeBatch.isError && (
+            <Alert severity="error">
+              {routeBatch.error instanceof ApiRequestError &&
+              routeBatch.error.status === 409
+                ? "The route changed before replacement. Refresh the matrix and try again."
+                : `The replacement could not be submitted: ${routeBatch.error.message}`}
+            </Alert>
+          )}
+          {routeBatchOrigin === "immediate" &&
+            routeBatchStatus.isError && (
+              <Alert severity="error">
+                The replacement was accepted, but its status could not be
+                refreshed. Operation {routeBatch.data?.operationId} remains
+                available for review.
+              </Alert>
+            )}
+          {routeBatchOrigin === "immediate" &&
+            routeBatch.isSuccess &&
+            routeBatchResult && (
+              <>
+                <Alert
+                  severity={
+                    routeBatchResult.state === "completed"
+                      ? "success"
+                      : routeBatchResult.state === "failed" ||
+                          routeBatchResult.state === "partial"
+                        ? "warning"
+                        : "info"
+                  }
+                >
+                  {routeBatchResult.state === "completed"
+                    ? "The replacement was acknowledged by the worker."
+                    : routeBatchResult.state === "failed"
+                      ? "The replacement failed. Review the recovery result below."
+                      : routeBatchResult.state === "running"
+                        ? "The replacement is in progress; waiting for worker acknowledgements."
+                        : "The replacement was accepted and is waiting for execution."}{" "}
+                  (operation {routeBatchResult.operationId}).
+                </Alert>
+                {(routeBatchResult.results ?? []).map((result) => (
+                  <Alert
+                    key={result.destinationId}
+                    severity={result.state === "succeeded" ? "success" : result.state === "failed" ? "warning" : "info"}
+                  >
+                    {sources.find((item) => item.id === result.sourceId)?.friendlyName ??
+                      "Unavailable input"}{" "}
+                    →{" "}
+                    {destinations.find(
+                      (item) => item.id === result.destinationId,
+                    )?.friendlyName ?? "Unavailable output"}
+                    :{" "}
+                    {result.state === "succeeded"
+                      ? "worker acknowledged Start"
+                      : result.errorMessage ??
+                        (result.state === "processing"
+                          ? "executing on a worker"
+                          : "waiting for a worker")}
+                  </Alert>
+                ))}
+              </>
+            )}
+          <Button
+            variant="outlined"
+            onClick={submitDesiredRoute}
+            disabled={
+              !selectedSource ||
+              !selectedDestination ||
+              selectedSource.lifecycle !== "validated" ||
+              selectedDestination.lifecycle !== "validated" ||
+              !routePlan.isSuccess ||
+              !resultMatchesSelection ||
+              routesLoading ||
+              routeWrite.isPending ||
+              (destinationRoute?.desiredState === "desired" &&
+                destinationRoute.sourceId === selectedSource.id)
+            }
+          >
+            {routeWrite.isPending
+              ? "Saving desired route…"
+              : destinationRoute?.desiredState === "desired" &&
+                  destinationRoute.sourceId === selectedSource?.id
+                ? "Route already desired"
+                : "Save desired route"}
+          </Button>
+          {routeWrite.isSuccess &&
+            !executeRouteMatchesSelection &&
+            routeWrite.variables?.sourceId === selectedSource?.id &&
+            routeWrite.variables?.destinationId === selectedDestination?.id && (
+              <Alert severity="success">
+                Desired route saved only. Media has not been started or
+                confirmed.
+              </Alert>
+            )}
+          {routeWrite.isError &&
+            routeWrite.variables?.sourceId === selectedSource?.id &&
+            routeWrite.variables?.destinationId === selectedDestination?.id && (
+              <Alert severity="error">
+                Unable to save route: {routeWrite.error.message}
+              </Alert>
+            )}
+        </Stack>
+        <Dialog
+          open={replaceRoute !== null}
+          onClose={() => setReplaceRoute(null)}
+        >
+          <DialogTitle>
+            {replaceRoute?.action === "execute"
+              ? "Replace active route?"
+              : "Replace desired route?"}
+          </DialogTitle>
+          <DialogContent>
+            <DialogContentText>
+              {replaceRoute
+                ? replaceRoute.action === "execute"
+                  ? `Replace ${replaceRoute.replacedSourceName} on ${replaceRoute.destinationName} with ${replaceRoute.sourceName}? ARC will prepare the new path first, then stop the current route and start the replacement. This is a hard cut; if Start fails, ARC will attempt to restore the previous route.`
+                  : `Replace the desired route from ${replaceRoute.replacedSourceName} to ${replaceRoute.destinationName} with ${replaceRoute.sourceName}? This saves desired state only; it does not switch live media.`
+                : ""}
+            </DialogContentText>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => setReplaceRoute(null)}>Cancel</Button>
+            <Button
+              variant="contained"
+              disabled={routeWrite.isPending || routeBatch.isPending}
+              onClick={() => {
+                if (!replaceRoute) return;
+                const { input, action } = replaceRoute;
+                setReplaceRoute(null);
+                if (action === "save") {
+                  routeWrite.mutate(input);
+                } else {
+                  const idempotencyKey = createPipelineId();
+                  setTakeIdempotencyKey(idempotencyKey);
+                  setRouteBatchOrigin("immediate");
+                  routeBatch.mutate({
+                    idempotencyKey,
+                    routes: [input],
+                  });
+                }
               }}
-            />
-          ))}
-        </Box>
+            >
+              {replaceRoute?.action === "execute"
+                ? "Confirm and execute"
+                : "Confirm replacement"}
+            </Button>
+          </DialogActions>
+        </Dialog>
         <Stack
           direction={{ xs: "column", sm: "row" }}
           justifyContent="space-between"
@@ -1551,7 +2259,9 @@ function WorkspaceView({
           sx={{ mt: 1.5 }}
         >
           <Typography variant="caption" color="text.secondary">
-            Matrix preview only · Crosspoints cannot be changed
+            Selected:{" "}
+            {selectedSource?.friendlyName ?? "no input"} →{" "}
+            {selectedDestination?.friendlyName ?? "no output"}
           </Typography>
           <Typography variant="caption" color="text.secondary">
             Inputs {sources.length} · Outputs {destinations.length}
@@ -1670,7 +2380,7 @@ function WorkspaceView({
         </CardContent>
       </Card>
 
-      <Card>
+      <Card sx={{ display: routeMode === "immediate" ? undefined : "none" }}>
         <CardContent>
           <Stack spacing={2}>
             <Box>
@@ -1680,7 +2390,10 @@ function WorkspaceView({
               <Typography variant="body2" color="text.secondary">
                 Reserve capacity for the selected validated input and output,
                 then Start or Stop it; unstarted assignments can be cancelled.
-                Planning alone does not start media.
+                Planning alone does not start media. New plans are rejected
+                while that destination has a planned or non-stopped assignment.
+                Use Immediate or Take execution to replace an occupied route;
+                direct assignment planning does not switch routes.
               </Typography>
             </Box>
             {(selectedSource?.lifecycle !== "validated" ||

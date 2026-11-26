@@ -1,6 +1,6 @@
 # Worker Control Protocol
 
-**Status:** The provider-backed credential verifier, local-only JSON environment provider, conditional API executable wiring, TLS-gated WebSocket session, PostgreSQL-backed command dispatcher, worker WebSocket client with optional private-CA trust, generation-gated Start/Stop handlers, GStreamer media adapter, and opt-in worker Compose profile are implemented. The UI supports a validated single-route assignment lifecycle; multi-route/resource lifecycle UI and production secret stores remain incomplete.
+**Status:** The provider-backed credential verifier, local-only JSON environment provider, conditional API executable wiring, TLS-gated WebSocket session, PostgreSQL-backed command dispatcher, worker WebSocket client with optional private-CA trust, generation-gated Prepare/Start/Stop handlers, structured worker failure acknowledgements, GStreamer media adapter, and opt-in worker Compose profile are implemented. The UI supports validated assignment lifecycle and durable route replacement; production secret stores remain incomplete.
 
 ## Decision
 
@@ -38,7 +38,7 @@ certificate validation remain enabled. An unreadable, empty, or invalid bundle
 prevents worker startup, and replacing the bundle requires a worker restart.
 
 After upgrade, the worker sends a JSON hello such as
-`{"kind":"hello","protocolVersion":1,"workerId":"<worker-uuid>"}` within five
+`{"kind":"hello","protocolVersion":2,"workerId":"<worker-uuid>"}` within five
 seconds. The API verifies that the version and identity match the authenticated
 request, then replies with a `welcome` message containing the protocol version
 and worker ID. The current message and frame limit is 64 KiB. This limit and
@@ -55,7 +55,7 @@ not mounted automatically by Compose.
 
 ## Versioned envelopes
 
-The shared Rust crate defines the protocol-v1 envelopes:
+The shared Rust crate defines the protocol-v2 envelopes:
 
 - `WorkerCommandEnvelope<T>` carries `protocolVersion`, `commandId`,
   authenticated `workerId`, `pipelineId`, `assignmentId`, `generation`, and a
@@ -85,8 +85,10 @@ injected handler. It returns `completed` only after the handler succeeds and the
 durable store marks the command complete; an already completed duplicate also
 returns `completed` without invoking the handler. A stale command returns
 `stale` with `currentGeneration` and never reaches the handler. The API treats
-that as a dispatch error and does not mark the command complete. An
-unacknowledged command remains retryable; a generation first becomes known when
+that as a dispatch error and does not mark the command complete. Handler
+failures return `failed` with bounded error details and remain incomplete so the
+same command can be retried. An unacknowledged command remains retryable; a
+generation first becomes known when
 a command reaches the store, so the store alone cannot reject an older command
 before a newer generation has been observed. Session replacement and
 per-pipeline serialization are process-local, and ledger retention is not
@@ -94,15 +96,19 @@ bounded.
 
 The acknowledgement message uses the normal camelCase envelope fields:
 `kind`, `protocolVersion`, `workerId`, `commandId`, and `outcome`. A stale
-acknowledgement also includes `currentGeneration`. The dispatcher accepts
-`kind: "command_ack"` with `outcome: "completed"` or `"stale"`. The worker
+acknowledgement also includes `currentGeneration`; a failed acknowledgement
+includes bounded `errorCode` and `errorMessage` fields. The dispatcher accepts
+`kind: "command_ack"` with `outcome: "completed"`, `"stale"`, or `"failed"`.
+The worker
 client sends the authenticated worker ID and bearer credential, verifies the
 welcome identity and protocol version, and bounds messages and frames to 64 KiB.
 Plaintext `ws://` is rejected except when explicitly enabled for an IP loopback
 endpoint. Its typed command payloads currently support `start` with a
-`PipelineSpecification` and `stop`; Start validates the pipeline ID and
-generation, then calls the injected `MediaPipeline`'s `prepare` and `start`
-methods, while Stop calls `stop`. A successful acknowledgement is emitted only
+`PipelineSpecification`, `prepare`, and `stop`; Prepare validates the
+specification and constructs the replacement path without starting it. Start
+validates the pipeline ID and generation, then calls the injected
+`MediaPipeline`'s `prepare` and `start` methods, while Stop calls `stop`. A
+successful acknowledgement is emitted only
 after the injected operation and durable completion both succeed. The worker
 executable injects the `arc-gstreamer` adapter, which converts typed route
 snapshots to supported GStreamer graphs, observes pipeline state and bus errors,
@@ -112,7 +118,13 @@ with bounded backoff. After a session receives a matching Welcome, a later
 disconnect resets the reconnect delay to one second; repeated pre-welcome
 connection failures continue exponential backoff up to 30 seconds. Loopback
 worker test clients send `X-Forwarded-Proto: https` alongside the authenticated
-worker identity and bearer credential. `POST /api/v1/routes/plan-assignment` continues to create
+worker identity and bearer credential. `PipelineSpecification.sourceIdentity`
+is an optional `{ sourceId, sourceRevision }` object. When present, it must
+identify a nonnil source and positive revision; the worker shares that source
+graph across destination pipelines on the same worker, while retaining a
+separately managed destination branch for each pipeline. Specifications
+without the field retain the independent-graph behavior.
+`POST /api/v1/routes/plan-assignment` continues to create
 a plan without executing it. `POST /api/v1/assignments/{assignmentId}/start`
 is the explicit lifecycle action: it verifies the generation, persists the
 starting state, and dispatches a Start command containing the assignment's
@@ -122,6 +134,10 @@ idempotent; an unavailable worker leaves the plan retryable.
 Initial dispatcher limits are 16 queued commands per session and a 30-second
 completion-acknowledgement timeout. Queue saturation, session loss, or timeout
 returns an error and leaves the command retryable.
+
+Protocol version 2 adds Prepare and structured failed acknowledgements. API and
+worker binaries must be upgraded together; version-1 workers are rejected
+rather than silently downgraded.
 
 ## Registry and placement foundations
 

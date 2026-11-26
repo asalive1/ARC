@@ -4,10 +4,8 @@ use arc_application::{MediaPipeline, PipelineSpecification, WorkerRegistry};
 use arc_domain::{Architecture, Platform, WorkerState};
 use arc_gstreamer::GstreamerMediaPipeline;
 use arc_infrastructure::{
-    assignments::PgAssignments,
-    postgres::connect_postgres,
-    worker_fencing::PgAssignmentGenerationStore,
-    worker_registry::PgWorkerRegistry,
+    assignments::PgAssignments, postgres::connect_postgres,
+    worker_fencing::PgAssignmentGenerationStore, worker_registry::PgWorkerRegistry,
 };
 use arc_worker::{local_worker, WorkerControlClient, WorkerControlClientConfig};
 use chrono::Utc;
@@ -51,14 +49,10 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
             invalid_config("ARC_WORKER_CAPACITY_UNITS", "must be greater than zero").into(),
         );
     }
-    let ingress_bits_per_second =
-        optional_u64_env("ARC_WORKER_INGRESS_BITS_PER_SECOND")?;
-    let egress_bits_per_second =
-        optional_u64_env("ARC_WORKER_EGRESS_BITS_PER_SECOND")?;
-    let cpu_utilization_ratio =
-        optional_ratio_env("ARC_WORKER_CPU_UTILIZATION_RATIO")?;
-    let memory_utilization_ratio =
-        optional_ratio_env("ARC_WORKER_MEMORY_UTILIZATION_RATIO")?;
+    let ingress_bits_per_second = optional_u64_env("ARC_WORKER_INGRESS_BITS_PER_SECOND")?;
+    let egress_bits_per_second = optional_u64_env("ARC_WORKER_EGRESS_BITS_PER_SECOND")?;
+    let cpu_utilization_ratio = optional_ratio_env("ARC_WORKER_CPU_UTILIZATION_RATIO")?;
+    let memory_utilization_ratio = optional_ratio_env("ARC_WORKER_MEMORY_UTILIZATION_RATIO")?;
 
     let mut resource_telemetry = ResourceTelemetry::new()?;
     tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
@@ -199,16 +193,17 @@ async fn reconcile_runtime_assignments(
     media_pipeline: &dyn MediaPipeline,
     worker_id: Uuid,
 ) -> Result<(), arc_application::PortError> {
-    for snapshot in assignments
-        .list_runtime_for_worker(worker_id)
-        .await?
-    {
+    for snapshot in assignments.list_runtime_for_worker(worker_id).await? {
         let Some(route) = snapshot.assignment.route else {
             continue;
         };
         let specification = PipelineSpecification {
             pipeline_id: snapshot.assignment.pipeline_id,
             assignment_generation: snapshot.assignment.generation,
+            source_identity: Some(arc_application::PipelineSourceIdentity {
+                source_id: route.source_id,
+                source_revision: route.source_revision,
+            }),
             requirements: snapshot.assignment.requirements,
             configuration: route.configuration,
         };
@@ -216,17 +211,15 @@ async fn reconcile_runtime_assignments(
         if snapshot.desired_state == "running" {
             media_pipeline.prepare(&specification).await?;
             media_pipeline
-                .start(specification.pipeline_id, specification.assignment_generation)
-                .await?;
-            assignments
-                .mark_started(
-                    snapshot.assignment.id,
-                    snapshot.assignment.generation,
+                .start(
+                    specification.pipeline_id,
+                    specification.assignment_generation,
                 )
                 .await?;
-        } else if snapshot.desired_state == "stopped"
-            && snapshot.observed_state == "stopping"
-        {
+            assignments
+                .mark_started(snapshot.assignment.id, snapshot.assignment.generation)
+                .await?;
+        } else if snapshot.desired_state == "stopped" && snapshot.observed_state == "stopping" {
             media_pipeline
                 .stop(
                     specification.pipeline_id,
@@ -234,10 +227,7 @@ async fn reconcile_runtime_assignments(
                 )
                 .await?;
             assignments
-                .mark_stopped(
-                    snapshot.assignment.id,
-                    snapshot.assignment.generation,
-                )
+                .mark_stopped(snapshot.assignment.id, snapshot.assignment.generation)
                 .await?;
         }
     }
@@ -313,19 +303,19 @@ fn worker_control_token() -> io::Result<(String, Option<PathBuf>)> {
             ));
         }
         let token = std::fs::read_to_string(&path)
-            .map_err(|error| invalid_config(
-                "ARC_WORKER_CONTROL_TOKEN_FILE",
-                &format!("could not read secret file: {error}"),
-            ))?
+            .map_err(|error| {
+                invalid_config(
+                    "ARC_WORKER_CONTROL_TOKEN_FILE",
+                    &format!("could not read secret file: {error}"),
+                )
+            })?
             .trim()
             .to_owned();
         (token, Some(PathBuf::from(path)))
     } else {
         (required_env("ARC_WORKER_CONTROL_TOKEN")?, None)
     };
-    if token.len() != 64
-        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid_config(
             "ARC_WORKER_CONTROL_TOKEN",
             "must be a 64-character hexadecimal token",

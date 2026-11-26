@@ -87,6 +87,46 @@ export interface RoutePlan {
   };
 }
 
+export interface RouteRecord {
+  destinationId: string;
+  sourceId: string;
+  desiredState: string;
+  observedState: string;
+  observedSourceId?: string | null;
+  revision: number;
+}
+
+export interface SetDesiredRouteInput {
+  sourceId: string;
+  destinationId: string;
+  expectedRouteRevision: number;
+  confirmReplace: boolean;
+}
+
+export interface RouteBatchOperation {
+  operationId: string;
+  state:
+    | "desired_state_applied"
+    | "pending"
+    | "running"
+    | "completed"
+    | "partial"
+    | "failed";
+  routes: RouteRecord[];
+  results?: RouteBatchItemResult[];
+}
+
+export interface RouteBatchItemResult {
+  sourceId: string;
+  destinationId: string;
+  pipelineId: string;
+  state: "pending" | "processing" | "succeeded" | "failed";
+  assignmentId: string | null;
+  assignmentGeneration: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
 export interface PlannedAssignment {
   id: string;
   pipelineId: string;
@@ -406,6 +446,91 @@ export function fetchDestinations(
   return requestJson("/destinations", undefined, baseUrl, fetcher);
 }
 
+export async function fetchRoutes(
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RouteRecord[]> {
+  const response = await requestJson<unknown>(
+    "/routes",
+    undefined,
+    baseUrl,
+    fetcher,
+  );
+  if (
+    typeof response !== "object" ||
+    response === null ||
+    !("items" in response) ||
+    !Array.isArray(response.items) ||
+    !response.items.every(isRouteRecord)
+  ) {
+    throw new Error("API returned an invalid route collection");
+  }
+  return response.items;
+}
+
+export async function setDesiredRoute(
+  input: SetDesiredRouteInput,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RouteRecord> {
+  const response = await requestJson<unknown>(
+    "/routes",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    },
+    baseUrl,
+    fetcher,
+  );
+  if (!isRouteRecord(response)) {
+    throw new Error("API returned an invalid route");
+  }
+  return response;
+}
+
+export async function setDesiredRoutesBatch(
+  routes: SetDesiredRouteInput[],
+  idempotencyKey: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RouteBatchOperation> {
+  const response = await requestJson<unknown>(
+    "/routes/batch",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey,
+      },
+      body: JSON.stringify({ routes }),
+    },
+    baseUrl,
+    fetcher,
+  );
+  if (!isRouteBatchOperation(response)) {
+    throw new Error("API returned an invalid route batch operation");
+  }
+  return response;
+}
+
+export async function getRouteBatchOperation(
+  operationId: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RouteBatchOperation> {
+  const response = await requestJson<unknown>(
+    `/operations/routes/${encodeURIComponent(operationId)}`,
+    {},
+    baseUrl,
+    fetcher,
+  );
+  if (!isRouteBatchOperation(response)) {
+    throw new Error("API returned an invalid route batch operation");
+  }
+  return response;
+}
+
 export function createDestination(
   friendlyName: string,
   profile: DestinationMediaProfile,
@@ -651,4 +776,75 @@ function isNonnegativeInteger(value: unknown): value is number {
 
 function isPayloadRate(value: unknown): value is number | null {
   return value === null || isNonnegativeInteger(value);
+}
+
+function isRouteRecord(value: unknown): value is RouteRecord {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "destinationId" in value &&
+    typeof value.destinationId === "string" &&
+    "sourceId" in value &&
+    typeof value.sourceId === "string" &&
+    "desiredState" in value &&
+    typeof value.desiredState === "string" &&
+    "observedState" in value &&
+    typeof value.observedState === "string" &&
+    (!("observedSourceId" in value) ||
+      value.observedSourceId === null ||
+      typeof value.observedSourceId === "string") &&
+    "revision" in value &&
+    typeof value.revision === "number" &&
+    Number.isSafeInteger(value.revision) &&
+    value.revision >= 0
+  );
+}
+
+function isRouteBatchOperation(value: unknown): value is RouteBatchOperation {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "operationId" in value &&
+    typeof value.operationId === "string" &&
+    "state" in value &&
+    [
+      "desired_state_applied",
+      "pending",
+      "running",
+      "completed",
+      "partial",
+      "failed",
+    ].includes(String(value.state)) &&
+    "routes" in value &&
+    Array.isArray(value.routes) &&
+    value.routes.every(isRouteRecord) &&
+    (!("results" in value) ||
+      (Array.isArray(value.results) && value.results.every(isRouteBatchItemResult)))
+  );
+}
+
+function isRouteBatchItemResult(value: unknown): value is RouteBatchItemResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "sourceId" in value &&
+    typeof value.sourceId === "string" &&
+    "destinationId" in value &&
+    typeof value.destinationId === "string" &&
+    "pipelineId" in value &&
+    typeof value.pipelineId === "string" &&
+    "state" in value &&
+    ["pending", "processing", "succeeded", "failed"].includes(
+      String(value.state),
+    ) &&
+    "assignmentId" in value &&
+    (typeof value.assignmentId === "string" || value.assignmentId === null) &&
+    "assignmentGeneration" in value &&
+    (typeof value.assignmentGeneration === "number" ||
+      value.assignmentGeneration === null) &&
+    "errorCode" in value &&
+    (typeof value.errorCode === "string" || value.errorCode === null) &&
+    "errorMessage" in value &&
+    (typeof value.errorMessage === "string" || value.errorMessage === null)
+  );
 }

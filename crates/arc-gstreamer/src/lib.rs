@@ -1,8 +1,12 @@
-use std::{collections::HashMap, sync::Mutex, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+    time::Duration,
+};
 
 use arc_application::{
-    MediaPipeline, PipelineObservation, PipelineObservedState, PipelineSpecification, PortError,
-    PortResult,
+    MediaPipeline, PipelineObservation, PipelineObservedState, PipelineSourceIdentity,
+    PipelineSpecification, PortError, PortResult,
 };
 use arc_domain::{
     estimate_pipeline_requirements, DestinationMediaProfile, MediaPath, SourceMediaProfile,
@@ -16,17 +20,34 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 const STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+const BRANCH_QUEUE_MAX_BUFFERS: u32 = 100;
 
 pub struct GstreamerMediaPipeline {
-    pipelines: Mutex<HashMap<Uuid, ManagedPipeline>>,
+    pipelines: Mutex<PipelineState>,
+}
+
+#[derive(Default)]
+struct PipelineState {
+    pipelines: HashMap<Uuid, ManagedPipeline>,
+    source_groups: HashMap<PipelineSourceIdentity, ManagedSourceGroup>,
 }
 
 struct ManagedPipeline {
     generation: i64,
     description: String,
     pipeline: Option<gst::Pipeline>,
+    source_identity: Option<PipelineSourceIdentity>,
+    branch: Option<gst::Bin>,
+    tee_pad: Option<gst::Pad>,
     observed_state: PipelineObservedState,
     health_reasons: Vec<String>,
+}
+
+struct ManagedSourceGroup {
+    description: String,
+    pipeline: gst::Pipeline,
+    tee: gst::Element,
+    active_branches: HashSet<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -45,7 +66,7 @@ impl GstreamerMediaPipeline {
             )
         })?;
         Ok(Self {
-            pipelines: Mutex::new(HashMap::new()),
+            pipelines: Mutex::new(PipelineState::default()),
         })
     }
 
@@ -93,9 +114,7 @@ impl GstreamerMediaPipeline {
         capabilities
     }
 
-    fn lock_pipelines(
-        &self,
-    ) -> PortResult<std::sync::MutexGuard<'_, HashMap<Uuid, ManagedPipeline>>> {
+    fn lock_pipelines(&self) -> PortResult<std::sync::MutexGuard<'_, PipelineState>> {
         self.pipelines.lock().map_err(|_| {
             pipeline_error(
                 "media_pipeline_state_unavailable",
@@ -124,21 +143,29 @@ impl MediaPipeline for GstreamerMediaPipeline {
             ));
         }
         let description = pipeline_description(&route.source, &route.destination)?;
-        let element = gst::parse::launch(&description).map_err(|error| {
-            pipeline_error(
-                "gstreamer_pipeline_prepare_failed",
-                format!("GStreamer could not prepare the media graph: {error}"),
-            )
-        })?;
-        let pipeline = element.downcast::<gst::Pipeline>().map_err(|_| {
-            pipeline_error(
-                "gstreamer_pipeline_prepare_failed",
-                "GStreamer media graph did not produce a pipeline",
-            )
-        })?;
+        let shared = if let Some(identity) = specification.source_identity {
+            if identity.source_id.is_nil() || identity.source_revision <= 0 {
+                return Err(pipeline_error(
+                    "invalid_pipeline_source_identity",
+                    "shared source identity requires a source ID and positive revision",
+                ));
+            }
+            Some((
+                identity,
+                shared_source_description(&route.source)?,
+                shared_branch_description(&route.source, &route.destination)?,
+            ))
+        } else {
+            None
+        };
+        let independent_pipeline = if shared.is_none() {
+            Some(parse_pipeline(&description)?)
+        } else {
+            None
+        };
 
-        let mut pipelines = self.lock_pipelines()?;
-        if let Some(current) = pipelines.get_mut(&specification.pipeline_id) {
+        let mut state = self.lock_pipelines()?;
+        if let Some(current) = state.pipelines.get(&specification.pipeline_id) {
             if specification.assignment_generation < current.generation {
                 return Err(pipeline_error(
                     "stale_pipeline_generation",
@@ -146,43 +173,54 @@ impl MediaPipeline for GstreamerMediaPipeline {
                 ));
             }
             if specification.assignment_generation == current.generation {
-                if !current.description.is_empty() && current.description != description {
+                if (!current.description.is_empty() && current.description != description)
+                    || current.source_identity != specification.source_identity
+                {
                     return Err(pipeline_error(
                         "pipeline_generation_conflict",
                         "one assignment generation cannot prepare different media graphs",
                     ));
                 }
-                if current.pipeline.is_some() {
+                if current.pipeline.is_some() || current.branch.is_some() {
                     return Ok(());
                 }
             }
             if specification.assignment_generation > current.generation {
-                if let Some(current_pipeline) = &current.pipeline {
-                    transition_pipeline(
-                        current_pipeline,
-                        gst::State::Null,
-                        "gstreamer_pipeline_stop_failed",
-                    )?;
-                }
+                retire_pipeline(&mut state, specification.pipeline_id)?;
             }
         }
 
-        pipelines.insert(
-            specification.pipeline_id,
-            ManagedPipeline {
-                generation: specification.assignment_generation,
+        if let Some((identity, source_description, branch_description)) = shared {
+            prepare_shared_pipeline(
+                &mut state,
+                specification.pipeline_id,
+                specification.assignment_generation,
                 description,
-                pipeline: Some(pipeline),
-                observed_state: PipelineObservedState::Preparing,
-                health_reasons: Vec::new(),
-            },
-        );
+                identity,
+                source_description,
+                branch_description,
+            )?;
+        } else {
+            state.pipelines.insert(
+                specification.pipeline_id,
+                ManagedPipeline {
+                    generation: specification.assignment_generation,
+                    description,
+                    pipeline: independent_pipeline,
+                    source_identity: None,
+                    branch: None,
+                    tee_pad: None,
+                    observed_state: PipelineObservedState::Preparing,
+                    health_reasons: Vec::new(),
+                },
+            );
+        }
         Ok(())
     }
 
     async fn start(&self, pipeline_id: Uuid, generation: i64) -> PortResult<()> {
-        let mut pipelines = self.lock_pipelines()?;
-        let managed = pipelines.get_mut(&pipeline_id).ok_or_else(|| {
+        let mut state = self.lock_pipelines()?;
+        let managed = state.pipelines.get(&pipeline_id).ok_or_else(|| {
             pipeline_error(
                 "pipeline_not_prepared",
                 "pipeline must be prepared before it can start",
@@ -194,6 +232,15 @@ impl MediaPipeline for GstreamerMediaPipeline {
                 "pipeline start does not match the prepared generation",
             ));
         }
+        if managed.source_identity.is_some() {
+            return start_shared_pipeline(&mut state, pipeline_id);
+        }
+        let managed = state.pipelines.get_mut(&pipeline_id).ok_or_else(|| {
+            pipeline_error(
+                "pipeline_not_prepared",
+                "pipeline disappeared before it could start",
+            )
+        })?;
         let pipeline = managed.pipeline.clone().ok_or_else(|| {
             pipeline_error(
                 "pipeline_not_prepared",
@@ -218,46 +265,80 @@ impl MediaPipeline for GstreamerMediaPipeline {
     }
 
     async fn stop(&self, pipeline_id: Uuid, generation: i64) -> PortResult<()> {
-        let mut pipelines = self.lock_pipelines()?;
-        let Some(managed) = pipelines.get_mut(&pipeline_id) else {
-            pipelines.insert(
+        let mut state = self.lock_pipelines()?;
+        if state
+            .pipelines
+            .get(&pipeline_id)
+            .is_some_and(|managed| generation < managed.generation)
+        {
+            return Err(pipeline_error(
+                "stale_pipeline_generation",
+                "pipeline stop belongs to an older assignment generation",
+            ));
+        }
+        let Some(mut managed) = state.pipelines.remove(&pipeline_id) else {
+            state.pipelines.insert(
                 pipeline_id,
                 ManagedPipeline {
                     generation,
                     description: String::new(),
                     pipeline: None,
+                    source_identity: None,
+                    branch: None,
+                    tee_pad: None,
                     observed_state: PipelineObservedState::Stopped,
                     health_reasons: Vec::new(),
                 },
             );
             return Ok(());
         };
-        if generation < managed.generation {
-            return Err(pipeline_error(
-                "stale_pipeline_generation",
-                "pipeline stop belongs to an older assignment generation",
-            ));
+        if managed.source_identity.is_some() {
+            if let Err(error) = detach_shared_branch(&mut state, pipeline_id, &mut managed) {
+                state.pipelines.insert(pipeline_id, managed);
+                return Err(error);
+            }
+            managed.branch = None;
+            managed.tee_pad = None;
         }
         if let Some(pipeline) = managed.pipeline.clone() {
-            transition_pipeline(
+            if let Err(error) = transition_pipeline(
                 &pipeline,
                 gst::State::Null,
                 "gstreamer_pipeline_stop_failed",
-            )?;
+            ) {
+                state.pipelines.insert(pipeline_id, managed);
+                return Err(error);
+            }
         }
         managed.generation = generation;
         managed.pipeline = None;
         managed.observed_state = PipelineObservedState::Stopped;
         managed.health_reasons.clear();
+        let source_identity = managed.source_identity;
+        state.pipelines.insert(pipeline_id, managed);
+        if let Some(identity) = source_identity {
+            prune_source_group(&mut state, identity);
+        }
         Ok(())
     }
 
     async fn observe(&self, pipeline_id: Uuid) -> PortResult<PipelineObservation> {
-        let mut pipelines = self.lock_pipelines()?;
-        let managed = pipelines.get_mut(&pipeline_id).ok_or_else(|| {
+        let mut state = self.lock_pipelines()?;
+        let managed = state.pipelines.get(&pipeline_id).ok_or_else(|| {
             pipeline_error(
                 "pipeline_not_found",
                 "pipeline has not been prepared on this worker",
+            )
+        })?;
+        let source_identity = managed.source_identity;
+        let is_stopped = matches!(managed.observed_state, PipelineObservedState::Stopped);
+        if let Some(identity) = source_identity.filter(|_| !is_stopped) {
+            observe_shared_group(&mut state, identity)?;
+        }
+        let managed = state.pipelines.get_mut(&pipeline_id).ok_or_else(|| {
+            pipeline_error(
+                "pipeline_not_found",
+                "pipeline state disappeared during observation",
             )
         })?;
         if let Some(pipeline) = managed.pipeline.clone() {
@@ -311,16 +392,408 @@ impl MediaPipeline for GstreamerMediaPipeline {
 
 impl Drop for GstreamerMediaPipeline {
     fn drop(&mut self) {
-        if let Ok(pipelines) = self.pipelines.get_mut() {
-            for managed in pipelines.values_mut() {
+        if let Ok(state) = self.pipelines.get_mut() {
+            for managed in state.pipelines.values_mut() {
                 if let Some(pipeline) = &managed.pipeline {
                     if let Err(error) = pipeline.set_state(gst::State::Null) {
                         tracing::warn!(%error, "failed to stop GStreamer pipeline on shutdown");
                     }
                 }
             }
+            for group in state.source_groups.values() {
+                if let Err(error) = group.pipeline.set_state(gst::State::Null) {
+                    tracing::warn!(%error, "failed to stop shared GStreamer source on shutdown");
+                }
+            }
         }
     }
+}
+
+fn parse_pipeline(description: &str) -> PortResult<gst::Pipeline> {
+    let element = gst::parse::launch(description).map_err(|error| {
+        pipeline_error(
+            "gstreamer_pipeline_prepare_failed",
+            format!("GStreamer could not prepare the media graph: {error}"),
+        )
+    })?;
+    element.downcast::<gst::Pipeline>().map_err(|_| {
+        pipeline_error(
+            "gstreamer_pipeline_prepare_failed",
+            "GStreamer media graph did not produce a pipeline",
+        )
+    })
+}
+
+fn prepare_shared_pipeline(
+    state: &mut PipelineState,
+    pipeline_id: Uuid,
+    generation: i64,
+    description: String,
+    identity: PipelineSourceIdentity,
+    source_description: String,
+    branch_description: String,
+) -> PortResult<()> {
+    let branch = gst::parse::bin_from_description(&branch_description, true).map_err(|error| {
+        pipeline_error(
+            "gstreamer_pipeline_prepare_failed",
+            format!("GStreamer could not prepare the destination branch: {error}"),
+        )
+    })?;
+    branch.set_property("name", format!("arc-branch-{pipeline_id}"));
+    if branch.static_pad("sink").is_none() {
+        return Err(pipeline_error(
+            "gstreamer_pipeline_prepare_failed",
+            "destination branch has no ghost sink pad",
+        ));
+    }
+
+    if let Some(group) = state.source_groups.get(&identity) {
+        if group.description != source_description {
+            return Err(pipeline_error(
+                "source_group_configuration_conflict",
+                "one source revision cannot prepare different source configurations",
+            ));
+        }
+    } else {
+        let pipeline = parse_pipeline(&source_description)?;
+        let tee = pipeline.by_name("source_tee").ok_or_else(|| {
+            pipeline_error(
+                "gstreamer_pipeline_prepare_failed",
+                "shared source graph is missing its fan-out element",
+            )
+        })?;
+        state.source_groups.insert(
+            identity,
+            ManagedSourceGroup {
+                description: source_description,
+                pipeline,
+                tee,
+                active_branches: HashSet::new(),
+            },
+        );
+    }
+
+    state.pipelines.insert(
+        pipeline_id,
+        ManagedPipeline {
+            generation,
+            description,
+            pipeline: None,
+            source_identity: Some(identity),
+            branch: Some(branch),
+            tee_pad: None,
+            observed_state: PipelineObservedState::Preparing,
+            health_reasons: Vec::new(),
+        },
+    );
+    Ok(())
+}
+
+fn start_shared_pipeline(state: &mut PipelineState, pipeline_id: Uuid) -> PortResult<()> {
+    let (identity, branch) = {
+        let managed = state.pipelines.get(&pipeline_id).ok_or_else(|| {
+            pipeline_error(
+                "pipeline_not_prepared",
+                "pipeline must be prepared before it can start",
+            )
+        })?;
+        let identity = managed.source_identity.ok_or_else(|| {
+            pipeline_error(
+                "pipeline_not_prepared",
+                "pipeline has no shared source identity",
+            )
+        })?;
+        let branch = managed.branch.clone().ok_or_else(|| {
+            pipeline_error(
+                "pipeline_not_prepared",
+                "stopped pipeline must be prepared again before it can start",
+            )
+        })?;
+        (identity, branch)
+    };
+    let group = state.source_groups.get_mut(&identity).ok_or_else(|| {
+        pipeline_error(
+            "pipeline_not_prepared",
+            "shared source has not been prepared on this worker",
+        )
+    })?;
+    if group.active_branches.contains(&pipeline_id) {
+        return Ok(());
+    }
+    let was_empty = group.active_branches.is_empty();
+    group.pipeline.add(&branch).map_err(|error| {
+        pipeline_error(
+            "gstreamer_branch_start_failed",
+            format!("GStreamer could not add destination branch: {error}"),
+        )
+    })?;
+    let Some(tee_pad) = group.tee.request_pad_simple("src_%u") else {
+        let _ = group.pipeline.remove(&branch);
+        return Err(pipeline_error(
+            "gstreamer_branch_start_failed",
+            "GStreamer could not allocate a source fan-out pad",
+        ));
+    };
+    let Some(branch_sink) = branch.static_pad("sink") else {
+        group.tee.release_request_pad(&tee_pad);
+        let _ = group.pipeline.remove(&branch);
+        return Err(pipeline_error(
+            "gstreamer_branch_start_failed",
+            "destination branch has no ghost sink pad",
+        ));
+    };
+    if let Err(error) = tee_pad.link(&branch_sink) {
+        group.tee.release_request_pad(&tee_pad);
+        let _ = group.pipeline.remove(&branch);
+        return Err(pipeline_error(
+            "gstreamer_branch_start_failed",
+            format!("GStreamer could not link the destination branch: {error}"),
+        ));
+    }
+
+    let activation = if was_empty {
+        transition_pipeline(
+            &group.pipeline,
+            gst::State::Playing,
+            "gstreamer_pipeline_start_failed",
+        )
+    } else {
+        branch.sync_state_with_parent().map_err(|error| {
+            pipeline_error(
+                "gstreamer_branch_start_failed",
+                format!("GStreamer could not start the destination branch: {error}"),
+            )
+        })
+    };
+    if let Err(error) = activation {
+        let _ = branch.set_state(gst::State::Null);
+        let _ = tee_pad.unlink(&branch_sink);
+        group.tee.release_request_pad(&tee_pad);
+        let _ = group.pipeline.remove(&branch);
+        if was_empty {
+            if let Err(cleanup_error) = group.pipeline.set_state(gst::State::Null) {
+                tracing::warn!(%cleanup_error, "failed to stop shared source after branch start failure");
+            }
+        }
+        if let Some(managed) = state.pipelines.get_mut(&pipeline_id) {
+            managed.observed_state = PipelineObservedState::Failed;
+            managed.health_reasons = vec![error.message.clone()];
+        }
+        return Err(error);
+    }
+    group.active_branches.insert(pipeline_id);
+    let managed = state.pipelines.get_mut(&pipeline_id).ok_or_else(|| {
+        pipeline_error(
+            "pipeline_not_prepared",
+            "pipeline state disappeared during branch activation",
+        )
+    })?;
+    managed.tee_pad = Some(tee_pad);
+    managed.observed_state = PipelineObservedState::Running;
+    managed.health_reasons.clear();
+    Ok(())
+}
+
+fn detach_shared_branch(
+    state: &mut PipelineState,
+    pipeline_id: Uuid,
+    managed: &mut ManagedPipeline,
+) -> PortResult<()> {
+    let Some(identity) = managed.source_identity else {
+        return Ok(());
+    };
+    let Some(group) = state.source_groups.get_mut(&identity) else {
+        return Err(pipeline_error(
+            "shared_source_not_found",
+            "shared source group disappeared before its branch stopped",
+        ));
+    };
+    let Some(branch) = managed.branch.as_ref() else {
+        return Ok(());
+    };
+    if group.active_branches.contains(&pipeline_id) {
+        let tee_pad = managed.tee_pad.as_ref().ok_or_else(|| {
+            pipeline_error(
+                "gstreamer_branch_state_unavailable",
+                "active destination branch has no source pad",
+            )
+        })?;
+        let branch_sink = branch.static_pad("sink").ok_or_else(|| {
+            pipeline_error(
+                "gstreamer_branch_state_unavailable",
+                "active destination branch has no ghost sink pad",
+            )
+        })?;
+        branch.set_state(gst::State::Null).map_err(|error| {
+            pipeline_error(
+                "gstreamer_pipeline_stop_failed",
+                format!("GStreamer could not stop destination branch: {error}"),
+            )
+        })?;
+        tee_pad.unlink(&branch_sink).map_err(|error| {
+            pipeline_error(
+                "gstreamer_pipeline_stop_failed",
+                format!("GStreamer could not unlink destination branch: {error}"),
+            )
+        })?;
+        group.tee.release_request_pad(tee_pad);
+        group.pipeline.remove(branch).map_err(|error| {
+            pipeline_error(
+                "gstreamer_pipeline_stop_failed",
+                format!("GStreamer could not remove destination branch: {error}"),
+            )
+        })?;
+        group.active_branches.remove(&pipeline_id);
+        if group.active_branches.is_empty() {
+            transition_pipeline(
+                &group.pipeline,
+                gst::State::Null,
+                "gstreamer_pipeline_stop_failed",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn retire_pipeline(state: &mut PipelineState, pipeline_id: Uuid) -> PortResult<()> {
+    let Some(mut managed) = state.pipelines.remove(&pipeline_id) else {
+        return Ok(());
+    };
+    let source_identity = managed.source_identity;
+    if source_identity.is_some() {
+        if let Err(error) = detach_shared_branch(state, pipeline_id, &mut managed) {
+            state.pipelines.insert(pipeline_id, managed);
+            return Err(error);
+        }
+    }
+    if let Some(pipeline) = managed.pipeline.as_ref() {
+        if let Err(error) =
+            transition_pipeline(pipeline, gst::State::Null, "gstreamer_pipeline_stop_failed")
+        {
+            state.pipelines.insert(pipeline_id, managed);
+            return Err(error);
+        }
+    }
+    if let Some(identity) = source_identity {
+        prune_source_group(state, identity);
+    }
+    Ok(())
+}
+
+fn prune_source_group(state: &mut PipelineState, identity: PipelineSourceIdentity) {
+    let still_referenced = state
+        .pipelines
+        .values()
+        .any(|managed| managed.source_identity == Some(identity) && managed.branch.is_some());
+    if !still_referenced
+        && state
+            .source_groups
+            .get(&identity)
+            .is_some_and(|group| group.active_branches.is_empty())
+    {
+        state.source_groups.remove(&identity);
+    }
+}
+
+fn observe_shared_group(
+    state: &mut PipelineState,
+    identity: PipelineSourceIdentity,
+) -> PortResult<()> {
+    let errors = {
+        let group = state.source_groups.get(&identity).ok_or_else(|| {
+            pipeline_error(
+                "shared_source_not_found",
+                "shared source group is not available on this worker",
+            )
+        })?;
+        drain_pipeline_errors(&group.pipeline)
+    };
+    for (branch_id, reason) in errors {
+        let affected = match branch_id {
+            Some(branch_id)
+                if state
+                    .pipelines
+                    .get(&branch_id)
+                    .is_some_and(|managed| managed.source_identity == Some(identity)) =>
+            {
+                vec![branch_id]
+            }
+            Some(_) => continue,
+            None => state
+                .source_groups
+                .get(&identity)
+                .map(|group| group.active_branches.iter().copied().collect())
+                .unwrap_or_default(),
+        };
+        for branch_id in affected {
+            let Some(mut managed) = state.pipelines.remove(&branch_id) else {
+                continue;
+            };
+            managed.observed_state = PipelineObservedState::Failed;
+            managed.health_reasons = vec![reason.clone()];
+            if let Err(error) = detach_shared_branch(state, branch_id, &mut managed) {
+                state.pipelines.insert(branch_id, managed);
+                return Err(error);
+            }
+            state.pipelines.insert(branch_id, managed);
+        }
+    }
+    let group = state.source_groups.get(&identity).ok_or_else(|| {
+        pipeline_error(
+            "shared_source_not_found",
+            "shared source group is not available on this worker",
+        )
+    })?;
+    let (state_change, gst_state, _) = group.pipeline.state(Some(gst::ClockTime::ZERO));
+    state_change.map_err(|error| {
+        pipeline_error(
+            "gstreamer_pipeline_observation_failed",
+            format!("shared source state could not be read: {error}"),
+        )
+    })?;
+    if gst_state == gst::State::Playing {
+        for branch_id in &group.active_branches {
+            if let Some(managed) = state.pipelines.get_mut(branch_id) {
+                if !matches!(managed.observed_state, PipelineObservedState::Failed) {
+                    managed.observed_state = PipelineObservedState::Running;
+                    managed.health_reasons.clear();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn drain_pipeline_errors(pipeline: &gst::Pipeline) -> Vec<(Option<Uuid>, String)> {
+    let Some(bus) = pipeline.bus() else {
+        return Vec::new();
+    };
+    let mut errors = Vec::new();
+    while let Some(message) = bus.pop_filtered(&[gst::MessageType::Error]) {
+        if let gst::MessageView::Error(error) = message.view() {
+            let source = message
+                .src()
+                .map(|source| source.name().to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            errors.push((
+                branch_id_for_message(&message),
+                format!("GStreamer element {source} failed: {}", error.error()),
+            ));
+        }
+    }
+    errors
+}
+
+fn branch_id_for_message(message: &gst::Message) -> Option<Uuid> {
+    let mut object = message.src().cloned();
+    while let Some(current) = object {
+        let name = current.name();
+        if let Some(value) = name.strip_prefix("arc-branch-") {
+            return Uuid::parse_str(value).ok();
+        }
+        object = current.parent();
+    }
+    None
 }
 
 fn transition_pipeline(
@@ -479,6 +952,126 @@ pub fn pipeline_description(
         }
     };
     Ok(description)
+}
+
+fn shared_source_description(source: &SourceMediaProfile) -> PortResult<String> {
+    let description = match source {
+        SourceMediaProfile::AlsaL16 { device } => format!(
+            "alsasrc device={} ! \
+             audio/x-raw,format=S16LE,rate=48000,channels=2 ! \
+             audioconvert ! audio/x-raw,format=S16BE,rate=48000,channels=2 ! \
+             tee name=source_tee",
+            gst_string(device)?,
+        ),
+        SourceMediaProfile::RtpL16 {
+            bind_address,
+            port,
+            payload_type,
+        } => rtp_source_description(
+            bind_address.to_string(),
+            *port,
+            "L16",
+            *payload_type,
+            "rtpL16depay",
+        )?,
+        SourceMediaProfile::RtpL24 {
+            bind_address,
+            port,
+            payload_type,
+        } => rtp_source_description(
+            bind_address.to_string(),
+            *port,
+            "L24",
+            *payload_type,
+            "rtpL24depay",
+        )?,
+        SourceMediaProfile::RtpMp2t { bind_address, port } => format!(
+            "udpsrc address={} port={port} caps={} ! \
+             rtpjitterbuffer ! rtpmp2tdepay ! tee name=source_tee",
+            gst_string(&bind_address.to_string())?,
+            gst_string(
+                "application/x-rtp,media=(string)video,clock-rate=(int)90000,\
+                 encoding-name=(string)MP2T,payload=(int)33"
+            )?,
+        ),
+        SourceMediaProfile::SrtMpegTs { host, port, mode } => format!(
+            "srtsrc uri={} ! tee name=source_tee",
+            gst_string(&srt_uri(host, *port, *mode)?)?,
+        ),
+    };
+    Ok(description)
+}
+
+fn shared_branch_description(
+    source: &SourceMediaProfile,
+    destination: &DestinationMediaProfile,
+) -> PortResult<String> {
+    let queue = format!(
+        "queue max-size-buffers={BRANCH_QUEUE_MAX_BUFFERS} \
+         max-size-bytes=0 max-size-time=0 leaky=downstream"
+    );
+    let description = match (
+        arc_domain::plan_media_path(source, destination),
+        destination,
+    ) {
+        (
+            Ok(MediaPath::AlsaL16ToRtpL16 | MediaPath::RtpL16ToRtpL16),
+            DestinationMediaProfile::RtpL16 {
+                address,
+                port,
+                payload_type,
+            },
+        ) => format!(
+            "{queue} ! rtpL16pay pt={payload_type} ! \
+             udpsink host={} port={port} sync=false async=false",
+            gst_string(&address.to_string())?,
+        ),
+        (
+            Ok(MediaPath::RtpL24ToRtpL24),
+            DestinationMediaProfile::RtpL24 {
+                address,
+                port,
+                payload_type,
+            },
+        ) => format!(
+            "{queue} ! rtpL24pay pt={payload_type} ! \
+             udpsink host={} port={port} sync=false async=false",
+            gst_string(&address.to_string())?,
+        ),
+        (
+            Ok(MediaPath::RtpMp2tToSrtMpegTs | MediaPath::SrtMpegTsToSrtMpegTs),
+            DestinationMediaProfile::SrtMpegTs { host, port, mode },
+        ) => format!(
+            "{queue} ! srtsink uri={} async=false",
+            gst_string(&srt_uri(host, *port, *mode)?)?,
+        ),
+        _ => {
+            return Err(pipeline_error(
+                "unsupported_media_path",
+                "media path does not have a shared-source GStreamer branch",
+            ))
+        }
+    };
+    Ok(description)
+}
+
+fn rtp_source_description(
+    bind_address: String,
+    source_port: u16,
+    encoding: &str,
+    payload_type: u8,
+    depayloader: &str,
+) -> PortResult<String> {
+    let caps = format!(
+        "application/x-rtp,media=(string)audio,clock-rate=(int)48000,\
+         encoding-name=(string){encoding},channels=(int)2,payload=(int){payload_type}"
+    );
+    Ok(format!(
+        "udpsrc address={} port={source_port} caps={} ! \
+         rtpjitterbuffer ! {depayloader} ! tee name=source_tee",
+        gst_string(&bind_address)?,
+        gst_string(&caps)?,
+    ))
 }
 
 fn rtp_audio_description(
@@ -647,6 +1240,16 @@ mod tests {
             assert!(description.contains(expected));
             gst::parse::launch(&description)
                 .unwrap_or_else(|error| panic!("invalid GStreamer graph {description}: {error}"));
+            let shared_source = shared_source_description(&source).unwrap();
+            assert!(shared_source.contains("tee name=source_tee"));
+            gst::parse::launch(&shared_source).unwrap_or_else(|error| {
+                panic!("invalid shared GStreamer source {shared_source}: {error}")
+            });
+            let branch = shared_branch_description(&source, &destination).unwrap();
+            assert!(branch.contains("max-size-buffers=100"));
+            assert!(branch.contains("leaky=downstream"));
+            gst::parse::bin_from_description(&branch, true)
+                .unwrap_or_else(|error| panic!("invalid destination branch {branch}: {error}"));
         }
     }
 
@@ -670,7 +1273,7 @@ mod tests {
     fn capabilities_are_limited_to_installed_gstreamer_elements() {
         let _ = gst::init();
         let capabilities = GstreamerMediaPipeline {
-            pipelines: Mutex::new(HashMap::new()),
+            pipelines: Mutex::new(PipelineState::default()),
         }
         .worker_capabilities(false);
         assert!(!capabilities.source_adapters.contains("alsa_l16"));
@@ -686,99 +1289,65 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn forwards_rtp_mpeg_ts_to_an_srt_listener() {
-        let media = GstreamerMediaPipeline::new().expect("GStreamer initializes");
+    fn srt_receiver(port: u16) -> (gst::Pipeline, AppSink) {
         let loopback = Ipv4Addr::LOCALHOST;
-        let rtp_reservation = UdpSocket::bind((loopback, 0)).expect("RTP source port reserves");
-        let rtp_port = rtp_reservation
-            .local_addr()
-            .expect("RTP source port is available")
-            .port();
-        let srt_reservation = UdpSocket::bind((loopback, 0)).expect("SRT listener port reserves");
-        let srt_port = srt_reservation
-            .local_addr()
-            .expect("SRT listener port is available")
-            .port();
-        drop((rtp_reservation, srt_reservation));
-
-        let receiver_source = gst::ElementFactory::make("srtsrc")
+        let source = gst::ElementFactory::make("srtsrc")
             .property(
                 "uri",
-                srt_uri(&loopback.to_string(), srt_port, SrtMode::Listener)
+                srt_uri(&loopback.to_string(), port, SrtMode::Listener)
                     .expect("SRT listener URI builds"),
             )
             .build()
             .expect("SRT listener element builds");
-        let receiver_sink = AppSink::builder().sync(false).build();
-        let receiver_sink_element = receiver_sink.upcast_ref::<gst::Element>();
-        let receiver_pipeline = gst::Pipeline::new();
-        receiver_pipeline
-            .add_many([&receiver_source, receiver_sink_element])
+        let sink = AppSink::builder().sync(false).build();
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add_many([&source, sink.upcast_ref::<gst::Element>()])
             .expect("SRT receiver elements are added");
-        receiver_source
-            .link(receiver_sink_element)
+        source
+            .link(sink.upcast_ref::<gst::Element>())
             .expect("SRT receiver elements link");
-        receiver_pipeline
+        pipeline
             .set_state(gst::State::Playing)
             .expect("SRT receiver starts");
+        (pipeline, sink)
+    }
 
-        let source = SourceMediaProfile::RtpMp2t {
-            bind_address: loopback.into(),
-            port: rtp_port,
-        };
-        let destination = DestinationMediaProfile::SrtMpegTs {
-            host: loopback.to_string(),
-            port: srt_port,
-            mode: SrtMode::Caller,
-        };
-        let estimate = estimate_pipeline_requirements(&source, &destination)
-            .expect("RTP MPEG-TS to SRT requirements are supported");
-        let pipeline_id = Uuid::new_v4();
-        let specification = PipelineSpecification {
-            pipeline_id,
-            assignment_generation: 1,
-            requirements: estimate.requirements,
-            configuration: serde_json::json!({
-                "source": source,
-                "destination": destination,
-            }),
-        };
-        media
-            .prepare(&specification)
-            .await
-            .expect("RTP-to-SRT pipeline prepares");
-        media
-            .start(pipeline_id, 1)
-            .await
-            .expect("RTP-to-SRT pipeline starts");
-
+    fn send_transport_stream(
+        sender: &UdpSocket,
+        loopback: Ipv4Addr,
+        port: u16,
+        marker: u8,
+    ) -> Vec<u8> {
         let mut transport_stream = Vec::with_capacity(188 * 7);
         for packet_index in 0..7u8 {
-            let mut packet = vec![packet_index; 188];
+            let mut packet = vec![marker.wrapping_add(packet_index); 188];
             packet[0] = 0x47;
             packet[1] = 0x01;
             packet[2] = 0x00;
             packet[3] = 0x10 | packet_index;
             transport_stream.extend_from_slice(&packet);
         }
-        let sender = UdpSocket::bind((loopback, 0)).expect("RTP sender socket binds");
         for sequence in 1..=4u16 {
             let mut datagram = Vec::with_capacity(12 + transport_stream.len());
             datagram.extend_from_slice(&[0x80, 33]);
-            datagram.extend_from_slice(&sequence.to_be_bytes());
-            datagram.extend_from_slice(&(u32::from(sequence) * 3_600).to_be_bytes());
+            datagram.extend_from_slice(&(u16::from(marker) * 4 + sequence).to_be_bytes());
+            datagram.extend_from_slice(
+                &(u32::from(marker) * 14_400 + u32::from(sequence) * 3_600).to_be_bytes(),
+            );
             datagram.extend_from_slice(&0x4152_4331_u32.to_be_bytes());
             datagram.extend_from_slice(&transport_stream);
             sender
-                .send_to(&datagram, (loopback, rtp_port))
+                .send_to(&datagram, (loopback, port))
                 .expect("RTP fixture packet sends");
         }
+        transport_stream
+    }
 
+    fn receiver_contains(sink: &AppSink, expected: &[u8]) -> bool {
         let mut received = Vec::new();
-        for _ in 0..5 {
-            let Some(sample) = receiver_sink.try_pull_sample(gst::ClockTime::from_seconds(1))
-            else {
+        for _ in 0..10 {
+            let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(250)) else {
                 continue;
             };
             let buffer = sample
@@ -788,26 +1357,128 @@ mod tests {
                 .expect("SRT receiver buffer is readable");
             received.extend_from_slice(buffer.as_slice());
             if received
-                .windows(transport_stream.len())
-                .any(|candidate| candidate == transport_stream.as_slice())
+                .windows(expected.len())
+                .any(|candidate| candidate == expected)
             {
-                break;
+                return true;
             }
         }
-        assert!(
-            received
-                .windows(transport_stream.len())
-                .any(|candidate| candidate == transport_stream.as_slice()),
-            "SRT output did not contain the original MPEG-TS packets; received {} bytes",
-            received.len()
-        );
+        false
+    }
+
+    #[tokio::test]
+    async fn shares_one_rtp_source_and_keeps_sibling_branch_running_after_stop() {
+        let media = GstreamerMediaPipeline::new().expect("GStreamer initializes");
+        let loopback = Ipv4Addr::LOCALHOST;
+        let rtp_reservation = UdpSocket::bind((loopback, 0)).expect("RTP source port reserves");
+        let rtp_port = rtp_reservation
+            .local_addr()
+            .expect("RTP source port is available")
+            .port();
+        let srt_reservations = [
+            UdpSocket::bind((loopback, 0)).expect("first SRT port reserves"),
+            UdpSocket::bind((loopback, 0)).expect("second SRT port reserves"),
+        ];
+        let srt_ports = srt_reservations
+            .iter()
+            .map(|socket| {
+                socket
+                    .local_addr()
+                    .expect("SRT listener port is available")
+                    .port()
+            })
+            .collect::<Vec<_>>();
+        drop((rtp_reservation, srt_reservations));
+        let (first_receiver, first_sink) = srt_receiver(srt_ports[0]);
+        let (second_receiver, second_sink) = srt_receiver(srt_ports[1]);
+
+        let source = SourceMediaProfile::RtpMp2t {
+            bind_address: loopback.into(),
+            port: rtp_port,
+        };
+        let first_destination = DestinationMediaProfile::SrtMpegTs {
+            host: loopback.to_string(),
+            port: srt_ports[0],
+            mode: SrtMode::Caller,
+        };
+        let second_destination = DestinationMediaProfile::SrtMpegTs {
+            host: loopback.to_string(),
+            port: srt_ports[1],
+            mode: SrtMode::Caller,
+        };
+        let estimate = estimate_pipeline_requirements(&source, &first_destination)
+            .expect("RTP MPEG-TS to SRT requirements are supported");
+        let first_pipeline_id = Uuid::new_v4();
+        let second_pipeline_id = Uuid::new_v4();
+        let source_identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let first_specification = PipelineSpecification {
+            pipeline_id: first_pipeline_id,
+            assignment_generation: 1,
+            source_identity: Some(source_identity),
+            requirements: estimate.requirements.clone(),
+            configuration: serde_json::json!({
+                "source": source,
+                "destination": first_destination,
+            }),
+        };
+        let second_specification = PipelineSpecification {
+            pipeline_id: second_pipeline_id,
+            assignment_generation: 1,
+            source_identity: Some(source_identity),
+            requirements: estimate.requirements.clone(),
+            configuration: serde_json::json!({
+                "source": source,
+                "destination": second_destination,
+            }),
+        };
+        media
+            .prepare(&first_specification)
+            .await
+            .expect("RTP-to-SRT pipeline prepares");
+        media
+            .prepare(&second_specification)
+            .await
+            .expect("second destination branch prepares on the shared source");
+        media
+            .start(first_pipeline_id, 1)
+            .await
+            .expect("RTP-to-SRT pipeline starts");
+        media
+            .start(second_pipeline_id, 1)
+            .await
+            .expect("second destination branch starts without another source graph");
+        let sender = UdpSocket::bind((loopback, 0)).expect("RTP sender socket binds");
+        let first_stream = send_transport_stream(&sender, loopback, rtp_port, 1);
+        assert!(receiver_contains(&first_sink, &first_stream));
+        assert!(receiver_contains(&second_sink, &first_stream));
 
         media
-            .stop(pipeline_id, 1)
+            .stop(first_pipeline_id, 1)
             .await
-            .expect("RTP-to-SRT pipeline stops");
-        receiver_pipeline
+            .expect("first destination branch stops");
+        assert!(matches!(
+            media
+                .observe(second_pipeline_id)
+                .await
+                .expect("sibling observation succeeds")
+                .state,
+            PipelineObservedState::Running
+        ));
+        let second_stream = send_transport_stream(&sender, loopback, rtp_port, 40);
+        assert!(receiver_contains(&second_sink, &second_stream));
+
+        media
+            .stop(second_pipeline_id, 1)
+            .await
+            .expect("second destination branch stops");
+        first_receiver
             .set_state(gst::State::Null)
-            .expect("SRT receiver stops");
+            .expect("first SRT receiver stops");
+        second_receiver
+            .set_state(gst::State::Null)
+            .expect("second SRT receiver stops");
     }
 }

@@ -38,6 +38,9 @@ const WORKER_CONTROL_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkerCommand {
+    Prepare {
+        specification: PipelineSpecification,
+    },
     Start {
         specification: PipelineSpecification,
     },
@@ -294,8 +297,8 @@ impl WorkerControlClient {
             ));
         }
         let bearer_token = self.current_bearer_token()?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {bearer_token}"))
-            .map_err(|_| {
+        let authorization =
+            HeaderValue::from_str(&format!("Bearer {bearer_token}")).map_err(|_| {
                 worker_client_error(
                     "invalid_worker_control_config",
                     "worker bearer credential is not a valid HTTP header value",
@@ -310,10 +313,9 @@ impl WorkerControlClient {
             })?;
         request.headers_mut().insert("authorization", authorization);
         request.headers_mut().insert("x-worker-id", worker_id);
-        request.headers_mut().insert(
-            "x-forwarded-proto",
-            HeaderValue::from_static("https"),
-        );
+        request
+            .headers_mut()
+            .insert("x-forwarded-proto", HeaderValue::from_static("https"));
         Ok(request)
     }
 
@@ -397,6 +399,7 @@ pub async fn execute_pipeline_command(
 ) -> PortResult<()> {
     validate_pipeline_command(&command)?;
     match command.payload {
+        WorkerCommand::Prepare { specification } => media_pipeline.prepare(&specification).await,
         WorkerCommand::Start { specification } => {
             media_pipeline.prepare(&specification).await?;
             media_pipeline
@@ -412,13 +415,18 @@ pub async fn execute_pipeline_command(
 }
 
 fn validate_pipeline_command(command: &WorkerCommandEnvelope<WorkerCommand>) -> PortResult<()> {
-    if let WorkerCommand::Start { specification } = &command.payload {
+    if let WorkerCommand::Prepare { specification } | WorkerCommand::Start { specification } =
+        &command.payload
+    {
         if specification.pipeline_id != command.pipeline_id
             || specification.assignment_generation != command.generation
+            || specification.source_identity.is_some_and(|identity| {
+                identity.source_id.is_nil() || identity.source_revision <= 0
+            })
         {
             return Err(worker_client_error(
                 "invalid_pipeline_command",
-                "start specification does not match its command identity",
+                "pipeline specification identity does not match its command",
             ));
         }
     }
@@ -599,6 +607,7 @@ mod tests {
         PipelineSpecification {
             pipeline_id,
             assignment_generation: generation,
+            source_identity: None,
             requirements: PipelineRequirements {
                 source_adapter: None,
                 destination_adapter: None,
@@ -875,7 +884,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_command_handler_does_not_return_a_completed_acknowledgement() {
+    async fn prepare_command_builds_the_path_without_starting_media() {
+        let media_pipeline = TestMediaPipeline::default();
+        let pipeline_id = Uuid::new_v4();
+        execute_pipeline_command(
+            &media_pipeline,
+            command(
+                Uuid::new_v4(),
+                pipeline_id,
+                Uuid::new_v4(),
+                1,
+                WorkerCommand::Prepare {
+                    specification: specification(pipeline_id, 1),
+                },
+            ),
+        )
+        .await
+        .expect("Prepare command succeeds");
+
+        assert_eq!(media_pipeline.prepared.load(Ordering::SeqCst), 1);
+        assert_eq!(media_pipeline.started.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_command_handler_returns_a_retryable_failure_acknowledgement() {
         let store = TestGenerationStore::default();
         let worker_id = Uuid::new_v4();
         let command = command(
@@ -892,16 +924,23 @@ mod tests {
             assignment_id: command.assignment_id,
             generation: command.generation,
         };
-        let error = receive_worker_command(&store, worker_id, command, |_| async {
+        let acknowledgement = receive_worker_command(&store, worker_id, command, |_| async {
             Err(PortError {
                 code: "media_pipeline_failed",
                 message: "injected test failure".to_owned(),
             })
         })
         .await
-        .expect_err("failed handler does not produce an acknowledgement");
+        .expect("failed handler produces an acknowledgement");
 
-        assert_eq!(error.code, "media_pipeline_failed");
+        assert_eq!(
+            acknowledgement.outcome,
+            arc_shared::WorkerCommandOutcome::Failed
+        );
+        assert_eq!(
+            acknowledgement.error_code.as_deref(),
+            Some("media_pipeline_failed")
+        );
         assert_eq!(
             store.begin_command(identity).await.unwrap(),
             CommandFenceDecision::Process

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const WORKER_PROTOCOL_VERSION: u16 = 1;
+pub const WORKER_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +44,7 @@ pub struct WorkerSessionWelcome {
 pub enum WorkerCommandOutcome {
     Completed,
     Stale,
+    Failed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,6 +56,10 @@ pub struct WorkerCommandAcknowledgement {
     pub command_id: Uuid,
     pub outcome: WorkerCommandOutcome,
     pub current_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 impl WorkerCommandAcknowledgement {
@@ -75,8 +80,19 @@ impl WorkerCommandAcknowledgement {
             return Err(WorkerSessionValidationError::InvalidWorkerIdentity);
         }
         match (self.outcome, self.current_generation) {
-            (WorkerCommandOutcome::Completed, None) => {}
-            (WorkerCommandOutcome::Stale, Some(generation)) if generation > 0 => {}
+            (WorkerCommandOutcome::Completed, None)
+                if self.error_code.is_none() && self.error_message.is_none() => {}
+            (WorkerCommandOutcome::Stale, Some(generation))
+                if generation > 0 && self.error_code.is_none() && self.error_message.is_none() => {}
+            (WorkerCommandOutcome::Failed, None)
+                if self
+                    .error_code
+                    .as_ref()
+                    .is_some_and(|code| !code.is_empty() && code.len() <= 128)
+                    && self
+                        .error_message
+                        .as_ref()
+                        .is_some_and(|message| !message.is_empty() && message.len() <= 4096) => {}
             _ => return Err(WorkerSessionValidationError::InvalidCommandIdentity),
         }
         Ok(())
@@ -202,6 +218,8 @@ mod tests {
             command_id: Uuid::new_v4(),
             outcome: WorkerCommandOutcome::Completed,
             current_generation: None,
+            error_code: None,
+            error_message: None,
         };
         assert_eq!(acknowledgement.validate_for_worker(worker_id), Ok(()));
         assert_eq!(
@@ -213,5 +231,28 @@ mod tests {
         assert_eq!(value["kind"], "command_ack");
         assert_eq!(value["outcome"], "completed");
         assert!(value.get("commandId").is_some());
+    }
+
+    #[test]
+    fn failed_worker_acknowledgement_requires_bounded_error_details() {
+        let worker_id = Uuid::new_v4();
+        let acknowledgement = WorkerCommandAcknowledgement {
+            kind: WorkerSessionMessageKind::CommandAck,
+            protocol_version: WORKER_PROTOCOL_VERSION,
+            worker_id,
+            command_id: Uuid::new_v4(),
+            outcome: WorkerCommandOutcome::Failed,
+            current_generation: None,
+            error_code: Some("media_start_failed".to_owned()),
+            error_message: Some("pipeline could not enter playing state".to_owned()),
+        };
+        assert_eq!(acknowledgement.validate_for_worker(worker_id), Ok(()));
+
+        let mut invalid = acknowledgement;
+        invalid.error_message = None;
+        assert_eq!(
+            invalid.validate_for_worker(worker_id),
+            Err(WorkerSessionValidationError::InvalidCommandIdentity)
+        );
     }
 }

@@ -1160,10 +1160,17 @@ fn pipeline_error(code: &'static str, message: impl Into<String>) -> PortError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    use std::{
+        net::{IpAddr, Ipv4Addr, UdpSocket},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Instant,
+    };
 
     use super::*;
-    use gstreamer_app::AppSink;
+    use gstreamer_app::{AppSink, AppSinkCallbacks};
 
     #[test]
     fn builds_and_parses_typed_phase_one_pipeline_descriptions() {
@@ -1480,5 +1487,157 @@ mod tests {
         second_receiver
             .set_state(gst::State::Null)
             .expect("second SRT receiver stops");
+    }
+
+    #[tokio::test]
+    async fn isolates_a_failed_shared_branch_and_keeps_sibling_receiving() {
+        let media = GstreamerMediaPipeline::new().expect("GStreamer initializes");
+        let source_identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let source_description = "videotestsrc is-live=true ! tee name=source_tee".to_owned();
+        let failing_pipeline_id = Uuid::new_v4();
+        let sibling_pipeline_id = Uuid::new_v4();
+        {
+            let mut state = media.lock_pipelines().expect("pipeline state is available");
+            prepare_shared_pipeline(
+                &mut state,
+                failing_pipeline_id,
+                1,
+                "injected branch failure".to_owned(),
+                source_identity,
+                source_description.clone(),
+                "queue ! fakesink sync=false".to_owned(),
+            )
+            .expect("failing branch prepares");
+            prepare_shared_pipeline(
+                &mut state,
+                sibling_pipeline_id,
+                1,
+                "healthy sibling".to_owned(),
+                source_identity,
+                source_description,
+                "queue ! appsink name=healthy_sink sync=false".to_owned(),
+            )
+            .expect("healthy sibling prepares");
+        }
+
+        let received_buffers = Arc::new(AtomicUsize::new(0));
+        let sibling_sink = {
+            let state = media.lock_pipelines().expect("pipeline state is available");
+            state
+                .pipelines
+                .get(&sibling_pipeline_id)
+                .and_then(|managed| managed.branch.as_ref())
+                .and_then(|branch| branch.by_name("healthy_sink"))
+                .expect("healthy appsink exists")
+                .downcast::<AppSink>()
+                .expect("healthy sink is an appsink")
+        };
+        let callback_count = Arc::clone(&received_buffers);
+        sibling_sink.set_callbacks(
+            AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    callback_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        media
+            .start(sibling_pipeline_id, 1)
+            .await
+            .expect("healthy sibling starts");
+        media
+            .start(failing_pipeline_id, 1)
+            .await
+            .expect("failing branch starts");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received_buffers.load(Ordering::Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "healthy sibling did not receive initial buffers"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // A branch-attributed bus error exercises isolation without failing the shared tee's flow.
+        {
+            let state = media.lock_pipelines().expect("pipeline state is available");
+            let branch = state
+                .pipelines
+                .get(&failing_pipeline_id)
+                .and_then(|managed| managed.branch.as_ref())
+                .expect("failing branch exists");
+            let pipeline = &state
+                .source_groups
+                .get(&source_identity)
+                .expect("shared source group exists")
+                .pipeline;
+            let message =
+                gst::message::Error::builder(gst::CoreError::Failed, "injected branch failure")
+                    .debug("deterministic shared-branch failure test")
+                    .src(branch)
+                    .build();
+            pipeline
+                .bus()
+                .expect("shared source bus exists")
+                .post(message)
+                .expect("branch failure message posts");
+        }
+
+        let failure_deadline = Instant::now() + Duration::from_secs(5);
+        let failure = loop {
+            let observation = media
+                .observe(failing_pipeline_id)
+                .await
+                .expect("failed branch observation succeeds");
+            if matches!(observation.state, PipelineObservedState::Failed) {
+                break observation;
+            }
+            assert!(
+                Instant::now() < failure_deadline,
+                "branch failure was not observed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            failure
+                .health_reasons
+                .iter()
+                .any(|reason| reason.contains("injected branch failure")),
+            "the failed branch's GStreamer error is reported: {:?}",
+            failure.health_reasons
+        );
+
+        let buffers_at_failure = received_buffers.load(Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received_buffers.load(Ordering::Relaxed) <= buffers_at_failure {
+            assert!(
+                Instant::now() < deadline,
+                "healthy sibling stopped receiving buffers after branch failure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            media
+                .observe(sibling_pipeline_id)
+                .await
+                .expect("healthy sibling observation succeeds")
+                .state,
+            PipelineObservedState::Running
+        ));
+
+        media
+            .stop(failing_pipeline_id, 1)
+            .await
+            .expect("failed branch cleans up");
+        media
+            .stop(sibling_pipeline_id, 1)
+            .await
+            .expect("healthy sibling cleans up");
     }
 }

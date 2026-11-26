@@ -3545,9 +3545,12 @@ mod tests {
             .list_current()
             .await
             .expect("route state reads after rejected replacement");
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].source_id, source_a.id);
-        assert_eq!(routes[0].revision, 1);
+        let route = routes
+            .into_iter()
+            .find(|route| route.destination_id == destination.id)
+            .expect("test destination route remains unchanged");
+        assert_eq!(route.source_id, source_a.id);
+        assert_eq!(route.revision, 1);
 
         let response = app
             .clone()
@@ -4645,10 +4648,21 @@ mod tests {
         let destination = catalog::validate_destination_draft(&pool, destination.id)
             .await
             .unwrap();
-        let body = |pipeline: Uuid, wait: bool| {
+        let second_destination = catalog::create_destination(
+            &pool,
+            "wait API second destination",
+            destination_profile.adapter_id(),
+            serde_json::to_value(&destination_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let second_destination = catalog::validate_destination_draft(&pool, second_destination.id)
+            .await
+            .unwrap();
+        let body = |pipeline: Uuid, wait: bool, destination_id: Uuid, destination_revision: i64| {
             serde_json::json!({
                 "pipelineId": pipeline, "sourceId": source.id, "sourceRevision": source.current_revision,
-                "destinationId": destination.id, "destinationRevision": destination.current_revision, "allowWaiting": wait
+                "destinationId": destination_id, "destinationRevision": destination_revision, "allowWaiting": wait
             })
         };
         let app = router_with_database(pool.clone());
@@ -4657,14 +4671,24 @@ mod tests {
             "POST",
             "/api/v1/routes/plan-assignment",
             Some(Uuid::new_v4()),
-            Some(body(Uuid::new_v4(), false)),
+            Some(body(
+                Uuid::new_v4(),
+                false,
+                destination.id,
+                destination.current_revision,
+            )),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(immediate["state"], "unavailable");
         assert!(immediate.get("requestId").is_none());
         let key = Uuid::new_v4();
-        let request = body(Uuid::new_v4(), true);
+        let request = body(
+            Uuid::new_v4(),
+            true,
+            destination.id,
+            destination.current_revision,
+        );
         let (_, waiting) = call(
             &app,
             "POST",
@@ -4704,7 +4728,12 @@ mod tests {
         );
 
         let expired_key = Uuid::new_v4();
-        let expired_body = body(Uuid::new_v4(), true);
+        let expired_body = body(
+            Uuid::new_v4(),
+            true,
+            destination.id,
+            destination.current_revision,
+        );
         let (_, expired) = call(
             &app,
             "POST",
@@ -4742,7 +4771,12 @@ mod tests {
             "POST",
             "/api/v1/routes/plan-assignment",
             Some(Uuid::new_v4()),
-            Some(body(Uuid::new_v4(), true)),
+            Some(body(
+                Uuid::new_v4(),
+                true,
+                destination.id,
+                destination.current_revision,
+            )),
         )
         .await;
         let (_, second) = call(
@@ -4750,7 +4784,12 @@ mod tests {
             "POST",
             "/api/v1/routes/plan-assignment",
             Some(Uuid::new_v4()),
-            Some(body(Uuid::new_v4(), true)),
+            Some(body(
+                Uuid::new_v4(),
+                true,
+                second_destination.id,
+                second_destination.current_revision,
+            )),
         )
         .await;
         let first_path = format!(
@@ -5727,7 +5766,11 @@ mod tests {
             .list_current()
             .await
             .expect("route state reads before Start acknowledgement");
-        assert_eq!(routes_before_start_ack[0].observed_state, "unknown");
+        let route_before_start_ack = routes_before_start_ack
+            .into_iter()
+            .find(|route| route.destination_id == destination.id)
+            .expect("test destination route exists before Start acknowledgement");
+        assert_eq!(route_before_start_ack.observed_state, "unknown");
         let starting_source_state: String =
             sqlx::query_scalar("SELECT desired_state FROM sources WHERE id = $1")
                 .bind(source.id)
@@ -5792,14 +5835,17 @@ mod tests {
             .expect("routes response reads");
         let routes: Value =
             serde_json::from_slice(&routes_body).expect("routes response is valid JSON");
-        assert_eq!(routes["items"].as_array().map(Vec::len), Some(1));
-        assert_eq!(routes["items"][0]["sourceId"], source.id.to_string());
-        assert_eq!(routes["items"][0]["desiredState"], "desired");
-        assert_eq!(routes["items"][0]["observedState"], "running");
-        assert_eq!(
-            routes["items"][0]["observedSourceId"],
-            source.id.to_string()
-        );
+        let routes = routes["items"]
+            .as_array()
+            .expect("routes response contains an item list");
+        let route = routes
+            .iter()
+            .find(|route| route["destinationId"] == destination.id.to_string())
+            .expect("routes response contains the test destination");
+        assert_eq!(route["sourceId"], source.id.to_string());
+        assert_eq!(route["desiredState"], "desired");
+        assert_eq!(route["observedState"], "running");
+        assert_eq!(route["observedSourceId"], source.id.to_string());
 
         let repeat_start = app
             .clone()
@@ -5990,7 +6036,11 @@ mod tests {
             .list_current()
             .await
             .expect("route state reads before Stop acknowledgement");
-        assert_eq!(routes_before_stop_ack[0].observed_state, "running");
+        let route_before_stop_ack = routes_before_stop_ack
+            .into_iter()
+            .find(|route| route.destination_id == destination.id)
+            .expect("test destination route exists before Stop acknowledgement");
+        assert_eq!(route_before_stop_ack.observed_state, "running");
         let competing_plan = serde_json::json!({
             "pipelineId": Uuid::new_v4(),
             "sourceId": source.id,

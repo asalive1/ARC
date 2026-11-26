@@ -7,8 +7,68 @@ validates draft configurations. The operator UI can now reserve a worker for a
 validated single route, Start or Stop it, or cancel it before it starts. An
 opt-in worker profile provides the worker command client and GStreamer adapter.
 Assignment Start/Stop now coordinates source and destination enabled state with
-worker acknowledgements. Multi-route editing and end-to-end deployed media
-transport remain outstanding.
+worker acknowledgements. Phase 2 adds crosspoint routing, shared-source fan-out,
+durable multi-route execution, and saved salvos. Deployed Linux ALSA-loopback
+to RTP stereo fan-out and Unroute are verified; external-endpoint and full
+deployment acceptance remain outstanding.
+
+## Crosspoint routing and salvos
+
+- Left-click a crosspoint to highlight it without changing live media.
+  Right-click it (or focus it and press Shift+F10) for **Take** and **Unroute**.
+  Take starts the selected input/output route; Unroute disconnects that output.
+  Replacing another input still requires explicit confirmation.
+- **Salvo**, below GPIO Configuration in the sidebar, has its saved-salvo
+  dropdown, **Take**, and **Save** controls above the matrix. Select one input
+  per output; click a selected crosspoint again to remove it from the salvo.
+- Save stores only the selected routes, not every live route. It does not
+  change live media. Save as new, update, reload, and delete are available.
+  Saved salvos use PostgreSQL and the `/api/v1/presets` API.
+  Up to 100 salvos are supported, each with 1-64 distinct output assignments
+  and a unique, trimmed name of 1-100 characters. Saved route removals and
+  Force mode are not implemented.
+- Take executes the saved salvo, not unsaved edits. Loading a salvo captures
+  the displayed destination revisions; strict execution rejects stale route
+  or salvo revisions. Reload and review before retrying a conflict. Unlisted
+  destinations remain unchanged. Force execution is not available.
+- Desired changes are recorded atomically, but media execution is independent
+  per destination, not an all-or-nothing switch. Review operation and
+  destination outcomes rather than assuming a request means media is running.
+  Replacements prepare the new path before the hard cut and attempt to restore
+  the previous route after a failed Start.
+- A destination with started execution, cleanup, or restoration still pending
+  rejects new Take, Salvo, direct-write, and Unroute requests with HTTP 409
+  `destination_busy`. Retry the accepted operation with its original
+  idempotency key rather than submitting a conflicting route. Cleanup retains
+  the replacement's capacity until its Stop is acknowledged.
+- Unroute is revision-guarded and durable. Busy destinations can reject a
+  conflicting command with HTTP 409. Stop acknowledgement, not command
+  acceptance, releases capacity and confirms stopped media. If no assignment
+  can confirm Stop, desired state is removed but the operation fails with
+  `stop_unconfirmed`; review that outcome rather than assuming silence.
+- The old bottom Take controls are removed. Compatibility checks and manual
+  worker lifecycle/capacity controls remain under **Advanced routing diagnostics**.
+
+## Input and output configuration
+
+- **New input/output** is a collapsed, full-width panel. Expand its arrow to
+  create a disabled draft.
+- Existing resources fill the available content width. Expand a row to edit
+  it inline, save a new draft revision, validate the saved revision, or delete
+  the resource. Cancel discards unsaved edits.
+- Enabled resources can be expanded for inspection, but their fields, Save
+  and Delete controls are disabled with an explanation. Unroute all assignments
+  using the resource before editing; opening an editor never stops media.
+- Delete requires confirmation and the displayed configuration revision.
+  Only disabled, unused resources can be permanently deleted. Routes,
+  **including removed route history**, assignments, signal mappings and saved
+  salvos block deletion. History is never cascaded away, and deletion cannot
+  be undone. Editing preserves prior configuration revisions.
+
+See [test-server readiness](docs/deployment.md#isolated-test-server-readiness)
+for the steps needed before an isolated deployment.
+The [media-enabled test deployment](docs/deployment.md#linux-dual-network-media-worker)
+now runs a non-root dual-network worker with ALSA capture and trusted WSS.
 
 ## Architecture review
 

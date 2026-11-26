@@ -131,6 +131,27 @@ packages can change, and build-stage dependencies differ from distributed
 runtime contents. Record image digests, package versions, licenses, and
 notices per target artifact.
 
+### Media-enabled test deployment identities
+
+The isolated Linux x86_64 test deployment now enables the existing optional
+worker and NGINX TLS ingress and refreshes the UI. No Rust/npm dependencies
+or bundled media plugins were added. Imported runtime image identities are:
+
+| Artifact | Docker image identity |
+| --- | --- |
+| ARC worker, including idle WSS keepalive fix | `sha256:0384b5c2ec28297da3efbfaeaa80731c3e9155c2fd9233dd72a7e1855b2df3d0` |
+| Worker TLS ingress (`nginx:1.29-alpine`) | `sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de` |
+| Updated ARC UI | `sha256:1ad14d4fc8763228f1251cb923feaa6792d268069c5a2af901db16a27445ecdf` |
+
+These are Docker image/index identities, not the separate image configuration
+digests. The private test-host backup retains image/source archives and exact
+SHA256 manifests. Existing host ALSA/GStreamer validation scripts are external
+test tools, not additions to the shipped worker image. Enabling these test
+artifacts does not close the release package/SBOM, notice or legal-review gates.
+The keepalive rebuild replaces only the worker executable on the original
+runtime image; runtime packages/plugins are unchanged. Rustfmt was installed
+only in the non-shipped cached build stage after a missing-tool failure.
+
 ## Phase 1 media runtime
 
 The opt-in worker image installs GStreamer core, the Base support library

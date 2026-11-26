@@ -7,12 +7,14 @@ import {
 } from "@tanstack/react-query";
 import {
   Alert,
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Box,
   Button,
   Card,
   CardContent,
   Chip,
-  Checkbox,
   CircularProgress,
   CssBaseline,
   Divider,
@@ -32,8 +34,8 @@ import {
   createTheme,
 } from "@mui/material";
 
-import { CrosspointMatrix } from "./CrosspointMatrix";
-import { stageRouteSelection, type StagedRoute } from "./routeStaging";
+import { RoutingWorkspace } from "./RoutingWorkspace";
+import { createPipelineId } from "./routeStaging";
 import {
   ApiRequestError,
   bootstrapAdmin,
@@ -44,19 +46,18 @@ import {
   fetchAdminSession,
   createDestination as createDestinationRequest,
   createSource as createSourceRequest,
+  deleteSource,
+  deleteDestination,
   fetchDestinations,
   fetchReadiness,
   fetchPipelineAssignment,
   fetchCapacityRequest,
   fetchRoutes,
   fetchSources,
-  getRouteBatchOperation,
   loginAdmin,
   logoutAdmin,
   planRoute,
   planRouteAssignment,
-  setDesiredRoute,
-  setDesiredRoutesBatch,
   startAssignment as startAssignmentRequest,
   stopAssignment as stopAssignmentRequest,
   updateDestination as updateDestinationRequest,
@@ -70,7 +71,6 @@ import {
   type PlanRouteAssignmentInput,
   type RouteRecord,
   type RoutePlan,
-  type SetDesiredRouteInput,
   type SourceMediaProfile,
   type SourceRecord,
 } from "./api";
@@ -96,13 +96,14 @@ function storedCapacityAttempt(): PlanRouteAssignmentInput | undefined {
   return undefined;
 }
 
-type Section = "workspace" | "inputs" | "outputs" | "gpio" | "admin";
+type Section = "workspace" | "inputs" | "outputs" | "gpio" | "salvos" | "admin";
 
 const navigation: { id: Section; label: string; badge?: string }[] = [
-  { id: "workspace", label: "Crosspoint Grid", badge: "Planned" },
+  { id: "workspace", label: "Crosspoint Grid" },
   { id: "inputs", label: "Inputs" },
   { id: "outputs", label: "Outputs" },
   { id: "gpio", label: "GPIO Configuration", badge: "Planned" },
+  { id: "salvos", label: "Salvo" },
   { id: "admin", label: "Admin Settings" },
 ];
 
@@ -111,6 +112,7 @@ const sectionTitles: Record<Section, string> = {
   inputs: "Input Configuration",
   outputs: "Output Configuration",
   gpio: "GPIO Configuration",
+  salvos: "Salvo",
   admin: "Admin Settings",
 };
 
@@ -119,23 +121,9 @@ const sectionDescriptions: Record<Section, string> = {
   inputs: "Configure and validate audio sources.",
   outputs: "Configure and validate audio destinations.",
   gpio: "Configure GPIO devices and signal mappings.",
+  salvos: "Save and take groups of crosspoint routes.",
   admin: "Workspace appearance and service status.",
 };
-
-function createPipelineId(): string {
-  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    hex.slice(12, 16),
-    hex.slice(16, 20),
-    hex.slice(20),
-  ].join("-");
-}
 
 export function App() {
   const queryClient = useQueryClient();
@@ -987,7 +975,7 @@ function WorkspaceApp({
                 )}
               </Stack>
 
-              {section === "workspace" && (
+              <Box hidden={section !== "workspace"}>
                 <WorkspaceView
                   sources={sources.data ?? []}
                   destinations={destinations.data ?? []}
@@ -1007,7 +995,21 @@ function WorkspaceApp({
                     destinations.isError ? destinations.error.message : ""
                   }
                 />
-              )}
+              </Box>
+
+              <Box hidden={section !== "salvos"}>
+                <RoutingWorkspace
+                  apiBaseUrl={apiBaseUrl}
+                  mode="salvos"
+                  sources={sources.data ?? []}
+                  destinations={destinations.data ?? []}
+                  routes={routes.data ?? []}
+                  routesLoading={routes.isLoading}
+                  routesError={routes.isError ? routes.error.message : ""}
+                  sourceError={sources.isError ? sources.error.message : ""}
+                  destinationError={destinations.isError ? destinations.error.message : ""}
+                />
+              </Box>
 
               {section === "inputs" && (
                 <ResourceWorkspace
@@ -1025,6 +1027,10 @@ function WorkspaceApp({
                   editingId={editingSourceId}
                   onEdit={beginEdit}
                   onCancelEdit={cancelSourceEdit}
+                  onDelete={async (record) => {
+                    await deleteSource(record.id, record.currentRevision, apiBaseUrl);
+                    await queryClient.invalidateQueries({ queryKey: ["sources"] });
+                  }}
                   validationError={
                     sourceValidation.isError
                       ? sourceValidation.error.message
@@ -1073,6 +1079,10 @@ function WorkspaceApp({
                   editingId={editingDestinationId}
                   onEdit={beginEdit}
                   onCancelEdit={cancelDestinationEdit}
+                  onDelete={async (record) => {
+                    await deleteDestination(record.id, record.currentRevision, apiBaseUrl);
+                    await queryClient.invalidateQueries({ queryKey: ["destinations"] });
+                  }}
                   validationError={
                     destinationValidation.isError
                       ? destinationValidation.error.message
@@ -1237,115 +1247,12 @@ function WorkspaceView({
   const activePipelineId = assignmentRequest?.pipelineId;
   const capacityRequestId = assignmentRequest?.capacityRequestId;
   const [allowWaiting, setAllowWaiting] = useState(!!assignmentRequest?.allowWaiting);
-  const [routeMode, setRouteMode] = useState<"immediate" | "take">("immediate");
-  const [pendingTake, setPendingTake] = useState<StagedRoute[]>([]);
-  const [takeIdempotencyKey, setTakeIdempotencyKey] = useState<string>();
-  const [confirmTakeReplacements, setConfirmTakeReplacements] = useState(false);
-  const [routeBatchOrigin, setRouteBatchOrigin] = useState<"immediate" | "take">(
-    "take",
-  );
   const resultMatchesSelection =
     selectedSource !== undefined &&
     selectedDestination !== undefined &&
     routePlan.variables !== undefined &&
     JSON.stringify(routePlan.variables.source) === JSON.stringify(selectedSource.configuration) &&
     JSON.stringify(routePlan.variables.destination) === JSON.stringify(selectedDestination.configuration);
-  const [replaceRoute, setReplaceRoute] = useState<{
-    input: SetDesiredRouteInput;
-    sourceName: string;
-    destinationName: string;
-    replacedSourceName: string;
-    action: "save" | "execute";
-  } | null>(null);
-  const destinationRoute = routes.find(
-    (route) => route.destinationId === selectedDestination?.id,
-  );
-  const routeRequiresReplacement = (
-    currentRoute: RouteRecord | undefined,
-    sourceId: string,
-  ) =>
-    currentRoute !== undefined &&
-    ((currentRoute.desiredState === "desired" &&
-      currentRoute.sourceId !== sourceId) ||
-      (currentRoute.observedState !== "stopped" &&
-        currentRoute.observedSourceId !== undefined &&
-        currentRoute.observedSourceId !== sourceId));
-  const pendingTakeReplacements = pendingTake.filter((route) =>
-    routeRequiresReplacement(
-      routes.find((item) => item.destinationId === route.destinationId),
-      route.sourceId,
-    ),
-  );
-  const pendingTakeHasStaleRevision = pendingTake.some((route) => {
-    const currentRevision =
-      routes.find((item) => item.destinationId === route.destinationId)
-        ?.revision ?? 0;
-    return currentRevision !== route.expectedRouteRevision;
-  });
-  const routeReplacementRequired =
-    selectedSource !== undefined &&
-    routeRequiresReplacement(destinationRoute, selectedSource.id);
-  const routeAlreadyRunning =
-    destinationRoute?.observedState === "running" &&
-    destinationRoute.observedSourceId === selectedSource?.id;
-  const routeExecutionBlockReason =
-    destinationRoute &&
-    destinationRoute.desiredState !== "desired" &&
-    destinationRoute.observedState !== "stopped"
-      ? "This destination has route history that is still transitioning. Wait for it to stop before starting another source."
-      : undefined;
-  const routeWrite = useMutation({
-    mutationFn: (input: SetDesiredRouteInput) =>
-      setDesiredRoute(input, apiBaseUrl),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["routes"] });
-    },
-  });
-  const routeBatch = useMutation({
-    mutationFn: (input: {
-      routes: SetDesiredRouteInput[];
-      idempotencyKey: string;
-    }) =>
-      setDesiredRoutesBatch(
-        input.routes,
-        input.idempotencyKey,
-        apiBaseUrl,
-      ),
-    onSuccess: async () => {
-      setPendingTake([]);
-      setTakeIdempotencyKey(undefined);
-      setConfirmTakeReplacements(false);
-      await queryClient.invalidateQueries({ queryKey: ["routes"] });
-    },
-    onError: async (error) => {
-      if (error instanceof ApiRequestError && error.status === 409) {
-        await queryClient.invalidateQueries({ queryKey: ["routes"] });
-      }
-    },
-  });
-  const routeBatchStatus = useQuery({
-    queryKey: ["route-batch-operation", routeBatch.data?.operationId],
-    queryFn: () =>
-      getRouteBatchOperation(routeBatch.data!.operationId, apiBaseUrl),
-    enabled: routeBatch.data?.operationId !== undefined,
-    refetchInterval: (query) =>
-      query.state.data?.state === "pending" ||
-      query.state.data?.state === "running"
-        ? 1000
-        : false,
-    retry: false,
-  });
-  const routeBatchExecutionPending =
-    routeBatchStatus.data?.state === "pending" ||
-    routeBatchStatus.data?.state === "running" ||
-    routeBatch.data?.state === "pending" ||
-    routeBatch.data?.state === "running";
-  useEffect(() => {
-    const state = routeBatchStatus.data?.state;
-    if (state === "completed" || state === "partial" || state === "failed") {
-      void queryClient.invalidateQueries({ queryKey: ["routes"] });
-    }
-  }, [queryClient, routeBatchStatus.data?.state]);
   const assignmentPlan = useMutation({
     mutationFn: (input: PlanRouteAssignmentInput) =>
       planRouteAssignment(input, apiBaseUrl),
@@ -1476,78 +1383,6 @@ function WorkspaceView({
   });
   const lifecycleActionPending =
     start.isPending || stop.isPending || cancel.isPending;
-  const executeRoute = useMutation({
-    mutationFn: async (input: {
-      source: SourceRecord;
-      destination: DestinationRecord;
-    }) => {
-      const existingRoute = routes.find(
-        (route) => route.destinationId === input.destination.id,
-      );
-      if (
-        !existingRoute ||
-        existingRoute.desiredState !== "desired" ||
-        existingRoute.sourceId !== input.source.id
-      ) {
-        await routeWrite.mutateAsync({
-          sourceId: input.source.id,
-          destinationId: input.destination.id,
-          expectedRouteRevision: existingRoute?.revision ?? 0,
-          confirmReplace: false,
-        });
-      }
-
-      const assignmentInput: PlanRouteAssignmentInput = {
-        pipelineId: createPipelineId(),
-        idempotencyKey: createPipelineId(),
-        sourceId: input.source.id,
-        sourceRevision: input.source.currentRevision,
-        destinationId: input.destination.id,
-        destinationRevision: input.destination.currentRevision,
-      };
-      const planResult = await assignmentPlan
-        .mutateAsync(assignmentInput)
-        .catch((error: unknown) => {
-          const message =
-            error instanceof Error ? error.message : "unknown planning error";
-          throw new Error(
-            `Desired route is set, but worker planning failed: ${message}`,
-          );
-        });
-      if (planResult.state !== "planned" || !planResult.assignment) {
-        throw new Error(
-          `Desired route is set, but no worker assignment was created${
-            planResult.reason ? `: ${planResult.reason}` : "."
-          }`,
-        );
-      }
-
-      const assignment = planResult.assignment;
-      const snapshot = await start
-        .mutateAsync({
-          pipelineId: assignment.pipelineId,
-          assignmentId: assignment.id,
-          generation: assignment.generation,
-        })
-        .catch((error: unknown) => {
-          const message =
-            error instanceof Error ? error.message : "unknown worker error";
-          throw new Error(
-            `Desired route is set and planned, but worker Start was not confirmed: ${message}`,
-          );
-        });
-      return { snapshot, pipelineId: assignment.pipelineId };
-    },
-    onSuccess: async (result) => {
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["routes"] }),
-        queryClient.invalidateQueries({
-          queryKey: ["pipeline-assignment", result.pipelineId],
-        }),
-      ]);
-      routeWrite.reset();
-    },
-  });
   const assignmentVariables =
     assignmentPlan.variables ?? assignmentRequest;
   const assignmentPlanMatchesSelection =
@@ -1583,7 +1418,6 @@ function WorkspaceView({
     assignmentPlanResult?.state !== "unavailable" &&
     assignmentPlanResult?.state !== "cancelled";
   const canCreateAssignment =
-    routeMode === "immediate" &&
     selectedSource?.lifecycle === "validated" &&
     selectedDestination?.lifecycle === "validated" &&
     !assignmentPlan.isPending &&
@@ -1596,48 +1430,6 @@ function WorkspaceView({
     (!currentAssignment || currentAssignmentIsTerminal) &&
     (assignmentPlanResult?.assignment == null ||
       currentAssignmentIsTerminal);
-  const canExecuteSelectedRoute =
-    selectedSource?.lifecycle === "validated" &&
-    selectedDestination?.lifecycle === "validated" &&
-    !routesLoading &&
-    !routeWrite.isPending &&
-    !routeBatch.isPending &&
-    !routeBatchExecutionPending &&
-    !assignmentPlan.isPending &&
-    !waitPending &&
-    !lifecycleActionPending &&
-    !executeRoute.isPending &&
-    !routeExecutionBlockReason &&
-    !routeAlreadyRunning &&
-    (routeReplacementRequired ||
-      (canCreateAssignment &&
-        (!destinationRoute ||
-          (destinationRoute.desiredState === "desired" &&
-            destinationRoute.sourceId === selectedSource.id)) &&
-        destinationRoute?.observedState !== "running" &&
-        (!destinationRoute?.observedSourceId ||
-          destinationRoute.observedSourceId === selectedSource.id)));
-  const canSaveTake =
-    routeMode === "take" &&
-    pendingTake.length > 0 &&
-    !routesLoading &&
-    !pendingTakeHasStaleRevision &&
-    pendingTake.every((route) => {
-      const source = sources.find((item) => item.id === route.sourceId);
-      const destination = destinations.find(
-        (item) => item.id === route.destinationId,
-      );
-      return source?.lifecycle === "validated" &&
-        destination?.lifecycle === "validated";
-    }) &&
-    (pendingTakeReplacements.length === 0 || confirmTakeReplacements) &&
-    !routeBatch.isPending &&
-    !routeBatchExecutionPending &&
-    !routeWrite.isPending;
-  const routeBatchResult = routeBatchStatus.data ?? routeBatch.data;
-  const executeRouteMatchesSelection =
-    executeRoute.variables?.source.id === selectedSource?.id &&
-    executeRoute.variables?.destination.id === selectedDestination?.id;
 
   async function invalidateResourceRecords() {
     await Promise.all([
@@ -1647,107 +1439,8 @@ function WorkspaceView({
     ]);
   }
 
-  function submitDesiredRoute() {
-    if (
-      routeMode !== "immediate" ||
-      !selectedSource ||
-      !selectedDestination ||
-      !routePlan.isSuccess ||
-      !resultMatchesSelection ||
-      selectedSource.lifecycle !== "validated" ||
-      selectedDestination.lifecycle !== "validated"
-    ) {
-      return;
-    }
-
-    routeWrite.reset();
-    executeRoute.reset();
-    const input: SetDesiredRouteInput = {
-      sourceId: selectedSource.id,
-      destinationId: selectedDestination.id,
-      expectedRouteRevision: destinationRoute?.revision ?? 0,
-      confirmReplace: false,
-    };
-    if (
-      destinationRoute?.desiredState === "desired" &&
-      destinationRoute.sourceId !== selectedSource.id
-    ) {
-      const replacedSource = sources.find(
-        (source) => source.id === destinationRoute.sourceId,
-      );
-      setReplaceRoute({
-        input: { ...input, confirmReplace: true },
-        sourceName: selectedSource.friendlyName,
-        destinationName: selectedDestination.friendlyName,
-        replacedSourceName: replacedSource?.friendlyName ?? "another input",
-        action: "save",
-      });
-      return;
-    }
-    routeWrite.mutate(input);
-  }
-
-  function submitTake() {
-    if (!canSaveTake) return;
-    const idempotencyKey = takeIdempotencyKey ?? createPipelineId();
-    setTakeIdempotencyKey(idempotencyKey);
-    setRouteBatchOrigin("take");
-    routeBatch.mutate({
-      idempotencyKey,
-      routes: pendingTake.map((route) => {
-        const currentRoute = routes.find(
-          (item) => item.destinationId === route.destinationId,
-        );
-        return {
-          sourceId: route.sourceId,
-          destinationId: route.destinationId,
-          expectedRouteRevision: route.expectedRouteRevision,
-          confirmReplace: routeRequiresReplacement(currentRoute, route.sourceId),
-        };
-      }),
-    });
-  }
-
-  function submitImmediateRoute() {
-    if (
-      routeMode !== "immediate" ||
-      !selectedSource ||
-      !selectedDestination ||
-      !canExecuteSelectedRoute
-    ) {
-      return;
-    }
-
-    routeWrite.reset();
-    if (routeReplacementRequired) {
-      const replacedSource = sources.find(
-        (source) =>
-          source.id ===
-          (destinationRoute?.observedSourceId ?? destinationRoute?.sourceId),
-      );
-      setReplaceRoute({
-        input: {
-          sourceId: selectedSource.id,
-          destinationId: selectedDestination.id,
-          expectedRouteRevision: destinationRoute?.revision ?? 0,
-          confirmReplace: true,
-        },
-        sourceName: selectedSource.friendlyName,
-        destinationName: selectedDestination.friendlyName,
-        replacedSourceName: replacedSource?.friendlyName ?? "the current input",
-        action: "execute",
-      });
-      return;
-    }
-    executeRoute.mutate({
-      source: selectedSource,
-      destination: selectedDestination,
-    });
-  }
-
   function submitAssignment() {
     if (
-      routeMode !== "immediate" ||
       !selectedSource ||
       !selectedDestination ||
       selectedSource.lifecycle !== "validated" ||
@@ -1791,484 +1484,25 @@ function WorkspaceView({
 
   return (
     <Stack spacing={2.5}>
-      <Paper variant="outlined" sx={{ p: { xs: 2, md: 3 } }}>
-        <Stack
-          direction={{ xs: "column", md: "row" }}
-          justifyContent="space-between"
-          alignItems={{ xs: "flex-start", md: "center" }}
-          spacing={2}
-          sx={{ mb: 2.5 }}
-        >
-          <Box>
-            <Stack direction="row" spacing={1} alignItems="center">
-              <Typography variant="h6" component="h2">
-                Routing matrix
-              </Typography>
-              <Chip
-                size="small"
-                label="Planned"
-                color="warning"
-                variant="outlined"
-              />
-            </Stack>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-              Select an input/output crosspoint. Immediate mode starts an
-              eligible route; Take mode stages selections for review.
-            </Typography>
-          </Box>
-          <Chip label="Up to 64 × 64" size="small" />
-        </Stack>
-        <CrosspointMatrix
-          sources={sources}
-          destinations={destinations}
-          routes={routes}
-          routesLoading={routesLoading}
-          routesError={routesError}
-          selectedSourceId={selectedSourceId}
-          selectedDestinationId={selectedDestinationId}
-          onSelect={(sourceId, destinationId) => {
-            onSourceChange(sourceId);
-            onDestinationChange(destinationId);
-            if (routeMode === "take") {
-              const staged = stageRouteSelection(pendingTake, {
-                sourceId,
-                destinationId,
-                expectedRouteRevision:
-                  routes.find((route) => route.destinationId === destinationId)
-                    ?.revision ?? 0,
-              });
-              if (staged !== pendingTake) {
-                setPendingTake(staged);
-                setTakeIdempotencyKey(createPipelineId());
-                setConfirmTakeReplacements(false);
-                routeBatch.reset();
-              }
-            }
-          }}
-        />
-        <FormControlLabel
-          control={
-            <Switch
-              checked={routeMode === "take"}
-              disabled={pendingTake.length > 0}
-              onChange={(_, checked) =>
-                setRouteMode(checked ? "take" : "immediate")
-              }
-            />
-          }
-          label={
-            routeMode === "take"
-              ? "Take mode (stage changes)"
-              : "Immediate mode"
-          }
-        />
-        {routeMode === "take" && (
-          <Stack spacing={1.5} sx={{ mt: 2 }}>
-            <Alert severity="info">
-              A Take saves all desired routes atomically, then executes each
-              route independently. Confirmed replacements prepare the new path
-              before stopping the current route; failed preparation leaves the
-              current route untouched. After the hard cut, ARC attempts to
-              restore the previous route if the replacement cannot start.
-              Outcomes appear below; one route does not roll back successful
-              sibling routes.
-            </Alert>
-            {pendingTakeHasStaleRevision && (
-              <Alert severity="warning">
-                A destination changed after staging. Select its crosspoint
-                again to refresh the expected revision, or cancel the Take.
-              </Alert>
-            )}
-            {pendingTake.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">
-                Select crosspoints in the matrix to add them to this Take.
-              </Typography>
-            ) : (
-              <Stack spacing={1}>
-                <Typography variant="subtitle2">
-                  Pending Take ({pendingTake.length})
-                </Typography>
-                {pendingTake.map((route) => {
-                  const source = sources.find(
-                    (item) => item.id === route.sourceId,
-                  );
-                  const destination = destinations.find(
-                    (item) => item.id === route.destinationId,
-                  );
-                  return (
-                    <Paper
-                      key={route.destinationId}
-                      variant="outlined"
-                      sx={{ p: 1.25 }}
-                    >
-                      <Stack
-                        direction="row"
-                        alignItems="center"
-                        justifyContent="space-between"
-                        spacing={1}
-                      >
-                        <Typography variant="body2">
-                          {source?.friendlyName ?? "Unavailable input"} →{" "}
-                          {destination?.friendlyName ?? "Unavailable output"}
-                        </Typography>
-                        <Button
-                          size="small"
-                          onClick={() => {
-                            setPendingTake((current) =>
-                              current.filter(
-                                (item) =>
-                                  item.destinationId !== route.destinationId,
-                              ),
-                            );
-                            setTakeIdempotencyKey(createPipelineId());
-                            setConfirmTakeReplacements(false);
-                            routeBatch.reset();
-                          }}
-                        >
-                          Remove
-                        </Button>
-                      </Stack>
-                    </Paper>
-                  );
-                })}
-              </Stack>
-            )}
-            {pendingTakeReplacements.length > 0 && (
-              <Stack spacing={1}>
-                <Alert severity="warning">
-                  This Take replaces the desired source for{" "}
-                  {pendingTakeReplacements.length} destination
-                  {pendingTakeReplacements.length === 1 ? "" : "s"}. Any
-                  active route will continue while ARC prepares its
-                  replacement. Switching is a hard cut, not a seamless
-                  crossfade; if the new route fails to start, ARC attempts to
-                  restore the previous route.
-                </Alert>
-                <FormControlLabel
-                  control={
-                    <Checkbox
-                      checked={confirmTakeReplacements}
-                      onChange={(_, checked) =>
-                        setConfirmTakeReplacements(checked)
-                      }
-                    />
-                  }
-                  label="Confirm replacing existing desired routes"
-                />
-              </Stack>
-            )}
-            {routeBatch.isError && (
-              <Alert severity="error">
-                {routeBatch.error instanceof ApiRequestError &&
-                routeBatch.error.status === 409
-                  ? "The batch conflicted with current route state. No changes were saved; refresh and re-stage the Take."
-                  : "The Take could not be confirmed. Retry it to safely reuse its operation key before staging a new Take."}
-              </Alert>
-            )}
-            {routeBatchStatus.isError && (
-              <Alert severity="error">
-                The Take was accepted, but its execution status could not be
-                refreshed. Operation {routeBatch.data?.operationId} remains
-                available for review.
-              </Alert>
-            )}
-            {routeBatch.isSuccess && routeBatchResult && (
-              <Alert
-                severity={
-                  routeBatchResult.state === "completed"
-                    ? "success"
-                    : routeBatchResult.state === "partial"
-                      ? "warning"
-                      : routeBatchResult.state === "failed"
-                        ? "error"
-                        : "info"
-                }
-              >
-                {routeBatchResult.state === "completed"
-                  ? `Take completed; ${routeBatchResult.results?.length ?? routeBatchResult.routes.length} route(s) were acknowledged by workers.`
-                  : routeBatchResult.state === "partial"
-                    ? "Take partially completed. Review the per-route outcomes below."
-                    : routeBatchResult.state === "failed"
-                      ? "Take failed. Review the per-route outcomes below."
-                      : routeBatchResult.state === "desired_state_applied"
-                        ? "Desired routes were saved, but this API has not reported worker execution."
-                        : routeBatchResult.state === "running"
-                          ? "Take execution is in progress. Waiting for worker acknowledgements."
-                          : "Take was durably accepted and is waiting for worker execution."}{" "}
-                (operation {routeBatchResult.operationId}).
-              </Alert>
-            )}
-            {(routeBatchResult?.results ?? []).map((result) => {
-              const source = sources.find((item) => item.id === result.sourceId);
-              const destination = destinations.find(
-                (item) => item.id === result.destinationId,
-              );
-              return (
-                <Alert
-                  key={result.destinationId}
-                  severity={
-                    result.state === "succeeded"
-                      ? "success"
-                      : result.state === "failed"
-                        ? "error"
-                        : "info"
-                  }
-                >
-                  {source?.friendlyName ?? "Unavailable input"} →{" "}
-                  {destination?.friendlyName ?? "Unavailable output"}:{" "}
-                  {result.state === "succeeded"
-                    ? "worker acknowledged Start"
-                    : result.state === "failed"
-                      ? `${result.errorCode ?? "execution_failed"} — ${result.errorMessage ?? "No further details are available."}`
-                      : result.errorMessage ??
-                        (result.state === "processing"
-                          ? "starting on a worker"
-                          : "waiting for a worker")}
-                </Alert>
-              );
-            })}
-            <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
-              <Button
-                variant="outlined"
-                disabled={pendingTake.length === 0}
-                onClick={() => {
-                  setPendingTake([]);
-                  setTakeIdempotencyKey(undefined);
-                  setConfirmTakeReplacements(false);
-                  routeBatch.reset();
-                }}
-              >
-                Cancel Take
-              </Button>
-              <Button
-                variant="contained"
-                disabled={!canSaveTake}
-                onClick={submitTake}
-              >
-                {routeBatch.isPending ? "Submitting Take…" : "Execute Take"}
-              </Button>
-            </Stack>
-          </Stack>
-        )}
-        <Stack
-          spacing={1.5}
-          sx={{
-            mt: 2,
-            display: routeMode === "immediate" ? undefined : "none",
-          }}
-        >
-          <Typography variant="body2" color="text.secondary">
-            Start selected route assigns a worker and requests Start. For a
-            confirmed replacement, the new path is prepared before the current
-            route is stopped. Switching is a hard cut; if the new route fails
-            to start, ARC attempts to restore the previous route.
-          </Typography>
-          <Button
-            variant="contained"
-            onClick={submitImmediateRoute}
-            disabled={!canExecuteSelectedRoute}
-          >
-            {routeBatch.isPending
-              ? "Submitting replacement…"
-              : routeReplacementRequired
-                ? "Replace selected route"
-                : executeRoute.isPending
-                  ? "Starting route…"
-                  : "Start selected route"}
-          </Button>
-          {routeExecutionBlockReason && (
-            <Alert severity="info">{routeExecutionBlockReason}</Alert>
-          )}
-          {executeRoute.isPending && executeRouteMatchesSelection && (
-            <Alert severity="info">
-              Desired route is set. Planning a worker assignment and waiting
-              for its Start response; media is not confirmed yet.
-            </Alert>
-          )}
-          {executeRoute.isSuccess &&
-            executeRouteMatchesSelection &&
-            (executeRoute.data.snapshot.observedState === "running" ? (
-              <Alert severity="success">
-                Worker confirmed the route as running. The matrix is
-                refreshing observed state.
-              </Alert>
-            ) : (
-              <Alert severity="info">
-                Start returned worker state "
-                {executeRoute.data.snapshot.observedState}". The matrix is
-                refreshing observed state.
-              </Alert>
-            ))}
-          {executeRoute.isError &&
-            executeRouteMatchesSelection && (
-              <Alert severity="error">
-                Unable to start route: {executeRoute.error.message}
-              </Alert>
-            )}
-          {routeBatchOrigin === "immediate" && routeBatch.isError && (
-            <Alert severity="error">
-              {routeBatch.error instanceof ApiRequestError &&
-              routeBatch.error.status === 409
-                ? "The route changed before replacement. Refresh the matrix and try again."
-                : `The replacement could not be submitted: ${routeBatch.error.message}`}
-            </Alert>
-          )}
-          {routeBatchOrigin === "immediate" &&
-            routeBatchStatus.isError && (
-              <Alert severity="error">
-                The replacement was accepted, but its status could not be
-                refreshed. Operation {routeBatch.data?.operationId} remains
-                available for review.
-              </Alert>
-            )}
-          {routeBatchOrigin === "immediate" &&
-            routeBatch.isSuccess &&
-            routeBatchResult && (
-              <>
-                <Alert
-                  severity={
-                    routeBatchResult.state === "completed"
-                      ? "success"
-                      : routeBatchResult.state === "failed" ||
-                          routeBatchResult.state === "partial"
-                        ? "warning"
-                        : "info"
-                  }
-                >
-                  {routeBatchResult.state === "completed"
-                    ? "The replacement was acknowledged by the worker."
-                    : routeBatchResult.state === "failed"
-                      ? "The replacement failed. Review the recovery result below."
-                      : routeBatchResult.state === "running"
-                        ? "The replacement is in progress; waiting for worker acknowledgements."
-                        : "The replacement was accepted and is waiting for execution."}{" "}
-                  (operation {routeBatchResult.operationId}).
-                </Alert>
-                {(routeBatchResult.results ?? []).map((result) => (
-                  <Alert
-                    key={result.destinationId}
-                    severity={result.state === "succeeded" ? "success" : result.state === "failed" ? "warning" : "info"}
-                  >
-                    {sources.find((item) => item.id === result.sourceId)?.friendlyName ??
-                      "Unavailable input"}{" "}
-                    →{" "}
-                    {destinations.find(
-                      (item) => item.id === result.destinationId,
-                    )?.friendlyName ?? "Unavailable output"}
-                    :{" "}
-                    {result.state === "succeeded"
-                      ? "worker acknowledged Start"
-                      : result.errorMessage ??
-                        (result.state === "processing"
-                          ? "executing on a worker"
-                          : "waiting for a worker")}
-                  </Alert>
-                ))}
-              </>
-            )}
-          <Button
-            variant="outlined"
-            onClick={submitDesiredRoute}
-            disabled={
-              !selectedSource ||
-              !selectedDestination ||
-              selectedSource.lifecycle !== "validated" ||
-              selectedDestination.lifecycle !== "validated" ||
-              !routePlan.isSuccess ||
-              !resultMatchesSelection ||
-              routesLoading ||
-              routeWrite.isPending ||
-              (destinationRoute?.desiredState === "desired" &&
-                destinationRoute.sourceId === selectedSource.id)
-            }
-          >
-            {routeWrite.isPending
-              ? "Saving desired route…"
-              : destinationRoute?.desiredState === "desired" &&
-                  destinationRoute.sourceId === selectedSource?.id
-                ? "Route already desired"
-                : "Save desired route"}
-          </Button>
-          {routeWrite.isSuccess &&
-            !executeRouteMatchesSelection &&
-            routeWrite.variables?.sourceId === selectedSource?.id &&
-            routeWrite.variables?.destinationId === selectedDestination?.id && (
-              <Alert severity="success">
-                Desired route saved only. Media has not been started or
-                confirmed.
-              </Alert>
-            )}
-          {routeWrite.isError &&
-            routeWrite.variables?.sourceId === selectedSource?.id &&
-            routeWrite.variables?.destinationId === selectedDestination?.id && (
-              <Alert severity="error">
-                Unable to save route: {routeWrite.error.message}
-              </Alert>
-            )}
-        </Stack>
-        <Dialog
-          open={replaceRoute !== null}
-          onClose={() => setReplaceRoute(null)}
-        >
-          <DialogTitle>
-            {replaceRoute?.action === "execute"
-              ? "Replace active route?"
-              : "Replace desired route?"}
-          </DialogTitle>
-          <DialogContent>
-            <DialogContentText>
-              {replaceRoute
-                ? replaceRoute.action === "execute"
-                  ? `Replace ${replaceRoute.replacedSourceName} on ${replaceRoute.destinationName} with ${replaceRoute.sourceName}? ARC will prepare the new path first, then stop the current route and start the replacement. This is a hard cut; if Start fails, ARC will attempt to restore the previous route.`
-                  : `Replace the desired route from ${replaceRoute.replacedSourceName} to ${replaceRoute.destinationName} with ${replaceRoute.sourceName}? This saves desired state only; it does not switch live media.`
-                : ""}
-            </DialogContentText>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => setReplaceRoute(null)}>Cancel</Button>
-            <Button
-              variant="contained"
-              disabled={routeWrite.isPending || routeBatch.isPending}
-              onClick={() => {
-                if (!replaceRoute) return;
-                const { input, action } = replaceRoute;
-                setReplaceRoute(null);
-                if (action === "save") {
-                  routeWrite.mutate(input);
-                } else {
-                  const idempotencyKey = createPipelineId();
-                  setTakeIdempotencyKey(idempotencyKey);
-                  setRouteBatchOrigin("immediate");
-                  routeBatch.mutate({
-                    idempotencyKey,
-                    routes: [input],
-                  });
-                }
-              }}
-            >
-              {replaceRoute?.action === "execute"
-                ? "Confirm and execute"
-                : "Confirm replacement"}
-            </Button>
-          </DialogActions>
-        </Dialog>
-        <Stack
-          direction={{ xs: "column", sm: "row" }}
-          justifyContent="space-between"
-          spacing={1}
-          sx={{ mt: 1.5 }}
-        >
-          <Typography variant="caption" color="text.secondary">
-            Selected:{" "}
-            {selectedSource?.friendlyName ?? "no input"} →{" "}
-            {selectedDestination?.friendlyName ?? "no output"}
-          </Typography>
-          <Typography variant="caption" color="text.secondary">
-            Inputs {sources.length} · Outputs {destinations.length}
-          </Typography>
-        </Stack>
-      </Paper>
-
+      <RoutingWorkspace
+        apiBaseUrl={apiBaseUrl}
+        mode="routes"
+        sources={sources}
+        destinations={destinations}
+        routes={routes}
+        routesLoading={routesLoading}
+        routesError={routesError}
+        sourceError={sourceError}
+        destinationError={destinationError}
+        onSelect={(sourceId, destinationId) => {
+          onSourceChange(sourceId);
+          onDestinationChange(destinationId);
+        }}
+      />
+      <Accordion>
+        <AccordionSummary>Advanced routing diagnostics</AccordionSummary>
+        <AccordionDetails>
+          <Stack spacing={2.5}>
       <Card>
         <CardContent>
           <Stack
@@ -2380,7 +1614,7 @@ function WorkspaceView({
         </CardContent>
       </Card>
 
-      <Card sx={{ display: routeMode === "immediate" ? undefined : "none" }}>
+      <Card>
         <CardContent>
           <Stack spacing={2}>
             <Box>
@@ -2392,7 +1626,7 @@ function WorkspaceView({
                 then Start or Stop it; unstarted assignments can be cancelled.
                 Planning alone does not start media. New plans are rejected
                 while that destination has a planned or non-stopped assignment.
-                Use Immediate or Take execution to replace an occupied route;
+                Use the crosspoint Take menu to replace an occupied route;
                 direct assignment planning does not switch routes.
               </Typography>
             </Box>
@@ -2664,6 +1898,9 @@ function WorkspaceView({
           </Stack>
         </CardContent>
       </Card>
+          </Stack>
+        </AccordionDetails>
+      </Accordion>
     </Stack>
   );
 }
@@ -2674,6 +1911,7 @@ type ResourceWorkspaceProps =
       loading: boolean;
       error: string;
       records: SourceRecord[];
+      onDelete: (record: SourceRecord | DestinationRecord) => Promise<void>;
       saveError: string;
       editingId?: string;
       onEdit: (record: SourceRecord | DestinationRecord) => void;
@@ -2705,6 +1943,7 @@ type ResourceWorkspaceProps =
       loading: boolean;
       error: string;
       records: DestinationRecord[];
+      onDelete: (record: SourceRecord | DestinationRecord) => Promise<void>;
       saveError: string;
       editingId?: string;
       onEdit: (record: SourceRecord | DestinationRecord) => void;
@@ -2731,132 +1970,184 @@ type ResourceWorkspaceProps =
 function ResourceWorkspace(props: ResourceWorkspaceProps) {
   const isInput = props.kind === "input";
   const label = isInput ? "Input" : "Output";
-  const actionLabel = props.editingId
-    ? `Save ${label.toLowerCase()} changes`
-    : `Create ${label.toLowerCase()} draft`;
+  const [creating, setCreating] = useState(false);
+  const [deleting, setDeleting] = useState<SourceRecord | DestinationRecord>();
+  const remove = useMutation({
+    mutationFn: props.onDelete,
+    onSuccess: () => {
+      setDeleting(undefined);
+      props.onCancelEdit();
+    },
+  });
+  const busy = props.saving || remove.isPending || !!props.validatingId;
+  const arrow = <span aria-hidden="true">&#9662;</span>;
+  const editor = (readOnly: boolean) => (
+    <Stack component="form" spacing={2} onSubmit={props.onSubmit}>
+      {readOnly && (
+        <Alert severity="info">
+          This {props.kind} is enabled. Unroute all assignments using it before
+          editing or deleting. Opening this editor does not stop media.
+        </Alert>
+      )}
+      <TextField
+        label="Friendly name"
+        value={props.name}
+        onChange={(event) => props.onNameChange(event.target.value)}
+        required
+        disabled={readOnly || busy}
+        inputProps={{ maxLength: 120 }}
+      />
+      {isInput ? (
+        <SourceFields {...props} disabled={readOnly || busy} />
+      ) : (
+        <DestinationFields {...props} disabled={readOnly || busy} />
+      )}
+      {props.saveError && (
+        <Alert severity="error">{label} could not be saved: {props.saveError}</Alert>
+      )}
+      <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+        <Button type="submit" variant="contained" disabled={readOnly || busy}>
+          {props.saving ? "Saving..." : props.editingId
+            ? `Save ${props.kind} changes` : `Create ${props.kind} draft`}
+        </Button>
+        {props.editingId && (
+          <Button type="button" disabled={busy} onClick={props.onCancelEdit}>Cancel</Button>
+        )}
+      </Stack>
+    </Stack>
+  );
   return (
     <Stack spacing={2.5}>
       <Alert severity="info">
-        {props.editingId
-          ? "Saving creates a new disabled draft revision. Validate it before use; the previous revision is preserved."
-          : "New resources are saved as disabled drafts. Validation checks the saved configuration but does not start media. Starting an assignment enables its input and output; they stay enabled while an active assignment uses them and are disabled after the last such assignment stops."}
+        New and edited resources are disabled drafts. Validate them before use;
+        validation does not start media. Expand a row to edit, validate or delete
+        it. Enabled resources cannot be edited or deleted; referenced resources
+        cannot be deleted, including those retained in route history or salvos.
       </Alert>
-      <Box
-        sx={{
-          display: "grid",
-          gridTemplateColumns: { xs: "1fr", lg: "minmax(320px, .8fr) 1.2fr" },
-          gap: 2.5,
-          alignItems: "start",
+      <Accordion
+        expanded={creating && !props.editingId}
+        onChange={(_, expanded) => {
+          setCreating(expanded);
+          if (expanded && props.editingId) props.onCancelEdit();
         }}
+        disableGutters
       >
-        <Card>
-          <CardContent>
-            <Stack component="form" spacing={2} onSubmit={props.onSubmit}>
+        <AccordionSummary expandIcon={arrow} disabled={busy}>
+          <Typography variant="h6" component="span">New {props.kind}</Typography>
+        </AccordionSummary>
+        <AccordionDetails>
+          {creating && !props.editingId && editor(false)}
+        </AccordionDetails>
+      </Accordion>
+      <Card>
+        <CardContent>
+          <Stack spacing={2}>
+            <Stack direction="row" justifyContent="space-between" alignItems="center">
               <Typography variant="h6" component="h2">
-                {props.editingId
-                  ? `Edit ${label.toLowerCase()}`
-                  : `Configure ${label.toLowerCase()}`}
+                Configured {isInput ? "inputs" : "outputs"}
               </Typography>
-              <TextField
-                label="Friendly name"
-                value={props.name}
-                onChange={(event) => props.onNameChange(event.target.value)}
-                required
-                inputProps={{ maxLength: 120 }}
-              />
-              {isInput ? (
-                <SourceFields {...props} />
-              ) : (
-                <DestinationFields {...props} />
-              )}
-              {props.saveError && (
-                <Alert severity="error">
-                  {label} could not be saved: {props.saveError}
-                </Alert>
-              )}
-              <Stack direction="row" spacing={1}>
-                <Button
-                  type="submit"
-                  variant="contained"
-                  disabled={props.saving}
-                >
-                  {props.saving ? "Saving..." : actionLabel}
-                </Button>
-                {props.editingId && (
-                  <Button
-                    type="button"
-                    disabled={props.saving}
-                    onClick={props.onCancelEdit}
-                  >
-                    Cancel
-                  </Button>
-                )}
-              </Stack>
+              <Chip size="small" label={props.records.length} />
             </Stack>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent>
-            <Stack spacing={2}>
-              <Stack
-                direction="row"
-                justifyContent="space-between"
-                alignItems="center"
+            {props.error && (
+              <Alert severity="error">{label}s could not be loaded: {props.error}</Alert>
+            )}
+            {props.validationError && (
+              <Alert severity="error">Validation failed: {props.validationError}</Alert>
+            )}
+            {props.loading ? (
+              <Alert severity="info">Loading {props.kind}s...</Alert>
+            ) : props.records.length === 0 ? (
+              <Typography color="text.secondary">No {props.kind}s configured yet.</Typography>
+            ) : props.records.map((record) => (
+              <Accordion
+                key={record.id}
+                disableGutters
+                expanded={props.editingId === record.id}
+                onChange={(_, expanded) => {
+                  setCreating(false);
+                  if (expanded) props.onEdit(record);
+                  else props.onCancelEdit();
+                }}
               >
-                <Typography variant="h6" component="h2">
-                  Configured {isInput ? "inputs" : "outputs"}
-                </Typography>
-                <Chip size="small" label={props.records.length} />
-              </Stack>
-              {props.error && (
-                <Alert severity="error">
-                  {label}s could not be loaded: {props.error}
-                </Alert>
-              )}
-              {props.validationError && (
-                <Alert severity="error">
-                  Validation failed: {props.validationError}
-                </Alert>
-              )}
-              {props.loading ? (
-                <Alert severity="info">Loading {label.toLowerCase()}s...</Alert>
-              ) : props.records.length === 0 ? (
-                <Paper variant="outlined" sx={{ p: 3, textAlign: "center" }}>
-                  <Typography color="text.secondary">
-                    No {label.toLowerCase()}s configured yet.
-                  </Typography>
-                </Paper>
-              ) : (
-                <Stack spacing={1}>
-                  {props.records.map((record) => (
-                    <ResourceRow
-                      key={record.id}
-                      record={record}
-                      kind={props.kind}
-                      validating={props.validatingId === record.id}
-                      onValidate={() => props.onValidate(record.id)}
-                      onEdit={() => props.onEdit(record)}
-                    />
-                  ))}
-                </Stack>
-              )}
-            </Stack>
-          </CardContent>
-        </Card>
-      </Box>
+                <AccordionSummary
+                  expandIcon={arrow}
+                  disabled={busy}
+                  aria-label={`Edit ${props.kind} ${record.friendlyName}`}
+                >
+                  <ResourceRow record={record} />
+                </AccordionSummary>
+                <AccordionDetails>
+                  {props.editingId === record.id && (
+                    <Stack spacing={2}>
+                      {editor(record.desiredState !== "disabled")}
+                      <Stack direction="row" spacing={1}>
+                        {record.lifecycle === "draft" && (
+                          <Button
+                            variant="outlined"
+                            disabled={busy}
+                            onClick={() => props.onValidate(record.id)}
+                            aria-label={`Validate ${props.kind} ${record.friendlyName}`}
+                          >
+                            {props.validatingId === record.id ? "Validating..." : "Validate saved revision"}
+                          </Button>
+                        )}
+                        <Button
+                          color="error"
+                          disabled={record.desiredState !== "disabled" || busy}
+                          onClick={() => { remove.reset(); setDeleting(record); }}
+                          aria-label={`Delete ${props.kind} ${record.friendlyName}`}
+                        >Delete</Button>
+                      </Stack>
+                    </Stack>
+                  )}
+                </AccordionDetails>
+              </Accordion>
+            ))}
+          </Stack>
+        </CardContent>
+      </Card>
+      <Dialog
+        open={!!deleting}
+        onClose={() => { if (!remove.isPending) setDeleting(undefined); }}
+        aria-labelledby="delete-resource-title"
+      >
+        <DialogTitle id="delete-resource-title">Delete {props.kind}?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Permanently delete {deleting?.friendlyName}? This cannot be undone.
+            Only unused resources can be deleted; routes, history, assignments,
+            signals and saved salvos prevent deletion.
+          </DialogContentText>
+          {remove.isError && (
+            <Alert severity="error" sx={{ mt: 2 }}>
+              {remove.error instanceof ApiRequestError && remove.error.status === 409
+                ? "Deletion blocked: the resource changed, is enabled, or is referenced. Reload it and check active routes, history and salvos."
+                : `Deletion failed: ${remove.error.message}`}
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={remove.isPending} onClick={() => setDeleting(undefined)}>Cancel</Button>
+          <Button
+            color="error"
+            disabled={remove.isPending || !deleting}
+            onClick={() => { if (deleting) remove.mutate(deleting); }}
+          >{remove.isPending ? "Deleting..." : `Delete ${props.kind}`}</Button>
+        </DialogActions>
+      </Dialog>
     </Stack>
   );
 }
 
 function SourceFields(
-  props: Extract<ResourceWorkspaceProps, { kind: "input" }>,
+  props: Extract<ResourceWorkspaceProps, { kind: "input" }> & { disabled: boolean },
 ) {
   return (
     <>
       <TextField
         select
         label="Input profile"
+        disabled={props.disabled}
         value={props.profileKind}
         onChange={(event) =>
           props.onProfileKindChange(
@@ -2881,6 +2172,7 @@ function SourceFields(
       {props.profileKind === "alsa_l16" ? (
         <TextField
           label="ALSA device"
+          disabled={props.disabled}
           value={props.sourceDevice}
           onChange={(event) => props.onSourceDeviceChange(event.target.value)}
           required
@@ -2888,6 +2180,7 @@ function SourceFields(
       ) : (
         <>
           <TextField
+            disabled={props.disabled}
             label={
               props.profileKind === "srt_mpeg_ts" ? "SRT host" : "Bind address"
             }
@@ -2907,6 +2200,7 @@ function SourceFields(
           />
           <TextField
             label={props.profileKind === "srt_mpeg_ts" ? "SRT port" : "UDP port"}
+            disabled={props.disabled}
             type="number"
             value={props.sourcePort}
             onChange={(event) => props.onSourcePortChange(event.target.value)}
@@ -2917,6 +2211,7 @@ function SourceFields(
             props.profileKind === "rtp_l24") && (
             <TextField
               label="RTP payload type"
+              disabled={props.disabled}
               type="number"
               value={props.sourcePayloadType}
               onChange={(event) =>
@@ -2930,6 +2225,7 @@ function SourceFields(
             <TextField
               select
               label="SRT mode"
+              disabled={props.disabled}
               value={props.sourceMode}
               onChange={(event) =>
                 props.onSourceModeChange(
@@ -2948,13 +2244,14 @@ function SourceFields(
 }
 
 function DestinationFields(
-  props: Extract<ResourceWorkspaceProps, { kind: "output" }>,
+  props: Extract<ResourceWorkspaceProps, { kind: "output" }> & { disabled: boolean },
 ) {
   return (
     <>
       <TextField
         select
         label="Output profile"
+        disabled={props.disabled}
         value={props.profileKind}
         onChange={(event) =>
           props.onProfileKindChange(
@@ -2973,6 +2270,7 @@ function DestinationFields(
       )}
       <TextField
         label={props.profileKind === "srt_mpeg_ts" ? "Host" : "Address"}
+        disabled={props.disabled}
         value={props.destinationAddress}
         onChange={(event) =>
           props.onDestinationAddressChange(event.target.value)
@@ -2981,6 +2279,7 @@ function DestinationFields(
       />
       <TextField
         label="Destination port"
+        disabled={props.disabled}
         type="number"
         value={props.destinationPort}
         onChange={(event) => props.onDestinationPortChange(event.target.value)}
@@ -2990,6 +2289,7 @@ function DestinationFields(
       {props.profileKind !== "srt_mpeg_ts" ? (
         <TextField
           label="RTP payload type"
+          disabled={props.disabled}
           type="number"
           value={props.destinationPayloadType}
           onChange={(event) =>
@@ -3002,6 +2302,7 @@ function DestinationFields(
         <TextField
           select
           label="SRT mode"
+          disabled={props.disabled}
           value={props.destinationMode}
           onChange={(event) =>
             props.onDestinationModeChange(
@@ -3019,20 +2320,11 @@ function DestinationFields(
 
 function ResourceRow({
   record,
-  kind,
-  validating,
-  onValidate,
-  onEdit,
 }: {
   record: SourceRecord | DestinationRecord;
-  kind: "input" | "output";
-  validating: boolean;
-  onValidate: () => void;
-  onEdit: () => void;
 }) {
   return (
-    <Paper
-      variant="outlined"
+    <Box
       sx={{
         px: 1.5,
         py: 1.25,
@@ -3067,29 +2359,7 @@ function ResourceRow({
           />
         </Stack>
       </Box>
-      <Stack direction="row" spacing={0.5} flexShrink={0}>
-        {record.desiredState === "disabled" && (
-          <Button
-            size="small"
-            onClick={onEdit}
-            aria-label={`Edit ${kind} ${record.friendlyName}`}
-          >
-            Edit
-          </Button>
-        )}
-        {record.lifecycle === "draft" && (
-          <Button
-            size="small"
-            variant="outlined"
-            disabled={validating}
-            onClick={onValidate}
-            aria-label={`Validate ${kind} ${record.friendlyName}`}
-          >
-            {validating ? "Validating..." : "Validate"}
-          </Button>
-        )}
-      </Stack>
-    </Paper>
+    </Box>
   );
 }
 
@@ -3202,7 +2472,8 @@ function AdminWorkspace({
               are independently provisioned through deployment secrets.
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Media runtime and route activation are not available yet.
+              Route activation requires a connected worker with matching media
+              capabilities. Review operation results in the crosspoint grid.
             </Typography>
           </Stack>
         </CardContent>

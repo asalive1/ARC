@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type UIEvent } from "react";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type UIEvent } from "react";
 import { Alert, Box, Button, Tooltip, Typography } from "@mui/material";
 
 import type {
@@ -84,7 +84,13 @@ interface CrosspointMatrixProps {
   routesError: string;
   selectedSourceId: string;
   selectedDestinationId: string;
+  selections?: { sourceId: string; destinationId: string }[];
   onSelect: (sourceId: string, destinationId: string) => void;
+  onContextMenu?: (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    sourceId: string,
+    destinationId: string,
+  ) => void;
 }
 
 export function CrosspointMatrix({
@@ -95,7 +101,9 @@ export function CrosspointMatrix({
   routesError,
   selectedSourceId,
   selectedDestinationId,
+  selections,
   onSelect,
+  onContextMenu,
 }: CrosspointMatrixProps) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({
@@ -106,6 +114,7 @@ export function CrosspointMatrix({
   });
   const visibleSources = sources.slice(0, MAX_PORTS);
   const visibleDestinations = destinations.slice(0, MAX_PORTS);
+  const hasPorts = visibleSources.length > 0 && visibleDestinations.length > 0;
   const routesByDestination = new Map(
     routes.map((route) => [route.destinationId, route]),
   );
@@ -118,6 +127,9 @@ export function CrosspointMatrix({
     HEADER_HEIGHT + visibleSources.length * ROW_HEIGHT;
 
   useEffect(() => {
+    if (!hasPorts) {
+      return;
+    }
     const node = viewportRef.current;
     if (!node) {
       return;
@@ -134,7 +146,7 @@ export function CrosspointMatrix({
     const observer = new ResizeObserver(updateSize);
     observer.observe(node);
     return () => observer.disconnect();
-  }, []);
+  }, [hasPorts]);
 
   const rowRange = getVisibleMatrixRange(
     viewport.top,
@@ -167,7 +179,7 @@ export function CrosspointMatrix({
     }));
   }
 
-  if (visibleSources.length === 0 || visibleDestinations.length === 0) {
+  if (!hasPorts) {
     return (
       <Box
         role="status"
@@ -363,9 +375,14 @@ export function CrosspointMatrix({
                   {visibleDestinations
                     .slice(columnRange.start, columnRange.end)
                     .map((destination, visibleIndex) => {
-                      const selected =
-                        source.id === selectedSourceId &&
-                        destination.id === selectedDestinationId;
+                      const selected = selections
+                        ? selections.some(
+                            (selection) =>
+                              selection.sourceId === source.id &&
+                              selection.destinationId === destination.id,
+                          )
+                        : source.id === selectedSourceId &&
+                          destination.id === selectedDestinationId;
                       const destinationRoute = routesByDestination.get(
                         destination.id,
                       );
@@ -408,13 +425,33 @@ export function CrosspointMatrix({
                             height: ROW_HEIGHT,
                           }}
                         >
-                          <Tooltip title={`${source.friendlyName} → ${destination.friendlyName}. ${cellDescription}`}>
+                          <Tooltip disableInteractive title={`${source.friendlyName} → ${destination.friendlyName}. ${cellDescription}`}>
                             <Button
                               aria-label={`Select ${source.friendlyName} to ${destination.friendlyName}. ${cellDescription}`}
                               aria-pressed={selected}
+                              aria-haspopup={onContextMenu ? "menu" : undefined}
                               onClick={() =>
                                 onSelect(source.id, destination.id)
                               }
+                              onContextMenu={
+                                onContextMenu
+                                  ? (event) => onContextMenu(event, source.id, destination.id)
+                                  : undefined
+                              }
+                              onKeyDown={(event) => {
+                                if (onContextMenu &&
+                                    (event.key === "ContextMenu" ||
+                                      (event.shiftKey && event.key === "F10"))) {
+                                  event.preventDefault();
+                                  event.currentTarget.dispatchEvent(
+                                    new MouseEvent("contextmenu", {
+                                      bubbles: true,
+                                      clientX: event.currentTarget.getBoundingClientRect().left,
+                                      clientY: event.currentTarget.getBoundingClientRect().bottom,
+                                    }),
+                                  );
+                                }
+                              }}
                               size="small"
                               color={
                                 selected

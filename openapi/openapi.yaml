@@ -230,6 +230,46 @@ paths:
         "500":
           $ref: "#/components/responses/ApiError"
   /sources/{sourceId}:
+    delete:
+      operationId: deleteSource
+      summary: Permanently delete a disabled unused source
+      description: Requires the current resource revision. Foreign-key references from routes (including removed history), salvos, assignments and signal mappings prevent deletion. Only the unused source and its configuration revisions are removed. Media is never stopped automatically.
+      parameters:
+        - name: sourceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteResourceRequest"
+      responses:
+        "200":
+          description: The unused resource and its configuration revisions were deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    const: true
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          description: resource_enabled, resource_in_use, or stale_resource_revision. No resource, history, assignment or preset is deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
     put:
       operationId: updateSource
       summary: Edit a disabled source as a new draft revision
@@ -319,6 +359,46 @@ paths:
         "500":
           $ref: "#/components/responses/ApiError"
   /destinations/{destinationId}:
+    delete:
+      operationId: deleteDestination
+      summary: Permanently delete a disabled unused destination
+      description: Requires the current resource revision. Route history, salvos, route-batch work and assignment references prevent deletion. Only the unused destination and its configuration revisions are removed. Media is never stopped automatically.
+      parameters:
+        - name: destinationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteResourceRequest"
+      responses:
+        "200":
+          description: The unused resource and its configuration revisions were deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    const: true
+        "422":
+          $ref: "#/components/responses/ApiError"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "409":
+          description: resource_enabled, resource_in_use, or stale_resource_revision. No resource, history, assignment or preset is deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
     put:
       operationId: updateDestination
       summary: Edit a disabled destination as a new draft revision
@@ -637,6 +717,168 @@ paths:
                 $ref: "#/components/schemas/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
+  /presets:
+    get:
+      operationId: listPresets
+      summary: List saved assignment salvos
+      responses:
+        "200":
+          description: Saved presets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Preset"
+    post:
+      operationId: createPreset
+      summary: Create a saved assignment salvo
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PresetInput"
+      responses:
+        "200":
+          description: Created preset.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Preset"
+        default:
+          $ref: "#/components/responses/Problem"
+  /presets/{presetId}:
+    parameters:
+      - name: presetId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    put:
+      operationId: updatePreset
+      summary: Update a preset at its expected revision
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePresetInput"
+      responses:
+        "200":
+          description: Updated preset.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Preset"
+        default:
+          $ref: "#/components/responses/Problem"
+    delete:
+      operationId: deletePreset
+      summary: Delete a preset at its expected revision
+      parameters:
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PresetRevisionInput"
+      responses:
+        "200":
+          description: Preset deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    const: true
+        default:
+          $ref: "#/components/responses/Problem"
+  /presets/{presetId}/execute:
+    post:
+      operationId: executePreset
+      summary: Execute a preset with strict preset and route revisions
+      description: >-
+        Replays an accepted request for the same key even after the preset changes
+        or is deleted. A new execution returns 409 destination_busy if a target
+        destination has already-started execution, cleanup, or restoration pending.
+      parameters:
+        - name: presetId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutePresetInput"
+      responses:
+        "200":
+          description: Durable route operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteBatchOperation"
+        default:
+          $ref: "#/components/responses/Problem"
+  /routes/unroute:
+    post:
+      operationId: unrouteDestination
+      summary: Remove desired routing and durably stop the destination assignment
+      description: >-
+        Worker acknowledgement is required to report a successful Stop. If no
+        assignment is available the desired route is removed but the operation
+        reports stop_unconfirmed. Concurrent execution is serialized by destination;
+        unresolved retries can return destination_busy.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/CsrfToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destinationId, expectedRouteRevision]
+              properties:
+                destinationId:
+                  type: string
+                  format: uuid
+                expectedRouteRevision:
+                  type: integer
+                  minimum: 0
+      responses:
+        "200":
+          description: Durable route operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteBatchOperation"
+        default:
+          $ref: "#/components/responses/Problem"
   /routes:
     get:
       operationId: listRoutes
@@ -657,7 +899,14 @@ paths:
     post:
       operationId: setDesiredRoute
       summary: Set the desired source for a destination
-      description: Validates the current source/destination profiles and atomically records desired route state. expectedRouteRevision must match the latest route revision, using zero when the destination has no route history. Replacing a different desired source requires confirmReplace. This operation does not start media or change observed state.
+      description: >-
+        Validates the current source/destination profiles and atomically records
+        desired route state. expectedRouteRevision must match the latest route
+        revision, using zero when the destination has no route history. Replacing
+        a different desired source requires confirmReplace. Returns 409
+        destination_busy while already-started execution, cleanup, or restoration
+        is unresolved for this destination. This operation does not start media
+        or change observed state.
       requestBody:
         required: true
         content:
@@ -686,8 +935,11 @@ paths:
       description: >-
         Validates every source/destination pair and route revision in one
         transaction. Any validation or revision conflict rolls back the entire
-        desired-state batch. Replacing a different desired source requires
-        confirmReplace. The durable operation then plans and starts each route
+        desired-state batch. A destination with already-started execution,
+        cleanup, or restoration still pending returns 409 destination_busy;
+        the accepted operation remains retryable with its original key.
+        Replacing a different desired source requires confirmReplace.
+        The durable operation then plans and starts each route
         independently, records per-route outcomes, retries transient worker
         unavailability, and resumes leased work after API restart. Replays with
         the same Idempotency-Key and identical routes return the same operation;
@@ -1384,6 +1636,14 @@ components:
           type: [integer, "null"]
           minimum: 0
           description: Estimated egress payload rate, or null if unknown.
+    DeleteResourceRequest:
+      type: object
+      required: [expectedRevision]
+      properties:
+        expectedRevision:
+          type: integer
+          minimum: 1
+          description: Current configuration revision captured when confirming deletion.
     ApiError:
       type: object
       required: [code, message]
@@ -1391,7 +1651,7 @@ components:
         code:
           type: string
           enum:
-            [invalid_request, not_found, invalid_lifecycle, resource_enabled, database_error, internal_error, stale_route_revision, replacement_confirmation_required, source_not_validated, destination_not_validated, assignment_conflict, reservation_conflict, invalid_route_revision, invalid_media_profile, invalid_reservation, invalid_pipeline_id]
+            [invalid_request, not_found, invalid_lifecycle, resource_enabled, resource_in_use, stale_resource_revision, database_error, internal_error, stale_route_revision, replacement_confirmation_required, destination_busy, source_not_validated, destination_not_validated, assignment_conflict, reservation_conflict, invalid_route_revision, invalid_media_profile, invalid_reservation, invalid_pipeline_id]
         message:
           type: string
     RouteProposal:
@@ -1458,6 +1718,57 @@ components:
           description: Duplicate destinationId values are rejected.
           items:
             $ref: "#/components/schemas/SetDesiredRouteRequest"
+    PresetRoute:
+      type: object
+      required: [sourceId, destinationId]
+      properties:
+        sourceId:
+          type: string
+          format: uuid
+        destinationId:
+          type: string
+          format: uuid
+    PresetInput:
+      type: object
+      required: [name, routes]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        routes:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/PresetRoute"
+    PresetRevisionInput:
+      type: object
+      required: [expectedRevision]
+      properties:
+        expectedRevision:
+          type: integer
+          minimum: 1
+    UpdatePresetInput:
+      allOf:
+        - $ref: "#/components/schemas/PresetInput"
+        - $ref: "#/components/schemas/PresetRevisionInput"
+    ExecutePresetInput:
+      allOf:
+        - $ref: "#/components/schemas/PresetRevisionInput"
+        - $ref: "#/components/schemas/SetDesiredRoutesBatchRequest"
+    Preset:
+      allOf:
+        - $ref: "#/components/schemas/PresetInput"
+        - type: object
+          required: [id, revision]
+          properties:
+            id:
+              type: string
+              format: uuid
+            revision:
+              type: integer
+              minimum: 1
     RouteBatchOperation:
       type: object
       required: [operationId, state, routes, results]

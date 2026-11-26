@@ -5,11 +5,18 @@ import {
   cancelCapacityRequest,
   createDestination,
   createSource,
+  deleteSource,
+  deleteDestination,
   fetchPipelineAssignment,
   fetchCapacityRequest,
   fetchLiveness,
   fetchReadiness,
   fetchRoutes,
+  fetchPresets,
+  savePreset,
+  deletePreset,
+  executePreset,
+  unrouteDestination,
   fetchSources,
   getRouteBatchOperation,
   planRoute,
@@ -23,6 +30,87 @@ import {
   validateDestination,
   validateSource,
 } from "./api";
+
+describe("catalog deletion API", () => {
+  it.each([
+    ["sources", deleteSource], ["destinations", deleteDestination],
+  ] as const)("revision-guards %s deletion and requires confirmation", async (path, remove) => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ deleted: true })),
+    );
+    await remove("resource/id", 3, "", fetcher);
+    expect(fetcher).toHaveBeenCalledWith(`/api/v1/${path}/resource%2Fid`, expect.objectContaining({
+      method: "DELETE", body: JSON.stringify({ expectedRevision: 3 }),
+    }));
+    fetcher.mockResolvedValue(new Response("{}"));
+    await expect(remove("resource", 3, "", fetcher)).rejects.toThrow("did not confirm");
+    fetcher.mockResolvedValue(new Response("null"));
+    await expect(remove("resource", 3, "", fetcher)).rejects.toThrow("did not confirm");
+    fetcher.mockResolvedValue(new Response("conflict", { status: 409 }));
+    await expect(remove("resource", 3, "", fetcher)).rejects.toThrow("HTTP 409");
+  });
+});
+
+describe("salvo and unroute API", () => {
+  const routes = [{ sourceId: "input-a", destinationId: "output-a" }];
+  const preset = { id: "salvo-a", name: "Morning", revision: 2, routes };
+  const operation = { operationId: "operation-a", state: "pending", routes: [], results: [] };
+  const respond = (value: unknown) =>
+    vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(value)));
+
+  it("loads saved salvos and rejects malformed persisted data", async () => {
+    await expect(fetchPresets("", respond([preset]))).resolves.toEqual([preset]);
+    await expect(fetchPresets("", respond([{ ...preset, routes: [{}] }])))
+      .rejects.toThrow("invalid salvo collection");
+  });
+
+  it("creates and revision-guards updates without embedding route-state revisions", async () => {
+    const create = respond(preset);
+    await savePreset({ name: "Morning", routes }, "", create);
+    expect(create).toHaveBeenCalledWith("/api/v1/presets", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ name: "Morning", routes }),
+    }));
+    const update = respond(preset);
+    await savePreset({ id: "salvo-a", name: "Morning", routes, expectedRevision: 1 }, "", update);
+    expect(update).toHaveBeenCalledWith("/api/v1/presets/salvo-a", expect.objectContaining({
+      method: "PUT", body: JSON.stringify({ name: "Morning", routes, expectedRevision: 1 }),
+    }));
+  });
+
+  it("takes a saved salvo using the preview revisions and operation key", async () => {
+    const fetcher = respond(operation);
+    const input = {
+      expectedRevision: 2,
+      routes: [{ ...routes[0], expectedRouteRevision: 7, confirmReplace: true }],
+    };
+    await expect(executePreset("salvo-a", input, "retry-key", "", fetcher)).resolves.toEqual(operation);
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/presets/salvo-a/execute", expect.objectContaining({
+      method: "POST", headers: expect.objectContaining({ "idempotency-key": "retry-key" }),
+      body: JSON.stringify(input),
+    }));
+  });
+
+  it("unroutes a destination with a revision guard rather than a session assignment", async () => {
+    const fetcher = respond(operation);
+    const input = { destinationId: "output-a", expectedRouteRevision: 7 };
+    await expect(unrouteDestination(input, "unroute-key", "", fetcher)).resolves.toEqual(operation);
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/routes/unroute", expect.objectContaining({
+      method: "POST", body: JSON.stringify(input),
+      headers: expect.objectContaining({ "idempotency-key": "unroute-key" }),
+    }));
+    const conflict = vi.fn<typeof fetch>().mockResolvedValue(new Response("conflict", { status: 409 }));
+    await expect(unrouteDestination(input, "unroute-key", "", conflict)).rejects.toThrow("HTTP 409");
+  });
+
+  it("revision-guards deletion and requires an explicit confirmation response", async () => {
+    const fetcher = respond({ deleted: true });
+    await deletePreset("salvo-a", 2, "", fetcher);
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/presets/salvo-a", expect.objectContaining({
+      method: "DELETE", body: JSON.stringify({ expectedRevision: 2 }),
+    }));
+    await expect(deletePreset("salvo-a", 2, "", respond({}))).rejects.toThrow("did not confirm");
+  });
+});
 
 describe("fetchLiveness", () => {
   it("requests the versioned API liveness endpoint", async () => {

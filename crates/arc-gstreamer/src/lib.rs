@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -173,6 +176,12 @@ impl MediaPipeline for GstreamerMediaPipeline {
                 ));
             }
             if specification.assignment_generation == current.generation {
+                if matches!(current.observed_state, PipelineObservedState::Stopped) {
+                    return Err(pipeline_error(
+                        "stale_pipeline_generation",
+                        "a stopped assignment generation cannot be prepared again",
+                    ));
+                }
                 if (!current.description.is_empty() && current.description != description)
                     || current.source_identity != specification.source_identity
                 {
@@ -433,19 +442,52 @@ fn prepare_shared_pipeline(
     source_description: String,
     branch_description: String,
 ) -> PortResult<()> {
-    let branch = gst::parse::bin_from_description(&branch_description, true).map_err(|error| {
+    let branch = gst::parse::bin_from_description(&branch_description, false).map_err(|error| {
         pipeline_error(
             "gstreamer_pipeline_prepare_failed",
             format!("GStreamer could not prepare the destination branch: {error}"),
         )
     })?;
     branch.set_property("name", format!("arc-branch-{pipeline_id}"));
-    if branch.static_pad("sink").is_none() {
-        return Err(pipeline_error(
+    let target = branch
+        .find_unlinked_pad(gst::PadDirection::Sink)
+        .ok_or_else(|| {
+            pipeline_error(
+                "gstreamer_pipeline_prepare_failed",
+                "destination branch has no unlinked sink pad",
+            )
+        })?;
+    let flow_failed = Arc::new(AtomicBool::new(false));
+    let list_flow_failed = Arc::clone(&flow_failed);
+    let sink = gst::GhostPad::builder_with_target(&target)
+        .map_err(|error| {
+            pipeline_error(
+                "gstreamer_pipeline_prepare_failed",
+                format!("GStreamer could not prepare the branch sink pad: {error}"),
+            )
+        })?
+        .name("sink")
+        .chain_function(move |pad, parent, buffer| {
+            isolate_branch_flow(
+                parent,
+                gst::ProxyPad::chain_default(pad, parent, buffer),
+                &flow_failed,
+            )
+        })
+        .chain_list_function(move |pad, parent, buffers| {
+            isolate_branch_flow(
+                parent,
+                gst::ProxyPad::chain_list_default(pad, parent, buffers),
+                &list_flow_failed,
+            )
+        })
+        .build();
+    branch.add_pad(&sink).map_err(|error| {
+        pipeline_error(
             "gstreamer_pipeline_prepare_failed",
-            "destination branch has no ghost sink pad",
-        ));
-    }
+            format!("GStreamer could not add the branch sink pad: {error}"),
+        )
+    })?;
 
     if let Some(group) = state.source_groups.get(&identity) {
         if group.description != source_description {
@@ -487,6 +529,32 @@ fn prepare_shared_pipeline(
         },
     );
     Ok(())
+}
+
+fn isolate_branch_flow(
+    parent: Option<&gst::Object>,
+    result: Result<gst::FlowSuccess, gst::FlowError>,
+    failed: &AtomicBool,
+) -> Result<gst::FlowSuccess, gst::FlowError> {
+    match result {
+        Ok(success) => Ok(success),
+        // A branch flushing during teardown must not flush the shared source.
+        Err(gst::FlowError::Flushing) => Ok(gst::FlowSuccess::Ok),
+        Err(error) => {
+            let Some(branch) = parent.and_then(|object| object.downcast_ref::<gst::Bin>()) else {
+                return Err(error);
+            };
+            // Report the failure on this branch, but keep tee's upstream flow alive.
+            if !failed.swap(true, Ordering::AcqRel) {
+                gst::element_error!(
+                    branch,
+                    gst::StreamError::Failed,
+                    ("destination branch stopped accepting media: {error}")
+                );
+            }
+            Ok(gst::FlowSuccess::Ok)
+        }
+    }
 }
 
 fn start_shared_pipeline(state: &mut PipelineState, pipeline_id: Uuid) -> PortResult<()> {
@@ -708,13 +776,14 @@ fn observe_shared_group(
         })?;
         drain_pipeline_errors(&group.pipeline)
     };
+    let had_errors = !errors.is_empty();
     for (branch_id, reason) in errors {
         let affected = match branch_id {
             Some(branch_id)
                 if state
-                    .pipelines
-                    .get(&branch_id)
-                    .is_some_and(|managed| managed.source_identity == Some(identity)) =>
+                    .source_groups
+                    .get(&identity)
+                    .is_some_and(|group| group.active_branches.contains(&branch_id)) =>
             {
                 vec![branch_id]
             }
@@ -744,7 +813,27 @@ fn observe_shared_group(
             "shared source group is not available on this worker",
         )
     })?;
-    let (state_change, gst_state, _) = group.pipeline.state(Some(gst::ClockTime::ZERO));
+    let (mut state_change, mut gst_state, _) = group.pipeline.state(Some(gst::ClockTime::ZERO));
+    if state_change.is_err()
+        && gst_state == gst::State::Playing
+        && had_errors
+        && !group.active_branches.is_empty()
+    {
+        // A removed child's error leaves the bin's state result cached as failed.
+        // Reaffirm Playing without cycling the still-streaming shared source.
+        group
+            .pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|error| {
+                pipeline_error(
+                    "gstreamer_pipeline_observation_failed",
+                    format!(
+                        "shared source could not acknowledge the isolated branch error: {error}"
+                    ),
+                )
+            })?;
+        (state_change, gst_state, _) = group.pipeline.state(Some(gst::ClockTime::ZERO));
+    }
     state_change.map_err(|error| {
         pipeline_error(
             "gstreamer_pipeline_observation_failed",
@@ -1163,7 +1252,7 @@ mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, UdpSocket},
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         time::Instant,
@@ -1466,6 +1555,11 @@ mod tests {
             .stop(first_pipeline_id, 1)
             .await
             .expect("first destination branch stops");
+        let error = media
+            .prepare(&first_specification)
+            .await
+            .expect_err("a delayed Start cannot prepare a stopped generation");
+        assert_eq!(error.code, "stale_pipeline_generation");
         assert!(matches!(
             media
                 .observe(second_pipeline_id)
@@ -1491,6 +1585,69 @@ mod tests {
 
     #[tokio::test]
     async fn isolates_a_failed_shared_branch_and_keeps_sibling_receiving() {
+        assert_shared_branch_failure_isolated(false).await;
+    }
+
+    #[tokio::test]
+    async fn isolates_an_element_flow_error_before_observation() {
+        assert_shared_branch_failure_isolated(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_shared_source_flow_error_fails_all_its_branches() {
+        let media = GstreamerMediaPipeline::new().expect("GStreamer initializes");
+        let identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let routes = [Uuid::new_v4(), Uuid::new_v4()];
+        {
+            let mut state = media.lock_pipelines().expect("pipeline state is available");
+            for pipeline_id in routes {
+                prepare_shared_pipeline(
+                    &mut state,
+                    pipeline_id,
+                    1,
+                    "shared source failure".to_owned(),
+                    identity,
+                    "videotestsrc is-live=true ! identity error-after=20 ! tee name=source_tee"
+                        .to_owned(),
+                    "queue ! fakesink sync=false async=false".to_owned(),
+                )
+                .expect("branch prepares");
+            }
+        }
+        for pipeline_id in routes {
+            media.start(pipeline_id, 1).await.expect("branch starts");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let observation = media
+                .observe(routes[0])
+                .await
+                .expect("observation succeeds");
+            if matches!(observation.state, PipelineObservedState::Failed) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source failure was not observed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for pipeline_id in routes {
+            let observation = media
+                .observe(pipeline_id)
+                .await
+                .expect("observation succeeds");
+            assert!(matches!(observation.state, PipelineObservedState::Failed));
+            assert!(observation
+                .health_reasons
+                .iter()
+                .any(|reason| reason.contains("Failed after iterations")));
+            media.stop(pipeline_id, 1).await.expect("branch cleans up");
+        }
+        assert!(media.lock_pipelines().unwrap().source_groups.is_empty());
+    }
+
+    async fn assert_shared_branch_failure_isolated(element_error: bool) {
         let media = GstreamerMediaPipeline::new().expect("GStreamer initializes");
         let source_identity = PipelineSourceIdentity {
             source_id: Uuid::new_v4(),
@@ -1508,7 +1665,12 @@ mod tests {
                 "injected branch failure".to_owned(),
                 source_identity,
                 source_description.clone(),
-                "queue ! fakesink sync=false".to_owned(),
+                if element_error {
+                    "queue ! identity name=fault error-after=20 ! fakesink sync=false async=false"
+                } else {
+                    "queue ! fakesink sync=false"
+                }
+                .to_owned(),
             )
             .expect("failing branch prepares");
             prepare_shared_pipeline(
@@ -1546,6 +1708,47 @@ mod tests {
                 .build(),
         );
 
+        let source_stream_starts = Arc::new(AtomicUsize::new(0));
+        let failure_posted = Arc::new(AtomicBool::new(false));
+        let (branch, bus) = {
+            let state = media.lock_pipelines().expect("pipeline state is available");
+            let branch = state.pipelines[&failing_pipeline_id]
+                .branch
+                .clone()
+                .expect("failing branch exists");
+            let group = &state.source_groups[&source_identity];
+            let stream_starts = Arc::clone(&source_stream_starts);
+            group
+                .tee
+                .static_pad("sink")
+                .expect("shared tee sink exists")
+                .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                    if info
+                        .event()
+                        .is_some_and(|event| event.type_() == gst::EventType::StreamStart)
+                    {
+                        stream_starts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    gst::PadProbeReturn::Ok
+                })
+                .expect("source stream probe attaches");
+            (
+                branch,
+                group.pipeline.bus().expect("shared source bus exists"),
+            )
+        };
+        if element_error {
+            let posted = Arc::clone(&failure_posted);
+            bus.set_sync_handler(move |_, message| {
+                if matches!(message.view(), gst::MessageView::Error(_))
+                    && branch_id_for_message(message) == Some(failing_pipeline_id)
+                {
+                    posted.store(true, Ordering::Release);
+                }
+                gst::BusSyncReply::Pass
+            });
+        }
+
         media
             .start(sibling_pipeline_id, 1)
             .await
@@ -1564,29 +1767,32 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // A branch-attributed bus error exercises isolation without failing the shared tee's flow.
-        {
-            let state = media.lock_pipelines().expect("pipeline state is available");
-            let branch = state
-                .pipelines
-                .get(&failing_pipeline_id)
-                .and_then(|managed| managed.branch.as_ref())
-                .expect("failing branch exists");
-            let pipeline = &state
-                .source_groups
-                .get(&source_identity)
-                .expect("shared source group exists")
-                .pipeline;
+        if !element_error {
             let message =
                 gst::message::Error::builder(gst::CoreError::Failed, "injected branch failure")
                     .debug("deterministic shared-branch failure test")
-                    .src(branch)
+                    .src(&branch)
                     .build();
-            pipeline
-                .bus()
-                .expect("shared source bus exists")
-                .post(message)
-                .expect("branch failure message posts");
+            bus.post(message).expect("branch failure message posts");
+        }
+
+        if element_error {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !failure_posted.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the element did not generate an error"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let buffers_before_observation = received_buffers.load(Ordering::Relaxed);
+            while received_buffers.load(Ordering::Relaxed) < buffers_before_observation + 10 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the sibling stopped receiving before the controller observed the failure"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
 
         let failure_deadline = Instant::now() + Duration::from_secs(5);
@@ -1608,7 +1814,11 @@ mod tests {
             failure
                 .health_reasons
                 .iter()
-                .any(|reason| reason.contains("injected branch failure")),
+                .any(|reason| reason.contains(if element_error {
+                    "Failed after iterations"
+                } else {
+                    "injected branch failure"
+                })),
             "the failed branch's GStreamer error is reported: {:?}",
             failure.health_reasons
         );
@@ -1630,6 +1840,11 @@ mod tests {
                 .state,
             PipelineObservedState::Running
         ));
+        assert_eq!(
+            source_stream_starts.load(Ordering::Relaxed),
+            1,
+            "isolating a branch must not restart the shared source"
+        );
 
         media
             .stop(failing_pipeline_id, 1)
@@ -1639,5 +1854,6 @@ mod tests {
             .stop(sibling_pipeline_id, 1)
             .await
             .expect("healthy sibling cleans up");
+        assert!(media.lock_pipelines().unwrap().source_groups.is_empty());
     }
 }

@@ -17,6 +17,78 @@ pub enum ResourceUpdateError {
     Database(sqlx::Error),
 }
 
+#[derive(Debug)]
+pub enum ResourceDeleteError {
+    NotFound,
+    Enabled,
+    StaleRevision,
+    InUse,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for ResourceDeleteError {
+    fn from(error: sqlx::Error) -> Self {
+        if matches!(&error, sqlx::Error::Database(db) if db.is_foreign_key_violation()) {
+            Self::InUse
+        } else {
+            Self::Database(error)
+        }
+    }
+}
+
+pub async fn delete_source(
+    pool: &PgPool,
+    id: Uuid,
+    expected_revision: i64,
+) -> Result<(), ResourceDeleteError> {
+    delete_unused_resource(pool, id, expected_revision, true).await
+}
+
+pub async fn delete_destination(
+    pool: &PgPool,
+    id: Uuid,
+    expected_revision: i64,
+) -> Result<(), ResourceDeleteError> {
+    delete_unused_resource(pool, id, expected_revision, false).await
+}
+
+async fn delete_unused_resource(
+    pool: &PgPool,
+    id: Uuid,
+    expected_revision: i64,
+    source: bool,
+) -> Result<(), ResourceDeleteError> {
+    let (select, delete) = if source {
+        (
+            "SELECT desired_state, current_revision FROM sources WHERE id = $1 FOR UPDATE",
+            "DELETE FROM sources WHERE id = $1",
+        )
+    } else {
+        (
+            "SELECT desired_state, current_revision FROM destinations WHERE id = $1 FOR UPDATE",
+            "DELETE FROM destinations WHERE id = $1",
+        )
+    };
+    let mut transaction = pool.begin().await?;
+    let (state, revision): (String, i64) = sqlx::query_as(select)
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(ResourceDeleteError::NotFound)?;
+    if revision != expected_revision {
+        return Err(ResourceDeleteError::StaleRevision);
+    }
+    if state != "disabled" {
+        return Err(ResourceDeleteError::Enabled);
+    }
+    sqlx::query(delete)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 impl From<sqlx::Error> for ResourceUpdateError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error)

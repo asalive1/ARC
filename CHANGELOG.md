@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- Added a Linux host-network worker overlay for dual-network media, loopback-only database/WSS control, private-CA trust and non-root ALSA access; deployed stereo ALSA-to-RTP fan-out and sibling-preserving Unroute pass on the test host.
+- Added worker WebSocket keepalives to prevent idle TLS-proxy disconnects; all ten control-client tests and the deployed 95-second idle-session check pass.
+- Added revision-guarded deletion of disabled, unused inputs and outputs, with confirmation and protection for route history, assignments, signals and saved salvos.
+- Reworked input/output configuration into full-width collapsed creation panels and expandable inline editors; enabled resources retain visible, explained editing/deletion restrictions.
+- Added saved-salvo management and strict, revision-checked Take execution above the crosspoint grid.
+- Added crosspoint Take/Unroute context menus with keyboard access; kept left-click selection as a non-executing preview.
+- Added durable, revision-guarded destination Unroute operations with acknowledged Stop, idempotent retry, destination serialization, and explicit unconfirmed-stop outcomes.
 - Approved ARC architecture package and Phase 0 Rust/API/worker/media contract scaffolding.
 - PostgreSQL initial migration, OpenAPI skeleton, Zephyr fixture area, and React health UI.
 - Local Docker Compose stack for the API, UI, and PostgreSQL, plus a source dependency license inventory.
@@ -48,8 +55,12 @@
 - Added PostgreSQL-backed 24-hour replay for planning requests using a required Idempotency-Key, with key/body mismatch conflicts.
 
 ### Changed
+- Replaced the bottom Immediate/Take controls with crosspoint menus and moved compatibility/worker controls into collapsed advanced diagnostics.
 - README and roadmap now describe ARC rather than the project template.
 - API startup now requires PostgreSQL, applies SQLx migrations, and keeps its non-container bind address loopback-only.
 
 ### Fixed
+- Prevented new Take, salvo execution, and direct route writes from superseding unresolved destination execution or replacement cleanup; accepted idempotent retries remain valid.
+- Isolated real destination-element flow errors from shared-source fan-out, preserving sibling delivery without restarting the source and reporting failures on the affected route.
+- Kept far-corner crosspoints reachable when endpoint catalogs load after the matrix first renders, and prevented crosspoint tooltips from blocking neighboring cells.
 - Prevented SRT output sinks from blocking live pipeline startup while waiting for preroll; clock synchronization remains enabled.

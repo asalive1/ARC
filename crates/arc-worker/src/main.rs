@@ -4,8 +4,11 @@ use arc_application::{MediaPipeline, PipelineSpecification, WorkerRegistry};
 use arc_domain::{Architecture, Platform, WorkerState};
 use arc_gstreamer::GstreamerMediaPipeline;
 use arc_infrastructure::{
-    assignments::PgAssignments, postgres::connect_postgres,
-    worker_fencing::PgAssignmentGenerationStore, worker_registry::PgWorkerRegistry,
+    assignments::PgAssignments,
+    postgres::{connect_postgres, PgPool},
+    routes::{destination_is_removed, lock_destination},
+    worker_fencing::PgAssignmentGenerationStore,
+    worker_registry::PgWorkerRegistry,
 };
 use arc_worker::{local_worker, WorkerControlClient, WorkerControlClientConfig};
 use chrono::Utc;
@@ -100,7 +103,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
         .map_err(port_error)?;
 
     let assignments = PgAssignments::new(pool.clone());
-    let generation_store = Arc::new(PgAssignmentGenerationStore::new(pool));
+    let generation_store = Arc::new(PgAssignmentGenerationStore::new(pool.clone()));
     let client = WorkerControlClient::new(
         WorkerControlClientConfig {
             endpoint,
@@ -156,6 +159,7 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
                 if connected {
                     reconcile_runtime_assignments(
                         &assignments,
+                        &pool,
                         media_pipeline.as_ref(),
                         worker_id,
                     )
@@ -190,10 +194,35 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
 
 async fn reconcile_runtime_assignments(
     assignments: &PgAssignments,
+    pool: &PgPool,
     media_pipeline: &dyn MediaPipeline,
     worker_id: Uuid,
 ) -> Result<(), arc_application::PortError> {
     for snapshot in assignments.list_runtime_for_worker(worker_id).await? {
+        let Some(destination_id) = snapshot
+            .assignment
+            .route
+            .as_ref()
+            .map(|route| route.destination_id)
+        else {
+            continue;
+        };
+        let mut guard = pool
+            .begin()
+            .await
+            .map_err(|error| arc_application::PortError {
+                code: "database_error",
+                message: error.to_string(),
+            })?;
+        lock_destination(&mut guard, destination_id)
+            .await
+            .map_err(|error| arc_application::PortError {
+                code: "database_error",
+                message: error.to_string(),
+            })?;
+        let Some(snapshot) = assignments.get_by_id(snapshot.assignment.id).await? else {
+            continue;
+        };
         let Some(route) = snapshot.assignment.route else {
             continue;
         };
@@ -208,7 +237,13 @@ async fn reconcile_runtime_assignments(
             configuration: route.configuration,
         };
 
-        if snapshot.desired_state == "running" {
+        let removed = destination_is_removed(&mut guard, destination_id)
+            .await
+            .map_err(|error| arc_application::PortError {
+                code: "database_error",
+                message: error.to_string(),
+            })?;
+        if snapshot.desired_state == "running" && !removed {
             media_pipeline.prepare(&specification).await?;
             media_pipeline
                 .start(
@@ -230,6 +265,13 @@ async fn reconcile_runtime_assignments(
                 .mark_stopped(snapshot.assignment.id, snapshot.assignment.generation)
                 .await?;
         }
+        guard
+            .commit()
+            .await
+            .map_err(|error| arc_application::PortError {
+                code: "database_error",
+                message: error.to_string(),
+            })?;
     }
     Ok(())
 }

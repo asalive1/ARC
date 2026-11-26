@@ -34,6 +34,7 @@ use crate::receive_worker_command;
 
 const MAX_WORKER_CONTROL_MESSAGE_SIZE: usize = 64 * 1024;
 const WORKER_CONTROL_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -189,7 +190,27 @@ impl WorkerControlClient {
         self.connection_status.send_replace(true);
         self.session_was_established.store(true, Ordering::Release);
 
-        while let Some(message) = socket.next().await {
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + WORKER_CONTROL_KEEPALIVE_INTERVAL,
+            WORKER_CONTROL_KEEPALIVE_INTERVAL,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let message = tokio::select! {
+                _ = keepalive.tick() => {
+                    socket.send(Message::Ping(Vec::new().into())).await.map_err(|_| {
+                        worker_client_error(
+                            "worker_control_connection_failed",
+                            "worker keepalive could not be sent",
+                        )
+                    })?;
+                    continue;
+                }
+                message = socket.next() => {
+                    let Some(message) = message else { break };
+                    message
+                }
+            };
             match message.map_err(|_| {
                 worker_client_error(
                     "worker_control_connection_failed",
@@ -945,6 +966,63 @@ mod tests {
             store.begin_command(identity).await.unwrap(),
             CommandFenceDecision::Process
         );
+    }
+
+    #[tokio::test]
+    async fn worker_client_keeps_an_idle_session_alive() {
+        let worker_id = Uuid::new_v4();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "ws://{}/api/v1/workers/control",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket =
+                accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                socket.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&WorkerSessionWelcome {
+                        kind: WorkerSessionMessageKind::Welcome,
+                        protocol_version: WORKER_PROTOCOL_VERSION,
+                        worker_id,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(40), socket.next())
+                .await
+                .expect("idle worker sends a keepalive before the ingress timeout")
+                .unwrap()
+                .unwrap();
+            let Message::Ping(payload) = message else {
+                panic!("expected idle worker keepalive");
+            };
+            socket.send(Message::Pong(payload)).await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let client = client(
+            endpoint,
+            worker_id,
+            Arc::new(TestGenerationStore::default()),
+            Arc::new(TestMediaPipeline::default()),
+            true,
+        );
+        let session = tokio::spawn(async move { client.run_session().await });
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -705,7 +705,7 @@ impl PgAssignments {
             snapshot.desired_state.as_str(),
             snapshot.observed_state.as_str(),
         ) {
-            ("running", "starting" | "running" | "failed" | "degraded") => {
+            ("running", "starting" | "running" | "failed" | "degraded" | "unknown") => {
                 sqlx::query(
                     "UPDATE pipeline_assignments SET desired_state = 'stopped', \
                      observed_state = 'stopping', updated_at = clock_timestamp() \

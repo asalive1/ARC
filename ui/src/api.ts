@@ -116,6 +116,18 @@ export interface RouteBatchOperation {
   results?: RouteBatchItemResult[];
 }
 
+export interface PresetRoute {
+  sourceId: string;
+  destinationId: string;
+}
+
+export interface RoutePreset {
+  id: string;
+  name: string;
+  revision: number;
+  routes: PresetRoute[];
+}
+
 export interface RouteBatchItemResult {
   sourceId: string;
   destinationId: string;
@@ -176,6 +188,49 @@ export class ApiRequestError extends Error {
     super(`API request failed with HTTP ${status}`);
     this.name = "ApiRequestError";
   }
+}
+
+async function deleteCatalogResource(
+  path: "sources" | "destinations",
+  id: string,
+  expectedRevision: number,
+  baseUrl: string,
+  fetcher: typeof fetch,
+): Promise<void> {
+  const result = await requestJson<unknown>(
+    `/${path}/${encodeURIComponent(id)}`,
+    {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision }),
+    },
+    baseUrl,
+    fetcher,
+  );
+  if (
+    typeof result !== "object" || result === null ||
+    !("deleted" in result) || result.deleted !== true
+  ) {
+    throw new Error("The API did not confirm resource deletion");
+  }
+}
+
+export function deleteSource(
+  id: string,
+  revision: number,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<void> {
+  return deleteCatalogResource("sources", id, revision, baseUrl, fetcher);
+}
+
+export function deleteDestination(
+  id: string,
+  revision: number,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<void> {
+  return deleteCatalogResource("destinations", id, revision, baseUrl, fetcher);
 }
 
 let csrfToken: string | undefined;
@@ -531,6 +586,106 @@ export async function getRouteBatchOperation(
   return response;
 }
 
+export async function fetchPresets(
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RoutePreset[]> {
+  const response = await requestJson<unknown>("/presets", undefined, baseUrl, fetcher);
+  if (!Array.isArray(response) || !response.every(isRoutePreset)) {
+    throw new Error("API returned an invalid salvo collection");
+  }
+  return response;
+}
+
+export async function savePreset(
+  input: { name: string; routes: PresetRoute[]; id?: string; expectedRevision?: number },
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RoutePreset> {
+  const { id, ...body } = input;
+  const response = await requestJson<unknown>(
+    id ? `/presets/${encodeURIComponent(id)}` : "/presets",
+    {
+      method: id ? "PUT" : "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    baseUrl,
+    fetcher,
+  );
+  if (!isRoutePreset(response)) {
+    throw new Error("API returned an invalid salvo");
+  }
+  return response;
+}
+
+export async function deletePreset(
+  id: string,
+  expectedRevision: number,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<void> {
+  const response = await requestJson<unknown>(
+    `/presets/${encodeURIComponent(id)}`,
+    {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision }),
+    },
+    baseUrl,
+    fetcher,
+  );
+  if (typeof response !== "object" || response === null ||
+      !("deleted" in response) || response.deleted !== true) {
+    throw new Error("API did not confirm salvo deletion");
+  }
+}
+
+export async function executePreset(
+  id: string,
+  input: { expectedRevision: number; routes: SetDesiredRouteInput[] },
+  idempotencyKey: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RouteBatchOperation> {
+  const response = await requestJson<unknown>(
+    `/presets/${encodeURIComponent(id)}/execute`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+      body: JSON.stringify(input),
+    },
+    baseUrl,
+    fetcher,
+  );
+  if (!isRouteBatchOperation(response)) {
+    throw new Error("API returned an invalid salvo operation");
+  }
+  return response;
+}
+
+export async function unrouteDestination(
+  input: { destinationId: string; expectedRouteRevision: number },
+  idempotencyKey: string,
+  baseUrl = "",
+  fetcher: typeof fetch = globalThis.fetch,
+): Promise<RouteBatchOperation> {
+  const response = await requestJson<unknown>(
+    "/routes/unroute",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+      body: JSON.stringify(input),
+    },
+    baseUrl,
+    fetcher,
+  );
+  if (!isRouteBatchOperation(response)) {
+    throw new Error("API returned an invalid unroute operation");
+  }
+  return response;
+}
+
 export function createDestination(
   friendlyName: string,
   profile: DestinationMediaProfile,
@@ -772,6 +927,19 @@ function isMediaPath(value: unknown): value is RoutePlan["mediaPath"] {
 
 function isNonnegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isRoutePreset(value: unknown): value is RoutePreset {
+  return typeof value === "object" && value !== null &&
+    "id" in value && typeof value.id === "string" &&
+    "name" in value && typeof value.name === "string" &&
+    "revision" in value && isNonnegativeInteger(value.revision) && value.revision > 0 &&
+    "routes" in value && Array.isArray(value.routes) &&
+    value.routes.length > 0 && value.routes.length <= 64 &&
+    value.routes.every((route: unknown) =>
+      typeof route === "object" && route !== null &&
+      "sourceId" in route && typeof route.sourceId === "string" &&
+      "destinationId" in route && typeof route.destinationId === "string");
 }
 
 function isPayloadRate(value: unknown): value is number | null {

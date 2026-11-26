@@ -1,0 +1,21 @@
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${ARC_WORKER_DB_PORT:-15432}:5432"
+
+  worker:
+    network_mode: host
+    environment:
+      DATABASE_URL: postgres://arc:${ARC_POSTGRES_PASSWORD:?Set ARC_POSTGRES_PASSWORD}@127.0.0.1:${ARC_WORKER_DB_PORT:-15432}/arc
+      ARC_WORKER_CONTROL_ENDPOINT: wss://127.0.0.1:${ARC_WORKER_TLS_PORT:-8443}/api/v1/workers/control
+      ARC_WORKER_CONTROL_CA_FILE: /etc/arc/trust/worker-ca.pem
+    depends_on:
+      ingress:
+        condition: service_started
+    devices:
+      - "/dev/snd:/dev/snd"
+    group_add:
+      - "${ARC_ALSA_GROUP_ID:?Set the host audio group numeric GID}"
+    volumes:
+      - "${ARC_WORKER_CA_FILE_SOURCE:?Set the public worker CA bundle}:/etc/arc/trust/worker-ca.pem:ro"
+      - "${ARC_ALSA_CONFIG_FILE_SOURCE:?Set the ALSA configuration file}:/etc/asound.conf:ro"

@@ -2107,6 +2107,11 @@ mod tests {
 
         let pool = connect_postgres(&env::var("DATABASE_URL").unwrap()).await.unwrap();
         migrate(&pool).await.unwrap();
+        // The ignored API tests share an isolated PostgreSQL database.
+        sqlx::query("TRUNCATE TABLE workers CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
         let source_profile = SourceMediaProfile::RtpL16 {
             bind_address: IpAddr::from([0, 0, 0, 0]), port: 5000, payload_type: 96,
         };
@@ -2581,11 +2586,13 @@ mod tests {
             Arc::new(PgAssignmentGenerationStore::new(pool.clone())),
             pool.clone(),
         ));
+        const WORKER_TOKEN: &str =
+            "abababababababababababababababababababababababababababababababab";
         let app = router_with_database_and_worker_dispatcher(
             pool.clone(),
             Arc::new(TestWorkerAuthenticator {
                 worker_id,
-                token: "worker-secret",
+                token: WORKER_TOKEN,
                 available: true,
             }),
             dispatcher,
@@ -2607,7 +2614,7 @@ mod tests {
                 endpoint: format!("ws://{address}/api/v1/workers/control"),
                 ca_certificates_file: None,
                 worker_id,
-                bearer_token: "worker-secret".to_owned(),
+                bearer_token: WORKER_TOKEN.to_owned(),
                 bearer_token_file: None,
                 allow_insecure_loopback: true,
             },

@@ -29,6 +29,8 @@ pub struct WorkerSessionHello {
     pub kind: WorkerSessionMessageKind,
     pub protocol_version: u16,
     pub worker_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_incarnation: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -37,6 +39,8 @@ pub struct WorkerSessionWelcome {
     pub kind: WorkerSessionMessageKind,
     pub protocol_version: u16,
     pub worker_id: Uuid,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -121,6 +125,9 @@ impl WorkerSessionHello {
         if self.worker_id.is_nil() || self.worker_id != authenticated_worker_id {
             return Err(WorkerSessionValidationError::InvalidWorkerIdentity);
         }
+        if self.process_incarnation.is_some_and(|id| id.is_nil()) {
+            return Err(WorkerSessionValidationError::InvalidWorkerIdentity);
+        }
         Ok(())
     }
 }
@@ -200,11 +207,26 @@ mod tests {
             kind: WorkerSessionMessageKind::Hello,
             protocol_version: WORKER_PROTOCOL_VERSION,
             worker_id,
+            process_incarnation: None,
         };
         assert_eq!(hello.validate_for_worker(worker_id), Ok(()));
         assert_eq!(
             hello.validate_for_worker(Uuid::new_v4()),
             Err(WorkerSessionValidationError::InvalidWorkerIdentity)
+        );
+        let invalid_incarnation = WorkerSessionHello {
+            process_incarnation: Some(Uuid::nil()),
+            ..hello.clone()
+        };
+        assert_eq!(
+            invalid_incarnation.validate_for_worker(worker_id),
+            Err(WorkerSessionValidationError::InvalidWorkerIdentity)
+        );
+        let legacy = serde_json::to_value(&hello).unwrap();
+        assert!(legacy.get("processIncarnation").is_none());
+        assert_eq!(
+            serde_json::from_value::<WorkerSessionHello>(legacy).unwrap(),
+            hello
         );
     }
 

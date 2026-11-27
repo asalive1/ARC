@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  ApiRequestError,
   cancelAssignment,
   cancelCapacityRequest,
   createDestination,
@@ -9,6 +10,7 @@ import {
   deleteDestination,
   fetchPipelineAssignment,
   fetchCapacityRequest,
+  fetchAdminAuthStatus,
   fetchLiveness,
   fetchReadiness,
   fetchRoutes,
@@ -30,6 +32,66 @@ import {
   validateDestination,
   validateSource,
 } from "./api";
+
+describe("API error details", () => {
+  const route = {
+    sourceId: "source-1", destinationId: "destination-1",
+    expectedRouteRevision: 0, confirmReplace: false,
+  };
+
+  it("preserves the server reason, code and status for a rejected Take", async () => {
+    const message = "media conversion is not supported by Phase 1";
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ code: "invalid_request", message }), { status: 422 }),
+    );
+
+    await expect(setDesiredRoutesBatch([route], "take-1", "", fetcher)).rejects.toMatchObject({
+      name: "ApiRequestError",
+      status: 422,
+      code: "invalid_request",
+      message: `API request failed with HTTP 422: ${message}`,
+    });
+  });
+
+  it("uses the same error details for authentication requests", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ code: "unauthorized", message: "Sign in first" }), { status: 401 }),
+    );
+
+    await expect(fetchAdminAuthStatus("", fetcher)).rejects.toMatchObject({
+      status: 401, code: "unauthorized", message: "API request failed with HTTP 401: Sign in first",
+    });
+  });
+
+  it("preserves HTTP status when the error response body cannot be read", async () => {
+    const body = new ReadableStream({
+      start(controller) { controller.error(new TypeError("Connection closed")); },
+    });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(body, { status: 422 }));
+
+    await expect(setDesiredRoutesBatch([route], "take-1", "", fetcher)).rejects.toMatchObject({
+      status: 422,
+      message: "API request failed with HTTP 422: The API error response could not be read: Connection closed",
+    });
+  });
+
+  it.each([
+    ["malformed JSON", "{", "application/json"],
+    ["an invalid envelope", '{"code":42,"message":null}', "application/json"],
+    ["an HTML proxy error", "<html>Bad gateway</html>", "text/html"],
+  ])("retains a typed HTTP error for %s", async (_label, body, contentType) => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(body, { status: 502, headers: { "content-type": contentType } }),
+    );
+    const request = setDesiredRoutesBatch([route], "take-1", "", fetcher);
+
+    await expect(request).rejects.toBeInstanceOf(ApiRequestError);
+    await expect(request).rejects.toMatchObject({
+      status: 502,
+      message: "API request failed with HTTP 502: The API returned an invalid error response",
+    });
+  });
+});
 
 describe("catalog deletion API", () => {
   it.each([
@@ -61,6 +123,26 @@ describe("salvo and unroute API", () => {
   it("loads saved salvos and rejects malformed persisted data", async () => {
     await expect(fetchPresets("", respond([preset]))).resolves.toEqual([preset]);
     await expect(fetchPresets("", respond([{ ...preset, routes: [{}] }])))
+      .rejects.toThrow("invalid salvo collection");
+  });
+
+  it("round-trips saved Unroute actions and rejects unknown action kinds", async () => {
+    const mixed = { ...preset, routes: [{ ...routes[0], action: "stop" as const }] };
+    await expect(fetchPresets("", respond([mixed]))).resolves.toEqual([mixed]);
+    const fetcher = respond(mixed);
+    await savePreset({ name: mixed.name, routes: mixed.routes }, "", fetcher);
+    expect(fetcher).toHaveBeenCalledWith("/api/v1/presets", expect.objectContaining({
+      body: JSON.stringify({ name: mixed.name, routes: mixed.routes }),
+    }));
+    const input = {
+      expectedRevision: 2,
+      routes: [{ ...mixed.routes[0], expectedRouteRevision: 7, confirmReplace: false }],
+    };
+    const execute = respond(operation);
+    await executePreset(preset.id, input, "mixed-key", "", execute);
+    expect(execute).toHaveBeenCalledWith("/api/v1/presets/salvo-a/execute",
+      expect.objectContaining({ body: JSON.stringify(input) }));
+    await expect(fetchPresets("", respond([{ ...preset, routes: [{ ...routes[0], action: "erase" }] }])))
       .rejects.toThrow("invalid salvo collection");
   });
 
@@ -730,7 +812,7 @@ describe("catalog and route API", () => {
 
     await expect(
       createSource("Bad source", { kind: "alsa_l16", device: "hw:1,0" }, "", fetcher),
-    ).rejects.toThrow("API request failed with HTTP 422");
+    ).rejects.toThrow("API request failed with HTTP 422: invalid request");
   });
 
   it("validates source and destination drafts through their lifecycle endpoints", async () => {

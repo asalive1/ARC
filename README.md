@@ -19,14 +19,18 @@ deployment acceptance remain outstanding.
   Take starts the selected input/output route; Unroute disconnects that output.
   Replacing another input still requires explicit confirmation.
 - **Salvo**, below GPIO Configuration in the sidebar, has its saved-salvo
-  dropdown, **Take**, and **Save** controls above the matrix. Select one input
-  per output; click a selected crosspoint again to remove it from the salvo.
-- Save stores only the selected routes, not every live route. It does not
+  dropdown, **Take**, and **Save** controls above the matrix. It starts with
+  an empty selection and **Select Salvo** in the dropdown; live routes are
+  not overlaid. Each return to this screen resets the dropdown and draft.
+  Click a crosspoint to cycle through **blue Take**, **red Unroute**, and clear.
+  Red disconnects that output regardless of its connected input; clear leaves
+  the output unchanged. Select one action per output, then **Save** and name
+  the salvo. Choosing a saved salvo displays its saved blue/red actions.
+- Save stores only the selected actions, not every live route. It does not
   change live media. Save as new, update, reload, and delete are available.
   Saved salvos use PostgreSQL and the `/api/v1/presets` API.
   Up to 100 salvos are supported, each with 1-64 distinct output assignments
-  and a unique, trimmed name of 1-100 characters. Saved route removals and
-  Force mode are not implemented.
+  and a unique, trimmed name of 1-100 characters. Force mode is not implemented.
 - Take executes the saved salvo, not unsaved edits. Loading a salvo captures
   the displayed destination revisions; strict execution rejects stale route
   or salvo revisions. Reload and review before retrying a conflict. Unlisted

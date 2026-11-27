@@ -1,8 +1,6 @@
 import type { PresetRoute, RouteRecord } from "./api";
 
-export interface StagedRoute {
-  sourceId: string;
-  destinationId: string;
+export interface StagedRoute extends PresetRoute {
   expectedRouteRevision: number;
 }
 
@@ -29,7 +27,8 @@ export function stageRouteSelection(
   }
   if (
     stagedRoutes[existingIndex].sourceId === selection.sourceId &&
-    stagedRoutes[existingIndex].expectedRouteRevision === selection.expectedRouteRevision
+    stagedRoutes[existingIndex].expectedRouteRevision === selection.expectedRouteRevision &&
+    (stagedRoutes[existingIndex].action ?? "start") === (selection.action ?? "start")
   ) {
     return stagedRoutes;
   }
@@ -42,11 +41,14 @@ export function toggleRouteSelection(
   stagedRoutes: StagedRoute[],
   selection: StagedRoute,
 ): StagedRoute[] {
-  return stagedRoutes.some((route) =>
+  const existing = stagedRoutes.find((route) =>
     route.sourceId === selection.sourceId &&
-    route.destinationId === selection.destinationId)
-    ? stagedRoutes.filter((route) => route.destinationId !== selection.destinationId)
-    : stageRouteSelection(stagedRoutes, selection);
+    route.destinationId === selection.destinationId);
+  if (!existing) return stageRouteSelection(stagedRoutes, selection);
+  if (existing.action === "stop") {
+    return stagedRoutes.filter((route) => route.destinationId !== selection.destinationId);
+  }
+  return stageRouteSelection(stagedRoutes, { ...existing, action: "stop" });
 }
 
 export function snapshotPresetRoutes(
@@ -76,5 +78,6 @@ export function matchesPresetRoutes(
   return selections.length === saved.length &&
     saved.every((route) => selections.some((selection) =>
       selection.sourceId === route.sourceId &&
-      selection.destinationId === route.destinationId));
+      selection.destinationId === route.destinationId &&
+      (selection.action ?? "start") === (route.action ?? "start")));
 }

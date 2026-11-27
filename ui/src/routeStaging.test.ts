@@ -9,8 +9,12 @@ describe("salvo selections", () => {
   const first = { sourceId: "a", destinationId: "x", expectedRouteRevision: 3 };
   const second = { sourceId: "b", destinationId: "y", expectedRouteRevision: 0 };
 
-  it("toggles one destination off without losing sibling selections", () => {
-    expect(toggleRouteSelection([first, second], first)).toEqual([second]);
+  it("cycles blue, red, clear without losing siblings or refreshing the pinned revision", () => {
+    const blue = toggleRouteSelection([second], first);
+    expect(blue).toEqual([second, first]);
+    const red = toggleRouteSelection(blue, { ...first, expectedRouteRevision: 9 });
+    expect(red).toEqual([second, { ...first, action: "stop" }]);
+    expect(toggleRouteSelection(red, first)).toEqual([second]);
     expect(toggleRouteSelection([first, second], { ...first, sourceId: "c" }))
       .toEqual([{ ...first, sourceId: "c" }, second]);
   });
@@ -32,6 +36,8 @@ describe("salvo selections", () => {
     expect(matchesPresetRoutes([second, first], [first, second])).toBe(true);
     expect(matchesPresetRoutes([first], [first, second])).toBe(false);
     expect(matchesPresetRoutes([{ ...first, sourceId: "c" }, second], [first, second])).toBe(false);
+    expect(matchesPresetRoutes([{ ...first, action: "stop" }, second], [first, second])).toBe(false);
+    expect(matchesPresetRoutes([first], [{ ...first, action: "start" }])).toBe(true);
   });
 });
 

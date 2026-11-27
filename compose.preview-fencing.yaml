@@ -1,0 +1,16 @@
+services:
+  api:
+    environment:
+      ARC_API_ENABLE_FENCED_PREVIEW: "true"
+
+  worker:
+    environment:
+      ARC_WORKER_ENABLE_PREVIEW_FENCING: "true"
+      ARC_WORKER_PREVIEW_FENCE_INITIAL_ENROLLMENT: ${ARC_WORKER_PREVIEW_FENCE_INITIAL_ENROLLMENT:-false}
+      ARC_WORKER_PREVIEW_FENCE_LOCK: /run/arc-preview-fence/lock
+      ARC_WORKER_PREVIEW_HOST_PROC: /hostproc
+      ARC_WORKER_PREVIEW_HOST_ID: /run/arc-preview-fence/host-id
+    volumes:
+      - /proc:/hostproc:ro
+      - ${ARC_WORKER_PREVIEW_FENCE_DIR:?Set the persistent host fence directory}/lock:/run/arc-preview-fence/lock:ro
+      - ${ARC_WORKER_PREVIEW_FENCE_DIR:?Set the persistent host fence directory}/host-id:/run/arc-preview-fence/host-id:ro

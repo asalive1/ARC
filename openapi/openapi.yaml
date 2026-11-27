@@ -301,6 +301,33 @@ paths:
           $ref: "#/components/responses/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
+  /sources/{sourceId}/preview:
+    get:
+      operationId: previewSource
+      summary: Open a browser audio preview WebSocket
+      description: >-
+        Requires an administrator session and an Origin matching the request
+        scheme and Host. The proxy must set X-Forwarded-Proto and preserve the
+        Host port. Binary messages contain interleaved stereo S16LE PCM at
+        48 kHz, with at most 4096 bytes per message. Preview requires a running
+        route. MPEG-TS preview supports Opus, MPEG-1 audio and AAC (ADTS); other codecs
+        are not yet supported.
+        Errors after upgrade are reported by a WebSocket close reason. Worker
+        and browser connections must reach the same API instance.
+      parameters:
+        - name: sourceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "101":
+          description: WebSocket connection established.
+        "401":
+          $ref: "#/components/responses/AuthenticationError"
+        "403":
+          $ref: "#/components/responses/ApiError"
   /sources/{sourceId}/validate:
     post:
       operationId: validateSourceDraft
@@ -586,7 +613,7 @@ paths:
     post:
       operationId: cancelUnstartedAssignment
       summary: Cancel an unstarted planned assignment
-      description: Requires the assignment generation as a fencing check. Only planned assignments still observed as not_started can be cancelled; cancellation atomically releases the capacity reservation. Repeating cancellation for the same already-cancelled generation is idempotent. It does not stop starting/running media or disable resources used by another active assignment.
+      description: Requires the assignment generation as a fencing check. Only planned assignments still observed as not_started can be cancelled; cancellation atomically releases the capacity reservation. A route batch executing or awaiting unconfirmed failed-Start cleanup cannot be cancelled by this endpoint. Repeating cancellation for the same already-cancelled generation is idempotent. It does not stop starting/running media or disable resources used by another active assignment.
       parameters:
         - name: assignmentId
           in: path
@@ -610,7 +637,7 @@ paths:
         "404":
           $ref: "#/components/responses/ApiError"
         "409":
-          description: The assignment is no longer in the requested generation or is not unstarted.
+          description: The assignment is no longer in the requested generation, is not unstarted, or is protected by route execution or unconfirmed cleanup.
           content:
             application/json:
               schema:
@@ -1728,6 +1755,11 @@ components:
         destinationId:
           type: string
           format: uuid
+        action:
+          type: string
+          enum: [start, stop]
+          default: start
+          description: Omitted means Take. Stop disconnects this destination regardless of its currently connected source; sourceId remains the saved visual anchor.
     PresetInput:
       type: object
       required: [name, routes]
@@ -1756,7 +1788,18 @@ components:
     ExecutePresetInput:
       allOf:
         - $ref: "#/components/schemas/PresetRevisionInput"
-        - $ref: "#/components/schemas/SetDesiredRoutesBatchRequest"
+        - type: object
+          required: [routes]
+          properties:
+            routes:
+              type: array
+              minItems: 1
+              maxItems: 64
+              description: Must exactly match the saved source, destination and action set. Duplicate destinations are rejected. Unlisted outputs are unchanged.
+              items:
+                allOf:
+                  - $ref: "#/components/schemas/SetDesiredRouteRequest"
+                  - $ref: "#/components/schemas/PresetRoute"
     Preset:
       allOf:
         - $ref: "#/components/schemas/PresetInput"
@@ -1799,6 +1842,11 @@ components:
         destinationId:
           type: string
           format: uuid
+        action:
+          type: string
+          enum: [start, stop]
+          default: start
+          description: Omitted for Take for backward compatibility. Stop outcomes refer to the actual disconnected source, not the saved visual anchor. Already-idle saved Stop actions can succeed without an assignment.
         pipelineId:
           type: string
           format: uuid

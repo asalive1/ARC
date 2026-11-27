@@ -51,9 +51,9 @@ requires attention to all listed terms.
 | UUID | 1.29.3 | Apache-2.0 OR MIT | Identifiers |
 | webpki-roots | 1.0.12 | MPL-2.0 | Bundled public TLS trust roots |
 | Emotion React / Styled | 11.14.0 / 11.14.1 | MIT | UI styling |
-| futures-util | 0.3.34 | MIT OR Apache-2.0 | Worker WebSocket client message handling and API session tests |
+| futures-util | 0.3.34 | MIT OR Apache-2.0 | Worker and API WebSocket handling and API session tests |
 | GStreamer Rust bindings | 0.25.4 | MIT OR Apache-2.0 | Worker media-plane adapter |
-| gstreamer-app Rust bindings | 0.25.2 | MIT OR Apache-2.0 | API-dispatched live RTP/SRT integration-test receivers |
+| gstreamer-app Rust bindings | 0.25.2 | MIT OR Apache-2.0 | Worker PCM preview tap and integration-test receivers |
 | Material UI | 7.3.11 | MIT | UI components |
 | TanStack React Query | 5.108.3 | MIT | UI data fetching |
 | React / React DOM | 19.3.1 / 19.3.1 | MIT | UI runtime |
@@ -88,6 +88,21 @@ the API crate. No third-party package or new technology was added.
 Worker command identity and generation-fencing groundwork use the existing
 Serde and async-trait dependencies; the PostgreSQL fence and command ledger use
 existing SQLx support. No third-party package was added.
+Worker preview cleanup tracking promotes the existing async-trait test
+dependency to a direct production dependency; no package was added.
+The preview close handshake promotes the existing futures-util test dependency
+to an API runtime dependency; no package was added.
+The experimental worker PCM preview tap promotes the existing gstreamer-app
+binding from a test dependency to a runtime dependency. It uses the app and
+audioconvert plugins already included in the worker image; no new native
+plugins or packages are added. Release binary and package inventories still
+need regeneration and review.
+The experimental browser preview player uses the browser-provided Web Audio
+and WebSocket APIs and adds no third-party package; its connected operator
+controls are deployed on the test host.
+The experimental worker tap also promotes the existing Tokio dependency from
+test-only to runtime for bounded asynchronous PCM reception. Tokio was already
+included in the worker; no new package or native plugin is introduced.
 The API command dispatcher reuses the workspace `arc-worker` crate and existing
 Tokio/WebSocket dependencies; it adds no third-party package.
 Provider-backed worker credential verification adds `subtle` for constant-time
@@ -134,14 +149,17 @@ notices per target artifact.
 ### Media-enabled test deployment identities
 
 The isolated Linux x86_64 test deployment now enables the existing optional
-worker and NGINX TLS ingress and refreshes the UI. No Rust/npm dependencies
+worker and NGINX TLS ingress and refreshes the API/UI. No Rust/npm dependencies
 or bundled media plugins were added. Imported runtime image identities are:
 
 | Artifact | Docker image identity |
 | --- | --- |
+| Updated ARC API, including saved Take/Unroute actions | `sha256:673844b0b9b00d9935348a434631c723690a4494b01fbb5aac735c53b1a33909` |
+| Backup API fallback, baseline behavior with migration 14 embedded | `sha256:6972a43c20d1ba54a530aec9d4737c5bb2dca09769c35f2a7be4f9c8685d0892` |
 | ARC worker, including idle WSS keepalive fix | `sha256:0384b5c2ec28297da3efbfaeaa80731c3e9155c2fd9233dd72a7e1855b2df3d0` |
 | Worker TLS ingress (`nginx:1.29-alpine`) | `sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de` |
-| Updated ARC UI | `sha256:1ad14d4fc8763228f1251cb923feaa6792d268069c5a2af901db16a27445ecdf` |
+| Updated ARC UI, including Active resource labels | `sha256:e5054c6b49334ea269a43a061f35aa452b93c134c5beae51aa0400b2ba6fd143` |
+| Previous ARC UI fallback, including API error details and three-state Salvo selections | `sha256:50dfb40ed8bfe397f8243c84969c3b468c9883381d9fc8ceb4d579d7173f2266` |
 
 These are Docker image/index identities, not the separate image configuration
 digests. The private test-host backup retains image/source archives and exact
@@ -151,15 +169,23 @@ artifacts does not close the release package/SBOM, notice or legal-review gates.
 The keepalive rebuild replaces only the worker executable on the original
 runtime image; runtime packages/plugins are unchanged. Rustfmt was installed
 only in the non-shipped cached build stage after a missing-tool failure.
+The API/fallback rebuilds replace only the executable; their runtime base
+layers are unchanged. Rustfmt, Clippy and matching native GStreamer test
+dependencies were installed only in the non-shipped verification environment
+after missing-tool/native-library failures.
+The UI error-reporting, Salvo-selection and Active-label rebuilds change only the application
+bundle on the existing NGINX runtime; npm dependencies and runtime packages
+are unchanged.
 
 ## Phase 1 media runtime
 
 The opt-in worker image installs GStreamer core, the Base support library
 (`libgstreamer-plugins-base1.0-0`) and the ALSA plugin, but not the full Base,
-Good or Bad plugin bundles. It copies only `libgstapp.so`,
+Good or Bad plugin bundles. The earlier baseline image copied `libgstapp.so`,
 `libgstaudioconvert.so`, `libgstudp.so`, `libgstrtp.so`,
 `libgstrtpmanager.so` and `libgstsrt.so` from non-shipped Debian plugin
-extraction stages. The SRT runtime library is installed separately.
+extraction stages. The SRT runtime library separately. The current test-host image additionally includes the
+preview plugins described below.
 The user approved LGPL GStreamer components and
 [Haivision SRT under MPL-2.0](https://github.com/Haivision/srt/blob/master/LICENSE)
 for Phase 1, with GPL/AGPL media components excluded from the media stack and
@@ -186,6 +212,33 @@ remains a release gate. The targeted SBOM and plugin findings are summarized in
 [dependency-license-inventory](dependency-license-inventory.md). Current Linux
 image SBOMs describe local builds only: no release image digests or Windows
 worker artifact are available for release review.
+
+The test-host MPEG-TS preview worker image also copies
+`libgstmpegtsdemux.so`, `libgstopus.so`, `libgstmpg123.so`,
+`libgstaudioparsers.so`, `libgstaudioresample.so` and the
+`libgstmpegts-1.0.so.0` and `libgstcodecparsers-1.0.so.0` support libraries.
+It installs `libopus0` and `libmpg123-0`. In the isolated Debian Bookworm
+test environment the five plugins report LGPL metadata; Debian records Opus
+under BSD terms and mpg123 under LGPL-2.1. The source and binary dependency
+closure, exact image digests, notices and target architectures still require
+review before distribution. The worker image under development also copies
+Debian's `libgstlibav.so` and builds FFmpeg's AAC decoder from Debian source
+with shared libraries, GPL and nonfree components disabled, and automatic
+external dependencies disabled. The patched source archive, LGPL-2.1 text,
+build configuration, Debian source version and GStreamer libav package notice
+are included in the image. One isolated x86-64 build used Debian FFmpeg source
+`7:5.1.9-0+deb12u1` and GStreamer libav `1.22.0-2`; its FFmpeg configuration
+reported LGPL-2.1-or-later with only the AAC decoder and parser enabled.
+The libav plugin resolved to the custom shared libraries, whose direct
+dependencies were libc, libm and the custom FFmpeg libraries. This evidence
+does not replace full source, binary, notice, architecture and distribution
+review. The source archive includes optional GPL-licensed source files that
+are not enabled in the build. The test host uses worker image
+`sha256:8c238497b800eaa555efdfb601ddb5c209a7c41b1df7b1997dd85d410cb3d123`;
+this deployment is not release approval. The GPL FAAD plugin
+and full plugin bundles are not included. The Opus plugin also contains an
+encoder; the separate MP3 and AAC test-encoder plugins are not copied into
+the worker image.
 
 Debian's GStreamer core copyright metadata labels the generated parser header
 `gst/parse/grammar.tab.h` GPL-3+. Debian's Meson build generates

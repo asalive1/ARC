@@ -1,6 +1,6 @@
-use std::{collections::BTreeSet, net::IpAddr};
+use std::{collections::BTreeSet, net::IpAddr, sync::Arc};
 
-use arc_domain::{PipelineRequirements, Worker, WorkerCapabilities};
+use arc_domain::{PipelineRequirements, SourceMediaProfile, Worker, WorkerCapabilities};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,17 @@ pub struct WorkerCommandIdentity {
     pub pipeline_id: Uuid,
     pub assignment_id: Uuid,
     pub generation: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessFenceIdentity {
+    pub host_id: Uuid,
+    pub boot_id: Uuid,
+    pub device: u64,
+    pub inode: u64,
+    pub proc_device: u64,
+    pub host_pid: u32,
+    pub start_ticks: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,12 +182,45 @@ pub trait DestinationAdapter: Send + Sync {
     async fn stop(&self, resource_id: Uuid) -> PortResult<()>;
 }
 
+/// Bounded 48 kHz stereo interleaved S16LE audio packets, at most 4096 bytes.
+/// `recv` must be cancellation-safe so a stopped relay can close promptly.
+#[async_trait]
+pub trait AudioPreview: Send {
+    async fn recv(&mut self) -> PortResult<Vec<u8>>;
+    async fn close(&mut self) -> PortResult<()>;
+}
+
 #[async_trait]
 pub trait MediaPipeline: Send + Sync {
     async fn prepare(&self, specification: &PipelineSpecification) -> PortResult<()>;
     async fn start(&self, pipeline_id: Uuid, generation: i64) -> PortResult<()>;
     async fn stop(&self, pipeline_id: Uuid, generation: i64) -> PortResult<()>;
     async fn observe(&self, pipeline_id: Uuid) -> PortResult<PipelineObservation>;
+
+    /// Attach to an already-running source without opening another input.
+    async fn start_active_preview(
+        self: Arc<Self>,
+        _identity: PipelineSourceIdentity,
+        _source: &SourceMediaProfile,
+    ) -> PortResult<Box<dyn AudioPreview>> {
+        Err(PortError {
+            code: "preview_unsupported",
+            message: "this worker does not support active-source preview".to_owned(),
+        })
+    }
+
+    /// Open only after reserving source ownership and capacity; retain the
+    /// reservation until the preview has closed successfully.
+    async fn start_reserved_preview(
+        self: Arc<Self>,
+        _identity: PipelineSourceIdentity,
+        _source: &SourceMediaProfile,
+    ) -> PortResult<Box<dyn AudioPreview>> {
+        Err(PortError {
+            code: "preview_unsupported",
+            message: "this worker does not support reserved-source preview".to_owned(),
+        })
+    }
 }
 
 pub trait SignalExtractor: Send + Sync {

@@ -1,15 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
 };
 
 use arc_application::{
-    MediaPipeline, PipelineObservation, PipelineObservedState, PipelineSourceIdentity,
-    PipelineSpecification, PortError, PortResult,
+    AudioPreview, MediaPipeline, PipelineObservation, PipelineObservedState,
+    PipelineSourceIdentity, PipelineSpecification, PortError, PortResult,
 };
 use arc_domain::{
     estimate_pipeline_requirements, DestinationMediaProfile, MediaPath, SourceMediaProfile,
@@ -19,11 +19,16 @@ use async_trait::async_trait;
 use chrono::Utc;
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_app::{AppSink, AppSinkCallbacks};
 use serde::Deserialize;
+use tokio::sync::mpsc::{self, error::TrySendError, Receiver};
 use uuid::Uuid;
 
 const STATE_CHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 const BRANCH_QUEUE_MAX_BUFFERS: u32 = 100;
+const PREVIEW_QUEUE_PACKETS: usize = 16;
+const PREVIEW_PACKET_BYTES: usize = 4096;
+const MAX_ACTIVE_PREVIEWS: usize = 8;
 
 pub struct GstreamerMediaPipeline {
     pipelines: Mutex<PipelineState>,
@@ -33,6 +38,99 @@ pub struct GstreamerMediaPipeline {
 struct PipelineState {
     pipelines: HashMap<Uuid, ManagedPipeline>,
     source_groups: HashMap<PipelineSourceIdentity, ManagedSourceGroup>,
+    previews: HashSet<Uuid>,
+    reserved_previews: HashSet<Uuid>,
+}
+
+/// A bounded tap of an active shared source. Packets contain interleaved stereo
+/// S16LE samples at 48 kHz.
+pub struct PcmPreview {
+    media: Arc<GstreamerMediaPipeline>,
+    pipeline_id: Uuid,
+    packets: Receiver<Vec<u8>>,
+    dropped_packets: Arc<AtomicU64>,
+    decode_error: Arc<Mutex<Option<PortError>>>,
+    closed: bool,
+}
+
+impl PcmPreview {
+    /// Wait asynchronously for audio. Cancellation does not consume a packet.
+    pub async fn recv(&mut self) -> PortResult<Vec<u8>> {
+        loop {
+            self.check()?;
+            tokio::select! {
+                packet = self.packets.recv() => {
+                    self.check()?;
+                    return packet.ok_or_else(|| {
+                        pipeline_error("preview_stream_ended", "preview audio stream ended unexpectedly")
+                    });
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+
+    /// Counts packets dropped at the consumer queue, not upstream queue drops.
+    pub fn dropped_packets(&self) -> u64 {
+        self.dropped_packets.load(Ordering::Relaxed)
+    }
+
+    pub fn check(&self) -> PortResult<()> {
+        if let Some(error) = self
+            .decode_error
+            .lock()
+            .map_err(|_| pipeline_error("preview_failed", "preview decoder state is unavailable"))?
+            .clone()
+        {
+            return Err(error);
+        }
+        let mut state = self.media.lock_pipelines()?;
+        let identity = state
+            .pipelines
+            .get(&self.pipeline_id)
+            .and_then(|pipeline| pipeline.source_identity)
+            .ok_or_else(|| pipeline_error("preview_closed", "preview is no longer active"))?;
+        observe_shared_group(&mut state, identity)?;
+        let managed = state
+            .pipelines
+            .get(&self.pipeline_id)
+            .ok_or_else(|| pipeline_error("preview_closed", "preview is no longer active"))?;
+        if matches!(managed.observed_state, PipelineObservedState::Failed) {
+            return Err(pipeline_error(
+                "preview_failed",
+                format!("preview failed: {}", managed.health_reasons.join("; ")),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn close(&mut self) -> PortResult<()> {
+        if !self.closed {
+            let mut state = self.media.lock_pipelines()?;
+            retire_pipeline(&mut state, self.pipeline_id)?;
+            self.closed = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PcmPreview {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            tracing::error!(code = error.code, message = %error.message, "failed to close PCM preview");
+        }
+    }
+}
+
+#[async_trait]
+impl AudioPreview for PcmPreview {
+    async fn recv(&mut self) -> PortResult<Vec<u8>> {
+        PcmPreview::recv(self).await
+    }
+
+    async fn close(&mut self) -> PortResult<()> {
+        PcmPreview::close(self)
+    }
 }
 
 struct ManagedPipeline {
@@ -117,6 +215,145 @@ impl GstreamerMediaPipeline {
         capabilities
     }
 
+    /// Attach without opening another source. The tap ends with the last route.
+    pub fn start_active_pcm_preview(
+        self: &Arc<Self>,
+        identity: PipelineSourceIdentity,
+        source: &SourceMediaProfile,
+    ) -> PortResult<PcmPreview> {
+        self.start_pcm_preview(identity, source, false)
+    }
+
+    fn start_pcm_preview(
+        self: &Arc<Self>,
+        identity: PipelineSourceIdentity,
+        source: &SourceMediaProfile,
+        reserved: bool,
+    ) -> PortResult<PcmPreview> {
+        let mpeg_ts = matches!(
+            source,
+            SourceMediaProfile::RtpMp2t { .. } | SourceMediaProfile::SrtMpegTs { .. }
+        );
+        let description = shared_source_description(source)?;
+        let mut state = self.lock_pipelines()?;
+        if state.previews.len() >= MAX_ACTIVE_PREVIEWS {
+            return Err(pipeline_error(
+                "preview_capacity_exhausted",
+                "this worker already has the maximum number of previews",
+            ));
+        }
+        let group = state.source_groups.get(&identity);
+        if group.is_some_and(|group| group.description != description) {
+            return Err(pipeline_error(
+                "source_group_configuration_conflict",
+                "preview source configuration does not match the active revision",
+            ));
+        }
+        if !reserved
+            && !group.is_some_and(|group| {
+                group
+                    .active_branches
+                    .iter()
+                    .any(|id| !state.previews.contains(id))
+            })
+        {
+            return Err(pipeline_error(
+                "preview_source_inactive",
+                "preview requires an active route",
+            ));
+        }
+        let pipeline_id = Uuid::new_v4();
+        let decoder = if mpeg_ts {
+            "tsdemux name=preview_demux audioconvert name=preview_convert"
+        } else {
+            "audioconvert name=preview_convert"
+        };
+        let branch = format!(
+            "queue name=preview_input max-size-buffers={BRANCH_QUEUE_MAX_BUFFERS} \
+             max-size-bytes=262144 max-size-time=0 leaky=downstream ! {decoder} ! audioresample ! \
+             audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved ! \
+             appsink name=preview_sink sync=false async=false max-buffers=4 drop=true"
+        );
+        prepare_shared_pipeline(
+            &mut state,
+            pipeline_id,
+            1,
+            "active PCM preview".to_owned(),
+            identity,
+            description,
+            branch,
+        )?;
+        state.previews.insert(pipeline_id);
+        if reserved {
+            state.reserved_previews.insert(pipeline_id);
+        }
+        let decode_error = Arc::new(Mutex::new(None));
+        if mpeg_ts {
+            let result = state.pipelines[&pipeline_id]
+                .branch
+                .as_ref()
+                .ok_or_else(|| {
+                    pipeline_error("preview_prepare_failed", "preview branch is missing")
+                })
+                .and_then(|branch| configure_mpeg_preview(branch, Arc::clone(&decode_error)));
+            if let Err(error) = result {
+                retire_pipeline(&mut state, pipeline_id)?;
+                return Err(error);
+            }
+        }
+        let (sender, packets) = mpsc::channel(PREVIEW_QUEUE_PACKETS);
+        let dropped_packets = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::clone(&dropped_packets);
+        let sink = state.pipelines[&pipeline_id]
+            .branch
+            .as_ref()
+            .and_then(|branch| branch.by_name("preview_sink"))
+            .and_then(|sink| sink.downcast::<AppSink>().ok());
+        let Some(sink) = sink else {
+            retire_pipeline(&mut state, pipeline_id)?;
+            return Err(pipeline_error(
+                "preview_prepare_failed",
+                "preview branch has no appsink",
+            ));
+        };
+        sink.set_callbacks(
+            AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let bytes = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    if bytes.as_slice().len() % 4 != 0 {
+                        return Err(gst::FlowError::Error);
+                    }
+                    let mut chunks = bytes.as_slice().chunks(PREVIEW_PACKET_BYTES);
+                    while let Some(packet) = chunks.next() {
+                        match sender.try_send(packet.to_vec()) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                dropped.fetch_add(1 + chunks.len() as u64, Ordering::Relaxed);
+                                break;
+                            }
+                            Err(TrySendError::Closed(_)) => return Err(gst::FlowError::Eos),
+                        }
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+        if let Err(error) = start_shared_pipeline(&mut state, pipeline_id) {
+            retire_pipeline(&mut state, pipeline_id)?;
+            return Err(error);
+        }
+        Ok(PcmPreview {
+            media: Arc::clone(self),
+            pipeline_id,
+            packets,
+            dropped_packets,
+            decode_error,
+            closed: false,
+        })
+    }
+
     fn lock_pipelines(&self) -> PortResult<std::sync::MutexGuard<'_, PipelineState>> {
         self.pipelines.lock().map_err(|_| {
             pipeline_error(
@@ -129,6 +366,22 @@ impl GstreamerMediaPipeline {
 
 #[async_trait]
 impl MediaPipeline for GstreamerMediaPipeline {
+    async fn start_active_preview(
+        self: Arc<Self>,
+        identity: PipelineSourceIdentity,
+        source: &SourceMediaProfile,
+    ) -> PortResult<Box<dyn AudioPreview>> {
+        Ok(Box::new(self.start_active_pcm_preview(identity, source)?))
+    }
+
+    async fn start_reserved_preview(
+        self: Arc<Self>,
+        identity: PipelineSourceIdentity,
+        source: &SourceMediaProfile,
+    ) -> PortResult<Box<dyn AudioPreview>> {
+        Ok(Box::new(self.start_pcm_preview(identity, source, true)?))
+    }
+
     async fn prepare(&self, specification: &PipelineSpecification) -> PortResult<()> {
         let route: PipelineRouteConfiguration =
             serde_json::from_value(specification.configuration.clone()).map_err(|error| {
@@ -418,6 +671,120 @@ impl Drop for GstreamerMediaPipeline {
     }
 }
 
+fn configure_mpeg_preview(
+    branch: &gst::Bin,
+    error: Arc<Mutex<Option<PortError>>>,
+) -> PortResult<()> {
+    let demux = branch.by_name("preview_demux").ok_or_else(|| {
+        pipeline_error(
+            "preview_prepare_failed",
+            "preview MPEG-TS demuxer is missing",
+        )
+    })?;
+    let convert = branch.by_name("preview_convert").ok_or_else(|| {
+        pipeline_error(
+            "preview_prepare_failed",
+            "preview audio converter is missing",
+        )
+    })?;
+    let linked = Arc::new(AtomicBool::new(false));
+    let pad_linked = Arc::clone(&linked);
+    let pad_error = Arc::clone(&error);
+    let branch = branch.downgrade();
+    demux.connect_pad_added(move |_demux, pad| {
+        let Some(caps) = pad.current_caps() else {
+            return;
+        };
+        let Some(format) = caps.structure(0) else {
+            return;
+        };
+        let decoder = match format.name().as_str() {
+            "audio/x-opus" => "opusdec",
+            "audio/mpeg" if format.get::<i32>("mpegversion") == Ok(1) => {
+                "mpegaudioparse ! mpg123audiodec"
+            }
+            "audio/mpeg" if matches!(format.get::<i32>("mpegversion"), Ok(2 | 4)) => {
+                "aacparse ! avdec_aac"
+            }
+            _ => return,
+        };
+        if pad_linked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let result = (|| -> PortResult<()> {
+            let branch = branch.upgrade().ok_or_else(|| {
+                pipeline_error("preview_closed", "preview branch has already closed")
+            })?;
+            let decoder = gst::parse::bin_from_description(decoder, true).map_err(|error| {
+                pipeline_error(
+                    "preview_codec_unsupported",
+                    format!("preview audio decoder is unavailable: {error}"),
+                )
+            })?;
+            branch.add(&decoder).map_err(|error| {
+                pipeline_error(
+                    "preview_failed",
+                    format!("cannot add preview decoder: {error}"),
+                )
+            })?;
+            let sink = decoder.static_pad("sink").ok_or_else(|| {
+                pipeline_error("preview_failed", "preview decoder has no input pad")
+            })?;
+            let output = decoder.static_pad("src").ok_or_else(|| {
+                pipeline_error("preview_failed", "preview decoder has no output pad")
+            })?;
+            let target = convert.static_pad("sink").ok_or_else(|| {
+                pipeline_error("preview_failed", "preview converter has no input pad")
+            })?;
+            output.link(&target).map_err(|error| {
+                pipeline_error(
+                    "preview_failed",
+                    format!("cannot link preview converter: {error}"),
+                )
+            })?;
+            decoder.sync_state_with_parent().map_err(|error| {
+                pipeline_error(
+                    "preview_failed",
+                    format!("cannot start preview decoder: {error}"),
+                )
+            })?;
+            pad.link(&sink).map_err(|error| {
+                pipeline_error(
+                    "preview_failed",
+                    format!("cannot link preview decoder: {error}"),
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            set_decode_error(&pad_error, error);
+        }
+    });
+    demux.connect_no_more_pads(move |_| {
+        if !linked.load(Ordering::Acquire) {
+            set_decode_error(
+                &error,
+                pipeline_error(
+                    "preview_codec_unsupported",
+                    "MPEG-TS preview supports Opus, MPEG-1 audio and AAC; no supported audio track was found",
+                ),
+            );
+        }
+    });
+    Ok(())
+}
+
+fn set_decode_error(state: &Mutex<Option<PortError>>, error: PortError) {
+    match state.lock() {
+        Ok(mut state) => {
+            if state.is_none() {
+                *state = Some(error);
+            }
+        }
+        Err(error) => tracing::error!(%error, "preview decoder state was poisoned"),
+    }
+}
+
 fn parse_pipeline(description: &str) -> PortResult<gst::Pipeline> {
     let element = gst::parse::launch(description).map_err(|error| {
         pipeline_error(
@@ -450,7 +817,9 @@ fn prepare_shared_pipeline(
     })?;
     branch.set_property("name", format!("arc-branch-{pipeline_id}"));
     let target = branch
-        .find_unlinked_pad(gst::PadDirection::Sink)
+        .by_name("preview_input")
+        .and_then(|input| input.static_pad("sink"))
+        .or_else(|| branch.find_unlinked_pad(gst::PadDirection::Sink))
         .ok_or_else(|| {
             pipeline_error(
                 "gstreamer_pipeline_prepare_failed",
@@ -589,6 +958,18 @@ fn start_shared_pipeline(state: &mut PipelineState, pipeline_id: Uuid) -> PortRe
         return Ok(());
     }
     let was_empty = group.active_branches.is_empty();
+    let tee_sink = group.tee.static_pad("sink").ok_or_else(|| {
+        pipeline_error(
+            "gstreamer_branch_state_unavailable",
+            "shared source fan-out has no sink pad",
+        )
+    })?;
+    // Exclude in-flight buffers and serialized events while changing tee pads.
+    let _stream_lock = if was_empty {
+        None
+    } else {
+        Some(tee_sink.stream_lock())
+    };
     group.pipeline.add(&branch).map_err(|error| {
         pipeline_error(
             "gstreamer_branch_start_failed",
@@ -670,6 +1051,28 @@ fn detach_shared_branch(
     let Some(identity) = managed.source_identity else {
         return Ok(());
     };
+    if !state.previews.contains(&pipeline_id) {
+        if let Some(group) = state.source_groups.get(&identity) {
+            let last_route = group.active_branches.contains(&pipeline_id)
+                && !group
+                    .active_branches
+                    .iter()
+                    .any(|id| *id != pipeline_id && !state.previews.contains(id));
+            if last_route {
+                let previews: Vec<_> = group
+                    .active_branches
+                    .iter()
+                    .filter(|id| {
+                        state.previews.contains(id) && !state.reserved_previews.contains(id)
+                    })
+                    .copied()
+                    .collect();
+                for preview in previews {
+                    retire_pipeline(state, preview)?;
+                }
+            }
+        }
+    }
     let Some(group) = state.source_groups.get_mut(&identity) else {
         return Err(pipeline_error(
             "shared_source_not_found",
@@ -692,6 +1095,13 @@ fn detach_shared_branch(
                 "active destination branch has no ghost sink pad",
             )
         })?;
+        let tee_sink = group.tee.static_pad("sink").ok_or_else(|| {
+            pipeline_error(
+                "gstreamer_branch_state_unavailable",
+                "shared source fan-out has no sink pad",
+            )
+        })?;
+        let stream_lock = tee_sink.stream_lock();
         branch.set_state(gst::State::Null).map_err(|error| {
             pipeline_error(
                 "gstreamer_pipeline_stop_failed",
@@ -712,13 +1122,14 @@ fn detach_shared_branch(
             )
         })?;
         group.active_branches.remove(&pipeline_id);
-        if group.active_branches.is_empty() {
-            transition_pipeline(
-                &group.pipeline,
-                gst::State::Null,
-                "gstreamer_pipeline_stop_failed",
-            )?;
-        }
+        drop(stream_lock);
+    }
+    if group.active_branches.is_empty() {
+        transition_pipeline(
+            &group.pipeline,
+            gst::State::Null,
+            "gstreamer_pipeline_stop_failed",
+        )?;
     }
     Ok(())
 }
@@ -745,6 +1156,8 @@ fn retire_pipeline(state: &mut PipelineState, pipeline_id: Uuid) -> PortResult<(
     if let Some(identity) = source_identity {
         prune_source_group(state, identity);
     }
+    state.previews.remove(&pipeline_id);
+    state.reserved_previews.remove(&pipeline_id);
     Ok(())
 }
 
@@ -1130,10 +1543,13 @@ fn shared_branch_description(
         (
             Ok(MediaPath::RtpMp2tToSrtMpegTs | MediaPath::SrtMpegTsToSrtMpegTs),
             DestinationMediaProfile::SrtMpegTs { host, port, mode },
-        ) => format!(
-            "{queue} ! srtsink uri={} async=false",
-            gst_string(&srt_uri(host, *port, *mode)?)?,
-        ),
+        ) => {
+            // A disconnected sink must not block serialized queries on the shared tee.
+            format!(
+                "{queue} ! srtsink uri={} async=false wait-for-connection=false",
+                gst_string(&srt_uri(host, *port, *mode)?)?,
+            )
+        }
         _ => {
             return Err(pipeline_error(
                 "unsupported_media_path",
@@ -1386,12 +1802,15 @@ mod tests {
     }
 
     fn srt_receiver(port: u16) -> (gst::Pipeline, AppSink) {
+        srt_receiver_with_mode(port, SrtMode::Listener)
+    }
+
+    fn srt_receiver_with_mode(port: u16, mode: SrtMode) -> (gst::Pipeline, AppSink) {
         let loopback = Ipv4Addr::LOCALHOST;
         let source = gst::ElementFactory::make("srtsrc")
             .property(
                 "uri",
-                srt_uri(&loopback.to_string(), port, SrtMode::Listener)
-                    .expect("SRT listener URI builds"),
+                srt_uri(&loopback.to_string(), port, mode).expect("SRT receiver URI builds"),
             )
             .build()
             .expect("SRT listener element builds");
@@ -1460,6 +1879,798 @@ mod tests {
             }
         }
         false
+    }
+
+    #[tokio::test]
+    async fn active_pcm_preview_is_bounded_and_does_not_keep_the_source_alive() {
+        let media = Arc::new(GstreamerMediaPipeline::new().expect("GStreamer initializes"));
+        let loopback = Ipv4Addr::LOCALHOST;
+        let reservation = UdpSocket::bind((loopback, 0)).expect("RTP port reserves");
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let source = SourceMediaProfile::RtpL16 {
+            bind_address: loopback.into(),
+            port,
+            payload_type: 96,
+        };
+        let identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let provider: Arc<dyn MediaPipeline> = media.clone();
+        assert_eq!(
+            Arc::clone(&provider)
+                .start_active_preview(identity, &source)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "preview_source_inactive"
+        );
+        assert_eq!(
+            media
+                .start_active_pcm_preview(identity, &source)
+                .err()
+                .unwrap()
+                .code,
+            "preview_source_inactive"
+        );
+        let route_id = Uuid::new_v4();
+        let sibling_id = Uuid::new_v4();
+        {
+            let mut state = media.lock_pipelines().unwrap();
+            prepare_shared_pipeline(
+                &mut state,
+                route_id,
+                1,
+                "test route".to_owned(),
+                identity,
+                shared_source_description(&source).unwrap(),
+                "queue ! appsink name=route_sink sync=false async=false".to_owned(),
+            )
+            .unwrap();
+            prepare_shared_pipeline(
+                &mut state,
+                sibling_id,
+                1,
+                "second test route".to_owned(),
+                identity,
+                shared_source_description(&source).unwrap(),
+                "queue ! appsink name=sibling_sink sync=false async=false".to_owned(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            media
+                .start_active_pcm_preview(identity, &source)
+                .err()
+                .unwrap()
+                .code,
+            "preview_source_inactive"
+        );
+        let count = Arc::new(AtomicUsize::new(0));
+        let sibling_count = Arc::new(AtomicUsize::new(0));
+        {
+            let state = media.lock_pipelines().unwrap();
+            for (id, name, counter) in [
+                (route_id, "route_sink", &count),
+                (sibling_id, "sibling_sink", &sibling_count),
+            ] {
+                let sink = state.pipelines[&id]
+                    .branch
+                    .as_ref()
+                    .unwrap()
+                    .by_name(name)
+                    .unwrap()
+                    .downcast::<AppSink>()
+                    .unwrap();
+                let counter = Arc::clone(counter);
+                sink.set_callbacks(
+                    AppSinkCallbacks::builder()
+                        .new_sample(move |sink| {
+                            sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            Ok(gst::FlowSuccess::Ok)
+                        })
+                        .build(),
+                );
+            }
+        }
+        media.start(route_id, 1).await.unwrap();
+        media.start(sibling_id, 1).await.unwrap();
+        let changed_source = SourceMediaProfile::RtpL16 {
+            bind_address: loopback.into(),
+            port,
+            payload_type: 97,
+        };
+        assert_eq!(
+            media
+                .start_active_pcm_preview(identity, &changed_source)
+                .err()
+                .unwrap()
+                .code,
+            "source_group_configuration_conflict"
+        );
+        let mut preview = media.start_active_pcm_preview(identity, &source).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), preview.recv())
+                .await
+                .is_err()
+        );
+        let sender = parse_pipeline(&format!(
+            "audiotestsrc is-live=true ! audio/x-raw,format=S16BE,rate=48000,channels=2 ! \
+             rtpL16pay pt=96 ! udpsink host=127.0.0.1 port={port} sync=false"
+        ))
+        .unwrap();
+        transition_pipeline(&sender, gst::State::Playing, "test_start_failed").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while count.load(Ordering::Relaxed) == 0 || sibling_count.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both routes receive audio before preview churn");
+        let mut additional = Vec::new();
+        for _ in 1..MAX_ACTIVE_PREVIEWS {
+            additional.push(media.start_active_pcm_preview(identity, &source).unwrap());
+        }
+        assert_eq!(
+            media
+                .start_active_pcm_preview(identity, &source)
+                .err()
+                .unwrap()
+                .code,
+            "preview_capacity_exhausted"
+        );
+        for extra in &mut additional {
+            extra.close().unwrap();
+        }
+        let packet = tokio::time::timeout(Duration::from_secs(5), preview.recv())
+            .await
+            .expect("preview receives audio in time")
+            .expect("preview receives audio");
+        assert!(!packet.is_empty() && packet.len() <= PREVIEW_PACKET_BYTES);
+        assert_eq!(packet.len() % 4, 0);
+        assert!(packet.iter().any(|byte| *byte != 0));
+        let mut abstract_preview = Arc::clone(&provider)
+            .start_active_preview(identity, &source)
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(5), abstract_preview.recv())
+            .await
+            .expect("worker preview receives audio in time")
+            .expect("worker preview receives audio");
+        assert!(!packet.is_empty() && packet.len() <= PREVIEW_PACKET_BYTES);
+        assert_eq!(packet.len() % 4, 0);
+        abstract_preview.close().await.unwrap();
+        {
+            let state = media.lock_pipelines().unwrap();
+            let caps = state.pipelines[&preview.pipeline_id]
+                .branch
+                .as_ref()
+                .unwrap()
+                .by_name("preview_sink")
+                .unwrap()
+                .static_pad("sink")
+                .unwrap()
+                .current_caps()
+                .unwrap();
+            let audio = caps.structure(0).unwrap();
+            assert_eq!(audio.get::<&str>("format").unwrap(), "S16LE");
+            assert_eq!(audio.get::<i32>("rate").unwrap(), 48_000);
+            assert_eq!(audio.get::<i32>("channels").unwrap(), 2);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while preview.dropped_packets() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "preview did not apply backpressure"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = count.load(Ordering::Relaxed);
+        while count.load(Ordering::Relaxed) <= before {
+            assert!(
+                Instant::now() < deadline,
+                "route stopped while preview was full"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        preview.close().unwrap();
+        assert!(matches!(
+            media.observe(route_id).await.unwrap().state,
+            PipelineObservedState::Running
+        ));
+
+        let mut failing_preview = media.start_active_pcm_preview(identity, &source).unwrap();
+        {
+            let state = media.lock_pipelines().unwrap();
+            let branch = state.pipelines[&failing_preview.pipeline_id]
+                .branch
+                .as_ref()
+                .unwrap();
+            let bus = state.source_groups[&identity].pipeline.bus().unwrap();
+            bus.post(
+                gst::message::Error::builder(gst::CoreError::Failed, "preview fault")
+                    .src(branch)
+                    .build(),
+            )
+            .unwrap();
+        }
+        let error = failing_preview
+            .recv()
+            .await
+            .expect_err("preview fault is reported");
+        assert_eq!(error.code, "preview_failed");
+        assert!(error.message.contains("preview fault"));
+        assert!(matches!(
+            media.observe(route_id).await.unwrap().state,
+            PipelineObservedState::Running
+        ));
+        failing_preview.close().unwrap();
+
+        let mut preview = media.start_active_pcm_preview(identity, &source).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), preview.recv())
+            .await
+            .expect("second preview receives audio in time")
+            .expect("second preview receives audio");
+        media.stop(route_id, 1).await.unwrap();
+        let before = sibling_count.load(Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sibling_count.load(Ordering::Relaxed) <= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sibling route keeps receiving after the other route stops");
+        assert!(matches!(
+            media.observe(sibling_id).await.unwrap().state,
+            PipelineObservedState::Running
+        ));
+        tokio::time::timeout(Duration::from_secs(5), preview.recv())
+            .await
+            .expect("preview receives audio in time")
+            .expect("preview survives one route stopping");
+        transition_pipeline(&sender, gst::State::Null, "test_stop_failed").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match tokio::time::timeout(Duration::from_millis(100), preview.recv()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => panic!("preview failed while draining: {error:?}"),
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("preview audio stops after the sender stops");
+        let (received, stopped) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(3), preview.recv()),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                media.stop(sibling_id, 1).await
+            }
+        );
+        stopped.unwrap();
+        assert_eq!(
+            received
+                .expect("receiver observes route stop")
+                .unwrap_err()
+                .code,
+            "preview_closed"
+        );
+        assert_eq!(preview.check().unwrap_err().code, "preview_closed");
+        assert!(media.lock_pipelines().unwrap().source_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserved_preview_shares_an_idle_source_with_routes_and_other_previews() {
+        let media = Arc::new(GstreamerMediaPipeline::new().unwrap());
+        let reservation = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let source = SourceMediaProfile::RtpL16 {
+            bind_address: Ipv4Addr::LOCALHOST.into(),
+            port,
+            payload_type: 96,
+        };
+        let mut preview = media.start_pcm_preview(identity, &source, true).unwrap();
+        let provider: Arc<dyn MediaPipeline> = media.clone();
+        let mut second = provider
+            .start_reserved_preview(identity, &source)
+            .await
+            .unwrap();
+        let changed_source = SourceMediaProfile::RtpL16 {
+            bind_address: Ipv4Addr::LOCALHOST.into(),
+            port,
+            payload_type: 97,
+        };
+        assert_eq!(
+            media
+                .start_pcm_preview(identity, &changed_source, true)
+                .err()
+                .unwrap()
+                .code,
+            "source_group_configuration_conflict"
+        );
+        assert_eq!(media.lock_pipelines().unwrap().source_groups.len(), 1);
+        let sender = parse_pipeline(&format!(
+            "audiotestsrc is-live=true ! audio/x-raw,format=S16BE,rate=48000,channels=2 ! \
+             rtpL16pay pt=96 ! udpsink host=127.0.0.1 port={port} sync=false"
+        ))
+        .unwrap();
+        transition_pipeline(&sender, gst::State::Playing, "test_start_failed").unwrap();
+        for tap in [&mut preview as &mut dyn AudioPreview, second.as_mut()] {
+            let packet = tokio::time::timeout(Duration::from_secs(5), tap.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(packet.iter().any(|byte| *byte != 0));
+        }
+
+        let route_id = Uuid::new_v4();
+        let received = Arc::new(AtomicUsize::new(0));
+        {
+            let mut state = media.lock_pipelines().unwrap();
+            prepare_shared_pipeline(
+                &mut state,
+                route_id,
+                1,
+                "test route".to_owned(),
+                identity,
+                shared_source_description(&source).unwrap(),
+                "queue ! appsink name=route_sink sync=false async=false".to_owned(),
+            )
+            .unwrap();
+            let sink = state.pipelines[&route_id]
+                .branch
+                .as_ref()
+                .unwrap()
+                .by_name("route_sink")
+                .unwrap()
+                .downcast::<AppSink>()
+                .unwrap();
+            let received = Arc::clone(&received);
+            sink.set_callbacks(
+                AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        received.fetch_add(1, Ordering::Relaxed);
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+        }
+        media.start(route_id, 1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route receives audio from the preview source");
+        let mut active_preview = media.start_active_pcm_preview(identity, &source).unwrap();
+        second.close().await.unwrap();
+        let before = received.load(Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received.load(Ordering::Relaxed) <= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route continues after a preview closes");
+
+        media.stop(route_id, 1).await.unwrap();
+        assert_eq!(active_preview.check().unwrap_err().code, "preview_closed");
+        active_preview.close().unwrap();
+        while preview.packets.try_recv().is_ok() {}
+        let packet = tokio::time::timeout(Duration::from_secs(5), preview.recv())
+            .await
+            .expect("preview continues after the final route stops")
+            .unwrap();
+        assert!(packet.iter().any(|byte| *byte != 0));
+        preview.close().unwrap();
+        assert!(media.lock_pipelines().unwrap().source_groups.is_empty());
+        transition_pipeline(&sender, gst::State::Null, "test_stop_failed").unwrap();
+    }
+
+    #[test]
+    fn retiring_an_inactive_branch_stops_its_unreferenced_source() {
+        let media = GstreamerMediaPipeline::new().unwrap();
+        let identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let branch = Uuid::new_v4();
+        let mut state = media.lock_pipelines().unwrap();
+        prepare_shared_pipeline(
+            &mut state,
+            branch,
+            1,
+            "test route".to_owned(),
+            identity,
+            "audiotestsrc is-live=true ! tee name=source_tee allow-not-linked=true".to_owned(),
+            "queue ! fakesink sync=false async=false".to_owned(),
+        )
+        .unwrap();
+        let source = state.source_groups[&identity].pipeline.clone();
+        transition_pipeline(&source, gst::State::Playing, "test_start_failed").unwrap();
+        retire_pipeline(&mut state, branch).unwrap();
+        assert_eq!(source.current_state(), gst::State::Null);
+        assert!(state.source_groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_mpeg_ts_opus_without_interrupting_the_route() {
+        test_mpeg_ts_preview("opusenc", true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_srt_mpeg_ts_without_interrupting_the_route() {
+        test_mpeg_ts_preview("opusenc", true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_mpeg_ts_mpeg_audio_without_interrupting_the_route() {
+        test_mpeg_ts_preview("lamemp3enc ! mpegaudioparse", true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_mpeg_ts_aac_without_interrupting_the_route() {
+        test_mpeg_ts_preview("voaacenc ! aacparse", true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn preview_decodes_srt_mpeg_ts_aac_without_interrupting_the_route() {
+        test_mpeg_ts_preview("voaacenc ! aacparse", true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn preview_attaches_to_an_already_streaming_srt_source() {
+        test_mpeg_ts_preview_with_streaming_source("opusenc").await;
+    }
+
+    #[tokio::test]
+    async fn aac_preview_attaches_to_an_already_streaming_srt_source() {
+        test_mpeg_ts_preview_with_streaming_source("voaacenc ! aacparse").await;
+    }
+
+    #[tokio::test]
+    async fn preview_on_streaming_srt_with_disconnected_destination() {
+        test_srt_preview_with_disconnected_destination(SrtMode::Caller).await;
+    }
+
+    #[tokio::test]
+    async fn preview_on_streaming_srt_with_no_listener_client() {
+        test_srt_preview_with_disconnected_destination(SrtMode::Listener).await;
+    }
+
+    async fn test_srt_preview_with_disconnected_destination(destination_mode: SrtMode) {
+        let media = Arc::new(GstreamerMediaPipeline::new().unwrap());
+        let ports = [
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        ];
+        let source_port = ports[0].local_addr().unwrap().port();
+        let destination_port = ports[1].local_addr().unwrap().port();
+        drop(ports);
+        let identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let source = SourceMediaProfile::SrtMpegTs {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: source_port,
+            mode: SrtMode::Listener,
+        };
+        let route_id = Uuid::new_v4();
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let mut state = media.lock_pipelines().unwrap();
+            prepare_shared_pipeline(
+                &mut state,
+                route_id,
+                1,
+                "test route".to_owned(),
+                identity,
+                shared_source_description(&source).unwrap(),
+                shared_branch_description(
+                    &source,
+                    &DestinationMediaProfile::SrtMpegTs {
+                        host: Ipv4Addr::LOCALHOST.to_string(),
+                        port: destination_port,
+                        mode: destination_mode,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let counter = Arc::clone(&count);
+            state.source_groups[&identity]
+                .tee
+                .static_pad("sink")
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                });
+        }
+        media.start(route_id, 1).await.unwrap();
+        let sender = parse_pipeline(&format!(
+            "audiotestsrc is-live=true ! audio/x-raw,rate=48000,channels=2 ! \
+             voaacenc ! aacparse ! mpegtsmux ! \
+             srtsink uri=\"srt://127.0.0.1:{source_port}?mode=caller\" sync=false async=false"
+        ))
+        .unwrap();
+        transition_pipeline(&sender, gst::State::Playing, "test_start_failed").unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while count.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SRT source receives audio before preview starts");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut preview = media.start_pcm_preview(identity, &source, true).unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(8), preview.recv())
+            .await
+            .expect("preview responds")
+            .expect("preview decodes audio");
+        assert!(packet.iter().any(|byte| *byte != 0));
+        preview.close().unwrap();
+        let mut preview = media.start_pcm_preview(identity, &source, true).unwrap();
+        let receiver_mode = match destination_mode {
+            SrtMode::Caller => SrtMode::Listener,
+            SrtMode::Listener => SrtMode::Caller,
+        };
+        let (receiver, sink) = srt_receiver_with_mode(destination_port, receiver_mode);
+        let routed = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(12))
+            .expect("SRT destination receives media after reconnect");
+        let bytes = routed.buffer().unwrap().map_readable().unwrap();
+        assert!(bytes.as_slice().chunks(188).any(|packet| packet[0] == 0x47));
+        while sink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+        preview.close().unwrap();
+        let routed_after_close = sink
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .expect("SRT destination continues after preview closes");
+        assert!(routed_after_close.buffer().unwrap().size() > 0);
+        media.stop(route_id, 1).await.unwrap();
+        transition_pipeline(&receiver, gst::State::Null, "test_stop_failed").unwrap();
+        transition_pipeline(&sender, gst::State::Null, "test_stop_failed").unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_signal_srt_and_rtp_previews_close_without_blocking() {
+        let media = Arc::new(GstreamerMediaPipeline::new().unwrap());
+        let ports = [
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        ];
+        let srt_port = ports[0].local_addr().unwrap().port();
+        let rtp_port = ports[1].local_addr().unwrap().port();
+        let destination_port = ports[2].local_addr().unwrap().port();
+        drop(ports);
+        let srt_identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let srt = SourceMediaProfile::SrtMpegTs {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: srt_port,
+            mode: SrtMode::Listener,
+        };
+        let route_id = Uuid::new_v4();
+        {
+            let mut state = media.lock_pipelines().unwrap();
+            prepare_shared_pipeline(
+                &mut state,
+                route_id,
+                1,
+                "test route".to_owned(),
+                srt_identity,
+                shared_source_description(&srt).unwrap(),
+                format!(
+                    "queue ! srtsink uri=\"srt://127.0.0.1:{destination_port}?mode=caller\" async=false"
+                ),
+            )
+            .unwrap();
+        }
+        media.start(route_id, 1).await.unwrap();
+        let mut srt_preview = media.start_pcm_preview(srt_identity, &srt, true).unwrap();
+        let rtp = SourceMediaProfile::RtpL24 {
+            bind_address: Ipv4Addr::LOCALHOST.into(),
+            port: rtp_port,
+            payload_type: 96,
+        };
+        let mut rtp_preview = media
+            .start_pcm_preview(
+                PipelineSourceIdentity {
+                    source_id: Uuid::new_v4(),
+                    source_revision: 1,
+                },
+                &rtp,
+                true,
+            )
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), srt_preview.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rtp_preview.recv())
+                .await
+                .is_err()
+        );
+        srt_preview.close().unwrap();
+        rtp_preview.close().unwrap();
+        media.stop(route_id, 1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_preview_shares_an_idle_srt_source_with_a_route() {
+        test_mpeg_ts_preview("voaacenc ! aacparse", true, true, true).await;
+    }
+
+    #[tokio::test]
+    async fn preview_reports_unsupported_mpeg_ts_audio_without_interrupting_the_route() {
+        test_mpeg_ts_preview(
+            "capssetter caps=\"audio/x-lpcm,width=(int)16,rate=(int)48000,channels=(int)2,\
+             dynamic_range=(int)0,emphasis=(boolean)false,mute=(boolean)false\" \
+             replace=true join=false",
+            false,
+            false,
+            false,
+        )
+        .await;
+    }
+
+    async fn test_mpeg_ts_preview(encoder: &str, supported: bool, srt: bool, reserved: bool) {
+        test_mpeg_ts_preview_scenario(encoder, supported, srt, reserved, false).await;
+    }
+
+    async fn test_mpeg_ts_preview_with_streaming_source(encoder: &str) {
+        test_mpeg_ts_preview_scenario(encoder, true, true, false, true).await;
+    }
+
+    async fn test_mpeg_ts_preview_scenario(
+        encoder: &str,
+        supported: bool,
+        srt: bool,
+        reserved: bool,
+        streaming_before_preview: bool,
+    ) {
+        let media = Arc::new(GstreamerMediaPipeline::new().unwrap());
+        let reservation = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let identity = PipelineSourceIdentity {
+            source_id: Uuid::new_v4(),
+            source_revision: 1,
+        };
+        let source = if srt {
+            SourceMediaProfile::SrtMpegTs {
+                host: Ipv4Addr::LOCALHOST.to_string(),
+                port,
+                mode: SrtMode::Listener,
+            }
+        } else {
+            SourceMediaProfile::RtpMp2t {
+                bind_address: Ipv4Addr::LOCALHOST.into(),
+                port,
+            }
+        };
+        assert_eq!(
+            media
+                .start_active_pcm_preview(identity, &source)
+                .err()
+                .unwrap()
+                .code,
+            "preview_source_inactive"
+        );
+        let idle_preview = if reserved {
+            Some(media.start_pcm_preview(identity, &source, true).unwrap())
+        } else {
+            None
+        };
+        let route_id = Uuid::new_v4();
+        let count = Arc::new(AtomicUsize::new(0));
+        {
+            let mut state = media.lock_pipelines().unwrap();
+            prepare_shared_pipeline(
+                &mut state,
+                route_id,
+                1,
+                "test route".to_owned(),
+                identity,
+                shared_source_description(&source).unwrap(),
+                "queue ! appsink name=route_sink sync=false async=false".to_owned(),
+            )
+            .unwrap();
+            let sink = state.pipelines[&route_id]
+                .branch
+                .as_ref()
+                .unwrap()
+                .by_name("route_sink")
+                .unwrap()
+                .downcast::<AppSink>()
+                .unwrap();
+            let count = Arc::clone(&count);
+            sink.set_callbacks(
+                AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        count.fetch_add(1, Ordering::Relaxed);
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+        }
+        media.start(route_id, 1).await.unwrap();
+        let output = if srt {
+            format!("srtsink uri=\"srt://127.0.0.1:{port}?mode=caller\" sync=false async=false")
+        } else {
+            format!("rtpmp2tpay ! udpsink host=127.0.0.1 port={port} sync=false")
+        };
+        let sender = parse_pipeline(&format!(
+            "audiotestsrc is-live=true ! audio/x-raw,rate=48000,channels=2 ! \
+             {encoder} ! mpegtsmux ! {output}"
+        ))
+        .unwrap();
+        let mut preview = if !streaming_before_preview {
+            Some(match idle_preview {
+                Some(preview) => preview,
+                None => media.start_active_pcm_preview(identity, &source).unwrap(),
+            })
+        } else {
+            None
+        };
+        transition_pipeline(&sender, gst::State::Playing, "test_start_failed").unwrap();
+        if streaming_before_preview {
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while count.load(Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("route receives audio before preview starts");
+            preview = Some(media.start_active_pcm_preview(identity, &source).unwrap());
+        }
+        let mut preview = preview.expect("preview started");
+        let result = tokio::time::timeout(Duration::from_secs(8), preview.recv()).await;
+        let during_preview = count.load(Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while count.load(Ordering::Relaxed) <= during_preview {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route continues while preview is active");
+        let before = count.load(Ordering::Relaxed);
+        preview.close().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while count.load(Ordering::Relaxed) <= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route continues after preview closes");
+        media.stop(route_id, 1).await.unwrap();
+        transition_pipeline(&sender, gst::State::Null, "test_stop_failed").unwrap();
+        let result = result.expect("MPEG-TS preview responds in time");
+        if supported {
+            assert!(result
+                .expect("preview decodes audio")
+                .iter()
+                .any(|byte| *byte != 0));
+        } else {
+            assert_eq!(result.unwrap_err().code, "preview_codec_unsupported");
+        }
     }
 
     #[tokio::test]

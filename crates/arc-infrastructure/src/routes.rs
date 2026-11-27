@@ -8,6 +8,28 @@ use uuid::Uuid;
 
 const ROUTE_GLOBAL_REVISION_LOCK_ID: i64 = 0x415243;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum RouteAction {
+    #[default]
+    Start,
+    Stop,
+}
+
+impl RouteAction {
+    fn is_start(&self) -> bool {
+        *self == Self::Start
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, FromRow, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteRecord {
@@ -26,6 +48,8 @@ pub struct DesiredRouteChange {
     pub destination_id: Uuid,
     pub expected_route_revision: i64,
     pub confirm_replace: bool,
+    #[serde(default, skip_serializing_if = "RouteAction::is_start")]
+    pub action: RouteAction,
 }
 
 #[derive(Clone, Debug, Deserialize, FromRow, PartialEq, Serialize)]
@@ -33,6 +57,8 @@ pub struct DesiredRouteChange {
 pub struct PresetRoute {
     pub source_id: Uuid,
     pub destination_id: Uuid,
+    #[serde(default, skip_serializing_if = "RouteAction::is_start")]
+    pub action: RouteAction,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -65,6 +91,8 @@ pub struct RouteBatchItemResult {
     pub assignment_generation: Option<i64>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "RouteAction::is_start")]
+    pub action: RouteAction,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -154,7 +182,7 @@ impl PgRoutes {
         let mut presets = Vec::with_capacity(rows.len());
         for (id, name, revision) in rows {
             let routes = sqlx::query_as::<_, PresetRoute>(
-                "SELECT source_id, destination_id FROM preset_routes WHERE preset_id = $1 ORDER BY destination_id",
+                "SELECT source_id, destination_id, action FROM preset_routes WHERE preset_id = $1 ORDER BY destination_id",
             )
             .bind(id)
             .fetch_all(&mut *tx)
@@ -259,8 +287,8 @@ impl PgRoutes {
                 .await?;
         }
         for route in &routes {
-            sqlx::query("INSERT INTO preset_routes (preset_id, source_id, destination_id) VALUES ($1, $2, $3)")
-                .bind(id).bind(route.source_id).bind(route.destination_id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO preset_routes (preset_id, source_id, destination_id, action) VALUES ($1, $2, $3, $4)")
+                .bind(id).bind(route.source_id).bind(route.destination_id).bind(route.action.as_str()).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(Preset {
@@ -330,6 +358,9 @@ impl PgRoutes {
         let destination = sqlx::query_as::<_, (String, Value)>(
             "SELECT r.lifecycle, r.configuration FROM destinations d JOIN destination_revisions r ON r.destination_id = d.id AND r.revision = d.current_revision WHERE d.id = $1 FOR SHARE OF d, r",
         ).bind(route.destination_id).fetch_optional(&mut **tx).await?.ok_or(RouteWriteError::DestinationNotFound)?;
+        if route.action == RouteAction::Stop {
+            return Ok(());
+        }
         if source.0 != "validated" {
             return Err(RouteWriteError::SourceNotValidated);
         }
@@ -414,72 +445,25 @@ impl PgRoutes {
         sqlx::query("SET LOCAL lock_timeout = '0'")
             .execute(&mut *tx)
             .await?;
-        let destination_revision = sqlx::query_scalar::<_, i64>(
-            "SELECT current_revision FROM destinations WHERE id = $1 FOR UPDATE",
+        let (route, _) = Self::remove_desired_route_in_transaction(
+            &mut tx,
+            destination_id,
+            expected_revision,
+            None,
         )
-        .bind(destination_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(RouteWriteError::DestinationNotFound)?;
-        ensure_destination_not_executing(&mut tx, destination_id).await?;
-        let current = sqlx::query_as::<_, (Uuid, Uuid, i64, String)>(
-            "SELECT id, source_id, route_revision, desired_state FROM route_instances \
-             WHERE destination_id = $1 ORDER BY route_revision DESC LIMIT 1 FOR UPDATE",
-        )
-        .bind(destination_id)
-        .fetch_optional(&mut *tx)
         .await?;
-        let current_revision = current.as_ref().map_or(0, |row| row.2);
-        if current_revision != expected_revision {
-            return Err(RouteWriteError::StaleRouteRevision {
-                expected: expected_revision,
-                current: current_revision,
-            });
-        }
-        let source_id = match current.as_ref() {
-            Some((_, source, _, _)) => *source,
-            None => sqlx::query_scalar::<_, Uuid>(
-                "SELECT source_id FROM pipeline_assignments WHERE destination_id = $1 \
-                 AND resource_type = 'pipeline' AND desired_state IN ('planned', 'running', 'stopped') \
-                 AND observed_state NOT IN ('stopped', 'cancelled') ORDER BY updated_at DESC LIMIT 1",
-            ).bind(destination_id).fetch_optional(&mut *tx).await?.ok_or(RouteWriteError::RouteNotFound)?,
-        };
+        let source_id = route.source_id;
         let source_revision =
             sqlx::query_scalar::<_, i64>("SELECT current_revision FROM sources WHERE id = $1")
                 .bind(source_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(ROUTE_GLOBAL_REVISION_LOCK_ID)
-            .execute(&mut *tx)
-            .await?;
-        let global_revision = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(global_revision), 0) + 1 FROM route_instances",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if let Some((id, _, _, desired)) = current {
-            if desired == "desired" {
-                sqlx::query("UPDATE route_instances SET desired_state = 'removed' WHERE id = $1")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-        let revision = current_revision + 1;
-        sqlx::query("INSERT INTO route_instances (id, source_id, destination_id, route_revision, global_revision, desired_state) VALUES ($1, $2, $3, $4, $5, 'removed')")
-            .bind(Uuid::new_v4()).bind(source_id).bind(destination_id).bind(revision).bind(global_revision).execute(&mut *tx).await?;
-        let observation = latest_observation(&mut tx, destination_id).await?;
-        let route = RouteRecord {
-            source_id,
-            destination_id,
-            revision,
-            desired_state: "removed".to_owned(),
-            observed_state: observation
-                .as_ref()
-                .map_or_else(|| "unknown".to_owned(), |(_, state)| state.clone()),
-            observed_source_id: observation.map(|(source, _)| source),
-        };
+        let destination_revision =
+            sqlx::query_scalar::<_, i64>("SELECT current_revision FROM destinations WHERE id = $1")
+                .bind(destination_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let revision = route.revision;
         let operation_id = Uuid::new_v4();
         let pipeline_id = Uuid::new_v5(&operation_id, destination_id.as_bytes());
         let planning_key = Uuid::new_v5(
@@ -495,6 +479,7 @@ impl PgRoutes {
             assignment_generation: None,
             error_code: None,
             error_message: None,
+            action: RouteAction::Stop,
         };
         let operation = RouteBatchOperation {
             operation_id,
@@ -508,6 +493,123 @@ impl PgRoutes {
             .bind(operation_id).bind(key).bind(request).bind(response).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO route_batch_items (operation_id, source_id, destination_id, source_revision, destination_revision, route_revision, pipeline_id, planning_key, action) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'stop')")
             .bind(operation_id).bind(source_id).bind(destination_id).bind(source_revision).bind(destination_revision).bind(revision).bind(pipeline_id).bind(planning_key).execute(&mut *tx).await?;
+        Self::capture_stop_targets(&mut tx, operation_id, destination_id).await?;
+        tx.commit().await?;
+        Ok(operation)
+    }
+
+    async fn remove_desired_route_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        destination_id: Uuid,
+        expected_revision: i64,
+        fallback_source: Option<Uuid>,
+    ) -> Result<(RouteRecord, bool), RouteWriteError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT current_revision FROM destinations WHERE id = $1 FOR UPDATE",
+        )
+        .bind(destination_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(RouteWriteError::DestinationNotFound)?;
+        ensure_destination_not_executing(tx, destination_id).await?;
+        let current = sqlx::query_as::<_, (Uuid, Uuid, i64, String)>(
+            "SELECT id, source_id, route_revision, desired_state FROM route_instances \
+             WHERE destination_id = $1 ORDER BY route_revision DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(destination_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let current_revision = current.as_ref().map_or(0, |row| row.2);
+        if current_revision != expected_revision {
+            return Err(RouteWriteError::StaleRouteRevision {
+                expected: expected_revision,
+                current: current_revision,
+            });
+        }
+        let assigned_source = sqlx::query_scalar::<_, Uuid>(
+            "SELECT source_id FROM pipeline_assignments WHERE destination_id = $1 \
+             AND resource_type = 'pipeline' AND desired_state IN ('planned', 'running', 'stopped') \
+             AND observed_state NOT IN ('stopped', 'cancelled') ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(destination_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let observation = latest_observation(tx, destination_id).await?;
+        let already_stopped = fallback_source.is_some()
+            && assigned_source.is_none()
+            && (current.is_none()
+                || (current.as_ref().is_some_and(|row| row.3 == "removed")
+                    && observation
+                        .as_ref()
+                        .is_some_and(|(_, state)| state == "stopped")));
+        let source_id = current
+            .as_ref()
+            .map(|row| row.1)
+            .or(assigned_source)
+            .or(fallback_source)
+            .ok_or(RouteWriteError::RouteNotFound)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(ROUTE_GLOBAL_REVISION_LOCK_ID)
+            .execute(&mut **tx)
+            .await?;
+        let global_revision = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(global_revision), 0) + 1 FROM route_instances",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if let Some((id, _, _, desired)) = current {
+            if desired == "desired" {
+                sqlx::query("UPDATE route_instances SET desired_state = 'removed' WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        }
+        let id = Uuid::new_v4();
+        let revision = current_revision + 1;
+        sqlx::query(
+            "INSERT INTO route_instances (id, source_id, destination_id, route_revision, global_revision, desired_state) \
+             VALUES ($1, $2, $3, $4, $5, 'removed')",
+        ).bind(id).bind(source_id).bind(destination_id).bind(revision).bind(global_revision)
+            .execute(&mut **tx).await?;
+        if already_stopped {
+            sqlx::query(
+                "INSERT INTO route_events (id, route_instance_id, observed_state, details) \
+                 VALUES ($1, $2, 'stopped', '{\"reason\":\"already_unrouted\"}')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok((
+            RouteRecord {
+                source_id,
+                destination_id,
+                revision,
+                desired_state: "removed".to_owned(),
+                observed_state: if already_stopped {
+                    "stopped".to_owned()
+                } else {
+                    observation
+                        .as_ref()
+                        .map_or_else(|| "unknown".to_owned(), |(_, state)| state.clone())
+                },
+                observed_source_id: if already_stopped {
+                    Some(source_id)
+                } else {
+                    observation.map(|(source, _)| source)
+                },
+            },
+            already_stopped,
+        ))
+    }
+
+    async fn capture_stop_targets(
+        tx: &mut Transaction<'_, Postgres>,
+        operation_id: Uuid,
+        destination_id: Uuid,
+    ) -> Result<(), RouteWriteError> {
         sqlx::query(
             "INSERT INTO route_stop_targets (operation_id, assignment_id, generation) \
              SELECT $1, id, generation FROM pipeline_assignments \
@@ -515,9 +617,8 @@ impl PgRoutes {
                AND ((desired_state = 'planned' AND observed_state = 'not_started') \
                  OR (desired_state = 'running' AND observed_state IN ('starting', 'running', 'failed', 'degraded', 'unknown')) \
                  OR (desired_state = 'stopped' AND observed_state = 'stopping'))",
-        ).bind(operation_id).bind(destination_id).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(operation)
+        ).bind(operation_id).bind(destination_id).execute(&mut **tx).await?;
+        Ok(())
     }
 
     pub async fn execute_preset(
@@ -601,7 +702,7 @@ impl PgRoutes {
                 return Err(RouteWriteError::PresetConflict);
             }
             let saved = sqlx::query_as::<_, PresetRoute>(
-                "SELECT source_id, destination_id FROM preset_routes WHERE preset_id = $1 ORDER BY destination_id",
+                "SELECT source_id, destination_id, action FROM preset_routes WHERE preset_id = $1 ORDER BY destination_id",
             )
             .bind(preset_id)
             .fetch_all(&mut *transaction)
@@ -610,6 +711,7 @@ impl PgRoutes {
                 || saved.iter().zip(&changes).any(|(saved, change)| {
                     saved.source_id != change.source_id
                         || saved.destination_id != change.destination_id
+                        || saved.action != change.action
                 })
             {
                 return Err(RouteWriteError::PresetConflict);
@@ -655,19 +757,36 @@ impl PgRoutes {
         let mut results = Vec::with_capacity(changes.len());
         let mut items = Vec::with_capacity(changes.len());
         for change in changes {
-            let replacement_assignment_id =
-                active_assignment_for_destination(&mut transaction, change.destination_id).await?;
-            let route = Self::set_desired_route_in_transaction(
-                &mut transaction,
-                change.source_id,
-                change.destination_id,
-                change.expected_route_revision,
-                change.confirm_replace,
-            )
-            .await?;
+            let stopping = change.action == RouteAction::Stop;
+            let replacement_assignment_id = if stopping {
+                None
+            } else {
+                active_assignment_for_destination(&mut transaction, change.destination_id).await?
+            };
+            let (route, already_stopped) = if stopping {
+                Self::remove_desired_route_in_transaction(
+                    &mut transaction,
+                    change.destination_id,
+                    change.expected_route_revision,
+                    Some(change.source_id),
+                )
+                .await?
+            } else {
+                (
+                    Self::set_desired_route_in_transaction(
+                        &mut transaction,
+                        change.source_id,
+                        change.destination_id,
+                        change.expected_route_revision,
+                        change.confirm_replace,
+                    )
+                    .await?,
+                    false,
+                )
+            };
             let source_revision =
                 sqlx::query_scalar::<_, i64>("SELECT current_revision FROM sources WHERE id = $1")
-                    .bind(change.source_id)
+                    .bind(route.source_id)
                     .fetch_one(&mut *transaction)
                     .await?;
             let destination_revision = sqlx::query_scalar::<_, i64>(
@@ -676,7 +795,8 @@ impl PgRoutes {
             .bind(change.destination_id)
             .fetch_one(&mut *transaction)
             .await?;
-            let running = if route.revision == change.expected_route_revision
+            let running = if !stopping
+                && route.revision == change.expected_route_revision
                 && route.observed_state == "running"
                 && route.observed_source_id == Some(change.source_id)
             {
@@ -711,22 +831,11 @@ impl PgRoutes {
                 &operation_id,
                 format!("route-plan:{}", change.destination_id).as_bytes(),
             );
-            items.push((
-                change.source_id,
-                change.destination_id,
-                source_revision,
-                destination_revision,
-                route.revision,
-                replacement_assignment_id,
-                pipeline_id,
-                planning_key,
-                running,
-            ));
-            results.push(RouteBatchItemResult {
-                source_id: change.source_id,
+            let result = RouteBatchItemResult {
+                source_id: route.source_id,
                 destination_id: change.destination_id,
                 pipeline_id: running.map_or(pipeline_id, |(_, _, pipeline)| pipeline),
-                state: if running.is_some() {
+                state: if running.is_some() || already_stopped {
                     "succeeded"
                 } else {
                     "pending"
@@ -736,7 +845,18 @@ impl PgRoutes {
                 assignment_generation: running.map(|(_, generation, _)| generation),
                 error_code: None,
                 error_message: None,
-            });
+                action: change.action,
+            };
+            items.push((
+                source_revision,
+                destination_revision,
+                route.revision,
+                replacement_assignment_id,
+                pipeline_id,
+                planning_key,
+                result.clone(),
+            ));
+            results.push(result);
             routes.push(route);
         }
         let state = if results.iter().all(|result| result.state == "succeeded") {
@@ -767,42 +887,41 @@ impl PgRoutes {
         .execute(&mut *transaction)
         .await?;
         for (
-            source_id,
-            destination_id,
             source_revision,
             destination_revision,
             route_revision,
             replacement_assignment_id,
             pipeline_id,
             planning_key,
-            running,
+            result,
         ) in items
         {
             sqlx::query(
                 "INSERT INTO route_batch_items \
                  (operation_id, source_id, destination_id, source_revision, \
                   destination_revision, route_revision, replacement_assignment_id, \
-                  pipeline_id, planning_key, state, assignment_id, assignment_generation) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  pipeline_id, planning_key, state, assignment_id, assignment_generation, action) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             )
             .bind(operation_id)
-            .bind(source_id)
-            .bind(destination_id)
+            .bind(result.source_id)
+            .bind(result.destination_id)
             .bind(source_revision)
             .bind(destination_revision)
             .bind(route_revision)
             .bind(replacement_assignment_id)
             .bind(pipeline_id)
             .bind(planning_key)
-            .bind(if running.is_some() {
-                "succeeded"
-            } else {
-                "pending"
-            })
-            .bind(running.map(|(id, _, _)| id))
-            .bind(running.map(|(_, generation, _)| generation))
+            .bind(&result.state)
+            .bind(result.assignment_id)
+            .bind(result.assignment_generation)
+            .bind(result.action.as_str())
             .execute(&mut *transaction)
             .await?;
+            if result.action == RouteAction::Stop {
+                Self::capture_stop_targets(&mut transaction, operation_id, result.destination_id)
+                    .await?;
+            }
         }
         transaction.commit().await?;
         self.get_route_batch_operation(operation.operation_id)
@@ -831,7 +950,7 @@ impl PgRoutes {
              CASE WHEN item.state = 'succeeded' \
                   THEN COALESCE(assignment.resource_id, item.pipeline_id) \
                   ELSE item.pipeline_id END AS pipeline_id, \
-             item.state, item.assignment_id, item.assignment_generation, item.error_code, item.error_message \
+             item.state, item.assignment_id, item.assignment_generation, item.error_code, item.error_message, item.action \
              FROM route_batch_items AS item \
              LEFT JOIN pipeline_assignments AS assignment ON assignment.id = item.assignment_id \
              WHERE item.operation_id = $1 ORDER BY item.destination_id",

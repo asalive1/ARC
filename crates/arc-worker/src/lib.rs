@@ -7,9 +7,17 @@ use uuid::Uuid;
 use std::future::Future;
 
 mod control_client;
+mod preview;
+#[cfg(target_os = "linux")]
+mod process_fence;
 pub use control_client::{
-    execute_pipeline_command, WorkerCommand, WorkerControlClient, WorkerControlClientConfig,
+    execute_pipeline_command, PreviewSessionFinalizer, WorkerCommand, WorkerControlClient,
+    WorkerControlClientConfig, WorkerPreviewControl, WorkerPreviewEventKind, WorkerPreviewFinished,
+    MAX_PREVIEW_ERROR_CODE_BYTES, MAX_PREVIEW_ERROR_MESSAGE_BYTES,
 };
+pub use preview::{relay_preview, send_preview_over_websocket, PreviewEnd, PreviewRelayReport};
+#[cfg(target_os = "linux")]
+pub use process_fence::{ProcessFenceIdentity, WorkerProcessFence};
 
 pub use arc_application::{
     BackupProvider, CapacityManager, DestinationAdapter, EventPublisher, MediaPipeline,

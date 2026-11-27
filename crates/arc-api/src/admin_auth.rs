@@ -79,6 +79,11 @@ struct SessionResponse {
 }
 
 impl AdminAuth {
+    #[cfg(test)]
+    pub(crate) fn for_test(pool: PgPool) -> Self {
+        Self { pool, secure_cookie: false }
+    }
+
     pub async fn from_env(pool: PgPool) -> Result<Self, Box<dyn std::error::Error>> {
         let secure_cookie = match std::env::var("ARC_ADMIN_COOKIE_SECURE") {
             Ok(value) if value.eq_ignore_ascii_case("true") => true,
@@ -502,7 +507,7 @@ async fn require_admin(
     next.run(request).await
 }
 
-async fn load_session(
+pub(crate) async fn load_session(
     auth: &AdminAuth,
     headers: &HeaderMap,
 ) -> Result<Option<AdminSession>, AuthApiError> {

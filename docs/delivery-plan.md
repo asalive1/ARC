@@ -89,6 +89,15 @@ live-route recovery remain acceptance work. ALSA output is not a native ARC
 destination; the external monitoring bridge is only a test aid. Other Phase 2
 gates still include multi-instance execution/reconnect and retry-exhaustion/
 manual-recovery evidence.
+On 2026-11-27 the operator reported hearing audio on an RTP-to-SRT route.
+The endpoint details and audio measurements have not been independently
+recorded, so this report does not by itself close the live-media acceptance gate.
+
+The sidebar and section-heading update was deployed as a UI-only image on
+2026-11-27. The API, worker, database and ingress container IDs and assignment
+snapshot were unchanged; audio continuity was not measured. The previous UI
+image and deployment artifacts remain available for rollback. Operators must
+refresh an existing browser tab to load the updated UI.
 
 ### Input/output configuration and unused-resource deletion
 
@@ -134,6 +143,11 @@ prevents restoration and capacity release. Acknowledged cleanup releases the
 target reservation, preserves the old route after failed Prepare, and permits
 restoring its pinned configuration after failed Start.
 
+The same isolated integration test also exercises failed-Take cleanup retry
+exhaustion. It confirms the `start_cleanup_failed` result, manual-recovery
+message, retained reservation and cancellation guard. Manual recovery itself
+remains an open acceptance item.
+
 This exposed and fixed an admission gap: Unroute rejected pending execution,
 but a new Take could supersede a cleanup retry. Desired-route writes now reuse
 Unroute's transactional destination guard. New batch Take, preset execution,
@@ -178,11 +192,91 @@ live-media acceptance.
 
 ## Phase gates
 
+### Audio preview (experimental test deployment)
+
+The test host has the UI, API and fenced worker deployed. A shared SRT
+destination that was waiting for a peer previously blocked preview cleanup;
+the worker now drops media while disconnected and resumes on connection.
+Live ALSA and SRT previews produced nonzero PCM, closed cleanly and released
+their reservations; a no-signal RTP preview also closed and released. Browser
+meters showed nonzero levels for both active sources. Passive capture found
+nonzero audio on both RTP outputs after rollout. The SRT receiver returned
+UDP port-unreachable, so its end-to-end route remains unverified. Full
+multi-instance and distribution acceptance remain open.
+
+The worker contains an experimental bounded PCM tap for an already-running
+shared ALSA L16, RTP L16, RTP L24, RTP MPEG-TS or SRT MPEG-TS source. MPEG-TS
+preview supports Opus, MPEG-1 audio and AAC (ADTS), not arbitrary codecs.
+It produces interleaved stereo
+48 kHz S16LE packets and drops packets rather than blocking a route when its
+consumer falls behind. It closes when the last route using that source stops.
+The media adapter also has an experimental reserved-source preview mode that
+can keep an idle source open and share it with routes. An opt-in API path
+uses durable placement and fenced ownership recovery. Isolated RTP and SRT
+tests cover preview-to-route sharing, preview cleanup and route continuity;
+the reserved tap remains open after the last route stops.
+The in-development database reservation layer shares placement locks,
+source affinity and capacity credits with route planning. It retains preview
+ownership until explicitly released or recovered after verified process exit.
+An experimental process-fence record and transactional recovery path now
+retain stale ownership until a caller verifies the previous process has exited.
+The database rejects legacy or mismatched control-session incarnations once a
+worker is enrolled. Linux worker startup can now opt into the host fence,
+process-exit verification, and session finalization; it remains disabled by
+default. An experimental opt-in API relay uses fenced placement and releases
+reservations after confirmed cleanup. Initial enrollment requires a verified stop of any unfenced worker
+and is not automated.
+Both taps expose cancellation-safe asynchronous packet reception and
+periodically check for preview failure. The active-route-only tap ends without
+draining stale audio when the last route closes.
+An expanded concurrent-preview regression exposed a route-continuity failure
+during branch churn: branch teardown returned `flushing` through the tee,
+pausing the RTP jitter-buffer task while the pipeline still reported Playing.
+The local fix holds the tee sink's stream lock while adding or removing active
+branches. In isolated Linux tests, all ten GStreamer tests passed, followed by
+50 preview-churn runs with GStreamer warnings fatal; the regression checks
+actual media reception on both routes and sibling continuity after Stop.
+The worker's 16 tests and GStreamer-enabled release build also passed. This
+fix is present on the test host; the subsequent SRT cleanup stall was addressed
+by preventing a disconnected sink from blocking shared-source fan-out.
+The worker's media-pipeline interface exposes this active-source PCM tap;
+other implementations explicitly report that preview is unsupported.
+A worker relay now validates PCM packet shape and size, uses a bounded delivery
+queue, counts dropped packets, and closes the tap on stop or consumer disconnect.
+It can send packets over a dedicated, already-authenticated WebSocket with
+bounded inbound frames and a write timeout. An isolated loopback RTP test
+verifies nonzero audio over a real WebSocket and continued route audio after
+the consumer disconnects. A worker connector constructs a separate data request
+on its configured control origin, using the worker credential and existing TLS
+trust. The API now has a bounded authenticated relay and worker control-session
+integration; isolated database tests cover audio delivery, origin rejection,
+administrator session revocation, worker session replacement and cleanup.
+The UI also has a browser PCM player with bounded scheduling, a stereo dBFS
+meter component and a binary WebSocket stream lifecycle adapter. The adapter
+uses the authenticated API endpoint. Input controls and the crosspoint menu now
+open a non-modal player with meters; the crosspoint workspace also shows meters.
+Its isolated tests cover binary packets over a local WebSocket and cleanup on
+malformed messages or disconnect; deployed browser meters have shown live
+ALSA and SRT audio.
+The browser can also open a player and WebSocket together, with cancellation
+and cleanup while audio initialization or connection setup is pending.
+The UI and ACME proxy configurations forward WebSocket upgrades. The test-host
+UI proxy overwrites the forwarded protocol with its own scheme so a client cannot
+assert a secure connection to the worker-control endpoint. Isolated NGINX
+tests verified ordinary HTTP and binary WebSocket delivery through both proxies,
+including TLS for the ACME configuration and a spoofed protocol header.
+Isolated RTP and SRT MPEG-TS tests cover Opus and AAC decoding with continued
+route delivery; RTP tests also cover MPEG-1 audio. These AAC tests use the
+packaged LGPL-only FFmpeg libraries. SRT receiver and release acceptance remain open.
+Reliable cleanup, idle-source live validation, additional codecs,
+packaged-image licensing review, real-browser playback and deployed acceptance
+remain open.
+
 | Phase | Deliverable scope | Exit evidence |
 |---|---|---|
 | 0 - Architecture and contracts | Approve architecture; decide blockers; define workspace/crate boundaries, PostgreSQL schema/migrations, OpenAPI skeleton, media/worker protocols, capability model, synthetic fixtures, CI and deployment scaffolding | Approved documents; versioned contracts; clean DB migration; test harness; runnable scaffold Compose topology; source dependency license inventory. Seven Rust tests, one SQLx/PostgreSQL 16 migration test, three UI tests/build, OpenAPI validation, schema/constraint checks, and npm audit pass. Platform/image license inventory, worker/telemetry deployment, approved Git remote confirmation, and exit review remain incomplete; Q8 and Q20 are resolved. |
 | 1 - Stateful audio slice | PostgreSQL; API/UI; source/destination lifecycle; SRT MPEG-TS, RTP L16/L24, and ALSA 48 kHz stereo L16 inputs; RTP L16/L24 and SRT outputs; one route; local worker registration, scheduler/assignment, health/events and restart recovery | The API, UI, PostgreSQL, worker, GStreamer, lifecycle, idempotency, reconciliation, session fencing, readiness, administrator bootstrap/recovery, Docker Compose file-backed secrets, worker-token reload/revalidation, optional ACME/WSS ingress, optional additive worker CA trust, OS-derived CPU/memory telemetry, and five-minute strict-FIFO capacity waits are implemented. API, UI and worker images build locally; Rust and UI unit tests pass; administrator bootstrap, CSRF, recovery, login and logout were exercised against an isolated PostgreSQL stack. The PostgreSQL test-fixture failures were fixed, all nine ignored API tests passed locally, and GitHub Actions run 45763988902 passed on commit 8d5c524. `deploy/validate-postgres-recovery.ps1` provides clean-migration, restart, dump and restore evidence, and `deploy/generate-rust-dependency-inventory.ps1` provides a locked Rust package inventory. Phase 1 exit remains blocked by external acceptance/release gates: live ALSA hardware, coordinated worker-secret rotation/revocation deployment testing, real-domain certificate issuance/renewal, the local synthetic resource/network/workload baseline, native Linux and Windows worker validation, GStreamer/package notice and license closure, exact release-image inventory, and approved Git remote/release workflow. Live ALSA and deployed media acceptance are intentionally sequenced after Phase 2 implementation. Multi-route/crosspoint UI is outside this phase. |
-| 2 - Routing expansion | Virtualized 64x64 matrix; fan-out; explicit replace; immediate/Take workflows; multi-route operations; route presets/salvos | The matrix separates latest desired and observed route state. Crosspoint Take uses durable `POST /routes/batch` operations; replacements prepare before Stop, perform a hard cut, and attempt restoration of the previous pinned route after failed Start. Each item has leases, stable pipeline/planning IDs, independent outcomes and restart recovery; desired changes are atomic, media switching is not. Shared-source groups have independent bounded destination branches, source-revision affinity, and capacity accounting of one source unit plus one unit per branch. GStreamer tests cover two outputs, stopping one branch without stopping its sibling, injected bus errors and real destination flow errors without source restart; real source errors still fail all branches. Native/deployment evidence remains open. `POST /routes/unroute` removes desired state and durably stops the destination assignment under destination serialization; it retains capacity until acknowledgement and reports `stop_unconfirmed` rather than claiming success when no assignment can confirm Stop. PostgreSQL-backed `/presets` CRUD supports 100 saved salvos of 1-64 distinct assignments with unique 1-100-character names. Strict execution validates the saved preset revision, exact route set and destination revisions captured at selection; accepted execution retries remain idempotent after preset update/deletion. Already-running identical routes are no-ops. The Salvo screen keeps dropdown, Take and Save above its matrix, and left-click staging never switches media. Backend/PostgreSQL and UI suites pass, with fixture-backed browser workflow/full-matrix checks. Saved route removals and Force mode remain unimplemented; Force awaits permission support. Operator locks, real-time multi-user synchronization, granular permissions and user-facing undo/rollback remain deferred. Phase 2 is not declared accepted until its remaining cleanup-failure, multi-instance execution/recovery and native/deployment gates are met |
+| 2 - Routing expansion | Virtualized 64x64 matrix; fan-out; explicit replace; immediate/Take workflows; multi-route operations; route presets/salvos | The matrix separates latest desired and observed route state. Crosspoint Take uses durable `POST /routes/batch` operations; replacements prepare before Stop, perform a hard cut, and attempt restoration of the previous pinned route after failed Start. Each item has leases, stable pipeline/planning IDs, independent outcomes and restart recovery; desired changes are atomic, media switching is not. Shared-source groups have independent bounded destination branches, source-revision affinity, and capacity accounting of one source unit plus one unit per branch. GStreamer tests cover two outputs, stopping one branch without stopping its sibling, injected bus errors and real destination flow errors without source restart; real source errors still fail all branches. Native/deployment evidence remains open. `POST /routes/unroute` removes desired state and durably stops the destination assignment under destination serialization; it retains capacity until acknowledgement and reports `stop_unconfirmed` rather than claiming success when no assignment can confirm Stop. PostgreSQL-backed `/presets` CRUD supports 100 saved salvos of 1-64 distinct output actions with unique 1-100-character names. Strict execution validates the saved preset revision, exact source/destination/action set and destination revisions captured at selection; accepted execution retries remain idempotent after preset update/deletion. Already-running identical routes and known-idle saved removals are no-ops. Saved removals disconnect the output regardless of the saved visual input anchor and reuse generation-pinned, acknowledged Stop execution. The Salvo screen keeps dropdown, Take and Save above its matrix; clicks cycle blue Take, red Unroute, clear without switching media. Returning resets only the draft and dropdown, retaining in-flight operation/retry tracking. Eighteen API unit tests, thirteen isolated PostgreSQL API tests and fifty-three focused UI tests/build pass for this slice, including independent Stop acknowledgements for two outputs and mixed-action rollback/replay. Force awaits permission support. Operator locks, real-time multi-user synchronization, granular permissions and user-facing undo/rollback remain deferred. Phase 2 is not declared accepted until its remaining cleanup-failure, multi-instance execution/recovery and native/deployment gates are met |
 | 3 - Zephyr Connect | Same-port audio/GPIO demux; parser, bounded ADTS reassembly, AAC decode, baseline/state, API/UI profile, simulator and fixtures | Five-channel synthetic suite/soak; live sender; real output; timing evidence; mock plus native plugin path as available |
 | 4 - Transport expansion | SRT MPEG-TS and UDP MPEG-TS inputs/outputs; selected HLS/Icecast; ALSA/WASAPI adapters | Capability-aware tests and Linux/Windows deployment documentation |
 | 5 - Signals and integrations | Normalized signal engine; SCTE-35/additional approved formats; mappings; GPO; Device Server mock/native plugin; automation command listener | Signal timing, plugin state/reconnect, permissions/audit, device acceptance |

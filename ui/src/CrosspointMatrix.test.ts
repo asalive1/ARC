@@ -1,11 +1,147 @@
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
+  CrosspointMatrix,
   getDesiredOutputCount,
   getVisibleMatrixRange,
   isObservedRunningRoute,
 } from "./CrosspointMatrix";
-import type { RouteRecord } from "./api";
+import type { DestinationRecord, RouteRecord, SourceRecord } from "./api";
+import { snapshotPresetRoutes } from "./routeStaging";
+import { DestinationOutcome, RoutingWorkspace } from "./RoutingWorkspace";
+
+describe("destination outcome", () => {
+  it("explains safe recovery for an occupied output without hiding the error", () => {
+    const html = renderToStaticMarkup(createElement(DestinationOutcome, {
+      name: "Output A",
+      item: {
+        sourceId: "a", destinationId: "x", pipelineId: "p", state: "failed",
+        assignmentId: null, assignmentGeneration: null,
+        errorCode: "destination_in_use", errorMessage: "destination already has an assignment",
+      },
+    }));
+    expect(html).toContain("destination already has an assignment");
+    expect(html).toContain("If it is safe to disconnect");
+    expect(html).toContain("wait for confirmation before retrying Take");
+  });
+});
+
+describe("Salvo matrix display", () => {
+  const sources: SourceRecord[] = ["a", "b"].map((id) => ({
+    id, friendlyName: `Input ${id}`, sourceType: "alsa_l16",
+    desiredState: "enabled", currentRevision: 1, revisionId: `${id}-1`,
+    lifecycle: "validated", configuration: { kind: "alsa_l16", device: "hw:1,0" },
+  }));
+  const destinations: DestinationRecord[] = [{
+    id: "x", friendlyName: "Output x", destinationType: "rtp_l16",
+    desiredState: "enabled", currentRevision: 1, revisionId: "x-1",
+    lifecycle: "validated",
+    configuration: { kind: "rtp_l16", address: "127.0.0.1", port: 5004, payloadType: 96 },
+  }];
+  const routes: RouteRecord[] = [{
+    sourceId: "b", destinationId: "x", desiredState: "desired",
+    observedState: "running", observedSourceId: "a", revision: 3,
+  }];
+  const props = {
+    sources, destinations, routes, routesLoading: false, routesError: "",
+    selectedSourceId: "", selectedDestinationId: "", onSelect: () => {},
+  };
+
+  it("places enlarged output and input labels at opposite corners of the matrix header", () => {
+    const html = renderToStaticMarkup(createElement(CrosspointMatrix, props));
+    expect(html).toContain("OUTPUT →");
+    expect(html).toContain("INPUT ↓");
+    expect(html.indexOf("OUTPUT →")).toBeLessThan(html.indexOf("INPUT ↓"));
+    expect(html).toContain("font-size:1.5rem");
+    expect(html).toContain("top:8px;right:8px");
+    expect(html).toContain("bottom:8px;left:8px");
+  });
+
+  it("starts blank despite existing desired and running routes", () => {
+    const client = new QueryClient();
+    client.setQueryData(["presets"], [{
+      id: "saved-1", name: "Saved selection", revision: 1,
+      routes: [{ sourceId: "b", destinationId: "x" }],
+    }]);
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client },
+      createElement(RoutingWorkspace, {
+        ...props, mode: "salvos", apiBaseUrl: "", sourceError: "", destinationError: "",
+      })));
+
+    expect(html).toContain("Select Salvo");
+    expect(html).not.toContain("Saved salvos");
+    expect(html).not.toContain('aria-pressed="true"');
+    expect(html).not.toContain("MuiButton-containedSuccess");
+    expect(html).not.toContain("MuiButton-containedWarning");
+    expect(html).not.toContain("saved desired routes");
+    expect(html).toContain("Not selected for this salvo.");
+    expect(html).toContain("Live routes are not shown.");
+  });
+
+  it("highlights only the saved selection without overlaying live routes", () => {
+    const selections = snapshotPresetRoutes([{ sourceId: "b", destinationId: "x" }], routes);
+    const html = renderToStaticMarkup(createElement(CrosspointMatrix, {
+      ...props, selectionOnly: true, selections,
+    }));
+
+    expect(html).toContain('aria-label="Select Input b to Output x. Selected to activate this route." aria-pressed="true"');
+    expect(html.match(/aria-pressed="true"/g)).toHaveLength(1);
+    expect(html).not.toContain("MuiButton-containedSuccess");
+    expect(html).not.toContain("Desired route revision");
+  });
+
+  it("renders a saved Unroute action red and identifies destination-wide disconnection", () => {
+    const selections = snapshotPresetRoutes([{
+      sourceId: "b", destinationId: "x", action: "stop",
+    }], routes);
+    const html = renderToStaticMarkup(createElement(CrosspointMatrix, {
+      ...props, selectionOnly: true, selections,
+    }));
+    expect(html).toContain("MuiButton-containedError");
+    expect(html).toContain("Selected to unroute this output, regardless of its input.");
+    expect(html).not.toContain("MuiButton-containedPrimary");
+    expect(html.match(/aria-pressed="true"/g)).toHaveLength(1);
+  });
+
+  it("preserves live indicators in the main routing grid", () => {
+    const html = renderToStaticMarkup(createElement(CrosspointMatrix, props));
+
+    expect(html).toContain("Worker-observed route is running.");
+    expect(html).toContain("Desired route revision 3");
+    expect(html).toContain("MuiButton-containedSuccess");
+    expect(html).toContain("MuiButton-containedWarning");
+    expect(html).toContain("1 saved desired routes.");
+  });
+
+  it("does not advertise Shift+F10 as a route action", () => {
+    const client = new QueryClient();
+    const html = renderToStaticMarkup(createElement(QueryClientProvider, { client },
+      createElement(RoutingWorkspace, {
+        ...props, mode: "routes", apiBaseUrl: "", sourceError: "", destinationError: "",
+      })));
+
+    expect(html).toContain("Right-click it for Take, Unroute, or Preview input.");
+    expect(html).not.toContain("Shift+F10");
+  });
+
+  it("shows preview levels in the routing grid but not the salvo editor", () => {
+    const client = new QueryClient();
+    const preview = { name: "Input a", levels: { left: -12, right: -24 }, busy: true };
+    const render = (mode: "routes" | "salvos") => renderToStaticMarkup(
+      createElement(QueryClientProvider, { client }, createElement(RoutingWorkspace, {
+        ...props, mode, apiBaseUrl: "", sourceError: "", destinationError: "", preview,
+      })),
+    );
+    const routing = render("routes");
+    expect(routing).toContain("Preview: Input a");
+    expect(routing).toContain("Left -12.0 dBFS");
+    expect(routing).toContain("Right -24.0 dBFS");
+    expect(render("salvos")).not.toContain("Preview: Input a");
+  });
+});
 
 describe("getVisibleMatrixRange", () => {
   it("limits rendering to visible items plus overscan", () => {

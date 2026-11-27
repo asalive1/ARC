@@ -17,6 +17,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 mod resource_telemetry;
+#[cfg(target_os = "linux")]
+mod preview_fencing;
 
 use resource_telemetry::{ResourceTelemetry, CPU_SAMPLE_INTERVAL};
 
@@ -56,6 +58,30 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     let egress_bits_per_second = optional_u64_env("ARC_WORKER_EGRESS_BITS_PER_SECOND")?;
     let cpu_utilization_ratio = optional_ratio_env("ARC_WORKER_CPU_UTILIZATION_RATIO")?;
     let memory_utilization_ratio = optional_ratio_env("ARC_WORKER_MEMORY_UTILIZATION_RATIO")?;
+    let enable_preview_fencing = optional_bool_env("ARC_WORKER_ENABLE_PREVIEW_FENCING")?;
+    #[cfg(not(target_os = "linux"))]
+    if enable_preview_fencing {
+        return Err(io::Error::other("preview process fencing requires Linux").into());
+    }
+    #[cfg(target_os = "linux")]
+    let preview_fence = if enable_preview_fencing {
+        Some(
+            arc_worker::WorkerProcessFence::acquire(
+                std::path::Path::new(&required_env("ARC_WORKER_PREVIEW_FENCE_LOCK")?),
+                std::path::Path::new(&required_env("ARC_WORKER_PREVIEW_HOST_PROC")?),
+                std::path::Path::new(&required_env("ARC_WORKER_PREVIEW_HOST_ID")?),
+            )
+            .map_err(port_error)?,
+        )
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let allow_initial_enrollment = if enable_preview_fencing {
+        optional_bool_env("ARC_WORKER_PREVIEW_FENCE_INITIAL_ENROLLMENT")?
+    } else {
+        false
+    };
 
     let mut resource_telemetry = ResourceTelemetry::new()?;
     tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
@@ -95,6 +121,20 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     let pool = connect_postgres(&database_url).await?;
     let registry = PgWorkerRegistry::new(pool.clone());
     register_or_resume(&registry, &mut worker).await?;
+    #[cfg(target_os = "linux")]
+    let preview_runtime = match preview_fence {
+        Some(fence) => Some(
+            preview_fencing::PreviewFenceRuntime::acquire(
+                pool.clone(),
+                worker_id,
+                fence,
+                allow_initial_enrollment,
+            )
+            .await
+            .map_err(port_error)?,
+        ),
+        None => None,
+    };
     worker.state = WorkerState::Warming;
     worker.last_heartbeat = Utc::now();
     registry
@@ -117,8 +157,13 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
         media_pipeline.clone(),
     )
     .map_err(port_error)?;
+    #[cfg(target_os = "linux")]
+    let client = match &preview_runtime {
+        Some(runtime) => runtime.configure_client(client).map_err(port_error)?,
+        None => client,
+    };
     let mut connection_status = client.connection_status();
-    let control_task = tokio::spawn(run_control_sessions(client));
+    let mut control_task = tokio::spawn(run_control_sessions(client));
 
     info!(
         %worker_id,
@@ -135,6 +180,13 @@ async fn run_worker() -> Result<(), Box<dyn Error>> {
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
+            result = &mut control_task => {
+                match result {
+                    Ok(Err(error)) => return Err(port_error(error).into()),
+                    Ok(Ok(())) => return Err(io::Error::other("worker control supervisor stopped").into()),
+                    Err(error) => return Err(io::Error::other(format!("worker control supervisor failed: {error}")).into()),
+                }
+            }
             result = &mut shutdown => {
                 result?;
                 break;
@@ -315,11 +367,14 @@ async fn register_or_resume(
     Ok(())
 }
 
-async fn run_control_sessions(client: WorkerControlClient) {
+async fn run_control_sessions(
+    client: WorkerControlClient,
+) -> Result<(), arc_application::PortError> {
     let mut reconnect_delay = Duration::from_secs(1);
     loop {
         match client.run_session().await {
             Ok(()) => warn!("worker control session ended; reconnecting"),
+            Err(error) if error.code == "preview_fence_required" => return Err(error),
             Err(error) => warn!(
                 code = error.code,
                 message = %error.message,
@@ -385,6 +440,16 @@ fn optional_path_env(name: &str) -> io::Result<Option<PathBuf>> {
         Ok(value) if value.trim().is_empty() => Ok(None),
         Ok(value) => Ok(Some(PathBuf::from(value))),
         Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(invalid_config(name, error)),
+    }
+}
+
+fn optional_bool_env(name: &str) -> io::Result<bool> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<bool>()
+            .map_err(|error| invalid_config(name, error)),
+        Err(env::VarError::NotPresent) => Ok(false),
         Err(error) => Err(invalid_config(name, error)),
     }
 }

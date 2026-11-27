@@ -2,7 +2,16 @@
 
 ## Unreleased
 
+### Changed
+- Removed the misleading Shift+F10 hint from the crosspoint grid; it opens the context menu rather than taking a route.
+- Prevented an unavailable SRT destination from blocking shared-source preview:
+  the sink drops media while disconnected and resumes when the peer connects.
+- Deployed experimental fenced audio preview to the test host and fixed clean
+  WebSocket shutdown. Live ALSA and SRT previews and both RTP outputs carried
+  audio; the SRT destination remains unreachable and unverified end-to-end.
+
 ### Added
+- Added saved mixed Take/Unroute salvos: crosspoints cycle blue, red, clear; red disconnects the selected output regardless of its input, using acknowledged durable Stop execution.
 - Added a Linux host-network worker overlay for dual-network media, loopback-only database/WSS control, private-CA trust and non-root ALSA access; deployed stereo ALSA-to-RTP fan-out and sibling-preserving Unroute pass on the test host.
 - Added worker WebSocket keepalives to prevent idle TLS-proxy disconnects; all ten control-client tests and the deployed 95-second idle-session check pass.
 - Added revision-guarded deletion of disabled, unused inputs and outputs, with confirmation and protection for route history, assignments, signals and saved salvos.
@@ -55,11 +64,60 @@
 - Added PostgreSQL-backed 24-hour replay for planning requests using a required Idempotency-Key, with key/body mismatch conflicts.
 
 ### Changed
+- Enlarged and repositioned the crosspoint input and output direction labels.
+- Simplified crosspoint hover text to the input and output names.
+- Prepared the UI proxy to forward WebSocket upgrades for future preview delivery.
+- Simplified the sidebar title and removed the requested crosspoint and admin subtitles.
+- Prevented shared-source branch changes from racing in-flight GStreamer media
+  by holding the tee sink stream lock during branch activation and teardown.
+- Began an experimental, bounded worker PCM preview tap for active shared
+  sources and a browser PCM player with stereo meters.
+- Made worker preview reception asynchronous, reporting source or preview
+  failure and discarding queued audio when the last route stops.
+- Added a browser preview-stream lifecycle adapter.
+- Exposed the existing active-source PCM tap through the worker media
+  interface, with an explicit unsupported result for other implementations.
+- Added a bounded worker preview relay with disconnect cleanup and an isolated
+  RTP audio and route-continuity regression.
+- Added a bounded dedicated-WebSocket sender and cancellable browser connection
+  setup for preview.
+- Added a worker preview connection using its configured control origin,
+  credential and TLS trust.
+- Connected the in-development authenticated preview relay, input controls,
+  crosspoint menu and stereo meters. Preview is not yet deployed.
+- Added an experimental reserved-source media tap for future idle-input preview;
+  it is not exposed until placement and ownership recovery are implemented.
+- Added in-development preview capacity reservations coordinated with route
+  placement and registered worker sessions.
+- Added worker control support for reserved-source previews and explicit cleanup
+  confirmation; the worker exits if reserved-source cleanup cannot be confirmed.
+  Idle previews and automatic fencing are not yet enabled.
+- Added transactional cleanup for a confirmed-closed preview control session,
+  including reservations created before a start command was delivered. Worker
+  session finalization remains opt-in pending rollout validation.
+- Added an experimental Linux host-process fence primitive. It is not yet
+  enabled by default.
+- Added transactional storage for process-fence identities and verified stale
+  preview recovery. An opt-in Linux worker startup path holds the fence and
+  finalizes preview sessions. An experimental opt-in API relay uses fenced
+  reservations and confirmed cleanup; it is not yet ready for deployment.
+- Added experimental preview decoding of Opus, MPEG-1 audio and AAC (ADTS) in active RTP or
+  SRT MPEG-TS sources; unsupported audio codecs are explicitly rejected.
+- Show approved resource configurations as Active without an assignment-state
+  label, and clarify that Active does not confirm audio flow.
+- Clarified SRT caller/listener
+  addresses, and safe recovery guidance for an occupied output.
 - Replaced the bottom Immediate/Take controls with crosspoint menus and moved compatibility/worker controls into collapsed advanced diagnostics.
 - README and roadmap now describe ARC rather than the project template.
 - API startup now requires PostgreSQL, applies SQLx migrations, and keeps its non-container bind address loopback-only.
 
 ### Fixed
+- Failed Takes now clean up their assignment with an acknowledged Stop before
+  releasing capacity, so a later Take is not blocked by the abandoned plan.
+  Unconfirmed cleanup retains the reservation and reports a recovery failure.
+- Reset the Salvo dropdown and draft on navigation without discarding in-flight media operations; late save/delete completions cannot restore an earlier visit's draft.
+- Start the Salvo grid blank without live-route overlays; show only draft/saved selections and default the dropdown to "Select Salvo".
+- Show the API's explanatory error message and preserve its code/status for rejected UI requests, including unsupported route conversions, instead of displaying only HTTP 422.
 - Prevented new Take, salvo execution, and direct route writes from superseding unresolved destination execution or replacement cleanup; accepted idempotent retries remain valid.
 - Isolated real destination-element flow errors from shared-source fan-out, preserving sibling delivery without restarting the source and reporting failures on the affected route.
 - Kept far-corner crosspoints reachable when endpoint catalogs load after the matrix first renders, and prevented crosspoint tooltips from blocking neighboring cells.

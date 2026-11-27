@@ -119,6 +119,7 @@ export interface RouteBatchOperation {
 export interface PresetRoute {
   sourceId: string;
   destinationId: string;
+  action?: "start" | "stop";
 }
 
 export interface RoutePreset {
@@ -137,6 +138,7 @@ export interface RouteBatchItemResult {
   assignmentGeneration: number | null;
   errorCode: string | null;
   errorMessage: string | null;
+  action?: PresetRoute["action"];
 }
 
 export interface PlannedAssignment {
@@ -184,10 +186,44 @@ export interface PlanRouteAssignmentInput extends PlanRouteAssignmentRequest {
 }
 
 export class ApiRequestError extends Error {
-  constructor(readonly status: number) {
-    super(`API request failed with HTTP ${status}`);
+  constructor(readonly status: number, detail?: string, readonly code?: string) {
+    super(`API request failed with HTTP ${status}${detail ? `: ${detail}` : ""}`);
     this.name = "ApiRequestError";
   }
+}
+
+async function readApiError(response: Response): Promise<ApiRequestError> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    if (!(error instanceof TypeError || error instanceof DOMException)) throw error;
+    return new ApiRequestError(
+      response.status,
+      `The API error response could not be read: ${error.message}`,
+    );
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    const detail = response.headers.get("content-type")?.startsWith("text/plain")
+      ? text.trim().slice(0, 500)
+      : undefined;
+    return new ApiRequestError(
+      response.status,
+      detail || "The API returned an invalid error response",
+    );
+  }
+  if (
+    typeof body === "object" && body !== null &&
+    "code" in body && typeof body.code === "string" &&
+    "message" in body && typeof body.message === "string" && body.message.trim()
+  ) {
+    return new ApiRequestError(response.status, body.message, body.code);
+  }
+  return new ApiRequestError(response.status, "The API returned an invalid error response");
 }
 
 async function deleteCatalogResource(
@@ -263,7 +299,7 @@ async function requestJson<T>(
     if (response.status === 401 && typeof window !== "undefined") {
       window.dispatchEvent(new Event("arc-auth-required"));
     }
-    throw new ApiRequestError(response.status);
+    throw await readApiError(response);
   }
   return (await response.json()) as T;
 }
@@ -279,7 +315,7 @@ async function authRequest<T>(
     credentials: "same-origin",
   });
   if (!response.ok) {
-    throw new ApiRequestError(response.status);
+    throw await readApiError(response);
   }
   return (await response.json()) as T;
 }
@@ -643,7 +679,7 @@ export async function deletePreset(
 
 export async function executePreset(
   id: string,
-  input: { expectedRevision: number; routes: SetDesiredRouteInput[] },
+  input: { expectedRevision: number; routes: (SetDesiredRouteInput & PresetRoute)[] },
   idempotencyKey: string,
   baseUrl = "",
   fetcher: typeof fetch = globalThis.fetch,
@@ -939,7 +975,8 @@ function isRoutePreset(value: unknown): value is RoutePreset {
     value.routes.every((route: unknown) =>
       typeof route === "object" && route !== null &&
       "sourceId" in route && typeof route.sourceId === "string" &&
-      "destinationId" in route && typeof route.destinationId === "string");
+      "destinationId" in route && typeof route.destinationId === "string" &&
+      (!("action" in route) || route.action === "start" || route.action === "stop"));
 }
 
 function isPayloadRate(value: unknown): value is number | null {
@@ -1001,6 +1038,7 @@ function isRouteBatchItemResult(value: unknown): value is RouteBatchItemResult {
     typeof value.destinationId === "string" &&
     "pipelineId" in value &&
     typeof value.pipelineId === "string" &&
+    (!("action" in value) || value.action === "start" || value.action === "stop") &&
     "state" in value &&
     ["pending", "processing", "succeeded", "failed"].includes(
       String(value.state),

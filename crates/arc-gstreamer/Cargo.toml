@@ -10,12 +10,10 @@ arc-domain = { path = "../arc-domain" }
 async-trait.workspace = true
 chrono.workspace = true
 gstreamer.workspace = true
+gstreamer-app.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-gstreamer-app.workspace = true
-tokio.workspace = true

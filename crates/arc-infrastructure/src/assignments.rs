@@ -234,6 +234,19 @@ impl PgAssignments {
                 message: "capacity reservation is no longer active".to_owned(),
             });
         }
+        let is_preview: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM preview_capacity_reservations WHERE reservation_id = $1)",
+        )
+        .bind(reservation_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| error_with("database_error", error))?;
+        if is_preview {
+            return Err(PortError {
+                code: "reservation_in_use",
+                message: "capacity reservation belongs to a preview".to_owned(),
+            });
+        }
         if reservation.worker_id != worker_id
             || reservation.capacity_units != i64::from(requirements.capacity_units)
         {

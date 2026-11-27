@@ -14,6 +14,7 @@ pub enum DraftValidationError {
 pub enum ResourceUpdateError {
     NotFound,
     Enabled,
+    InUse,
     Database(sqlx::Error),
 }
 
@@ -202,6 +203,15 @@ pub async fn update_source(
 
     if desired_state != "disabled" {
         return Err(ResourceUpdateError::Enabled);
+    }
+    let preview_in_use: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM preview_capacity_reservations WHERE source_id = $1)",
+    )
+    .bind(source_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if preview_in_use {
+        return Err(ResourceUpdateError::InUse);
     }
 
     let revision = sqlx::query_scalar::<_, i64>(

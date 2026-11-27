@@ -13,7 +13,7 @@ use arc_infrastructure::{
     pipeline_planning::{PgPipelinePlanner, PipelinePlanningDecision, RouteRevision},
     postgres::PgPool,
     routes::{
-        lock_destination, DesiredRouteChange, PgRoutes, Preset, PresetRoute,
+        lock_destination, DesiredRouteChange, PgRoutes, Preset, PresetRoute, RouteAction,
         RouteBatchItemCompletion, RouteBatchOperation, RouteBatchWorkItem, RouteRecord,
         RouteWriteError,
     },
@@ -36,6 +36,7 @@ use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 mod admin_auth;
+mod preview;
 mod worker_control_runtime;
 pub use admin_auth::AdminAuth;
 pub use worker_control_runtime::WorkerCommandDispatcher;
@@ -137,7 +138,7 @@ pub fn router_with_database_and_admin_auth(pool: PgPool, admin_auth: AdminAuth) 
 }
 
 pub fn router_with_worker_authenticator(authenticator: Arc<dyn WorkerAuthenticator>) -> Router {
-    router().merge(worker_control_router(authenticator, None))
+    router().merge(worker_control_router(authenticator, None, None))
 }
 
 pub fn router_with_worker_dispatcher(
@@ -148,6 +149,7 @@ pub fn router_with_worker_dispatcher(
         .merge(worker_control_router(
             authenticator,
             Some(dispatcher.clone()),
+            None,
         ))
         .layer(Extension(dispatcher))
 }
@@ -156,7 +158,7 @@ pub fn router_with_database_and_worker_authenticator(
     pool: PgPool,
     authenticator: Arc<dyn WorkerAuthenticator>,
 ) -> Router {
-    router_with_database(pool).merge(worker_control_router(authenticator, None))
+    router_with_database(pool).merge(worker_control_router(authenticator, None, None))
 }
 
 pub fn router_with_database_and_worker_dispatcher(
@@ -176,6 +178,7 @@ pub fn router_with_database_and_worker_dispatcher(
         .merge(worker_control_router(
             authenticator,
             Some(dispatcher.clone()),
+            None,
         ))
         .layer(Extension(pool.clone()))
         .layer(Extension(dispatcher.clone()));
@@ -189,6 +192,7 @@ pub fn router_with_database_worker_dispatcher_and_admin_auth(
     dispatcher: Arc<WorkerCommandDispatcher>,
     admin_auth: AdminAuth,
 ) -> Router {
+    let preview_broker = preview::PreviewBroker::new();
     let protected = database_routes()
         .route(
             "/api/v1/assignments/{assignment_id}/start",
@@ -199,14 +203,17 @@ pub fn router_with_database_worker_dispatcher_and_admin_auth(
             post(stop_assignment),
         )
         .route("/api/v1/auth/password", put(admin_auth::change_password))
+        .route("/api/v1/sources/{source_id}/preview", get(preview::browser_preview))
         .layer(Extension(pool.clone()))
         .layer(Extension(dispatcher.clone()))
-        .layer(Extension(admin_auth.clone()));
+        .layer(Extension(admin_auth.clone()))
+        .layer(Extension(preview_broker.clone()));
     let routes = admin_auth::protect(protected, admin_auth.clone())
         .merge(admin_auth::public_routes(admin_auth))
         .merge(worker_control_router(
             authenticator,
             Some(dispatcher.clone()),
+            Some(preview_broker),
         ));
     let routes = with_capacity_processor(routes, pool.clone());
     with_route_batch_processor(routes, pool, dispatcher)
@@ -452,6 +459,60 @@ async fn process_claimed_route_batch_item(
         return Ok(true);
     }
 
+    if item.error_code.as_deref() == Some("start_cleanup_pending") {
+        let initial_error = item
+            .error_message
+            .as_deref()
+            .unwrap_or("Take failed before its cleanup was confirmed.");
+        match cleanup_replacement_target(
+            pool.clone(),
+            Arc::clone(dispatcher),
+            assignment.id,
+            assignment.generation,
+        )
+        .await
+        {
+            Ok(()) => routes
+                .finish_batch_item(
+                    &item,
+                    RouteBatchItemCompletion::Failed {
+                        assignment: Some((assignment.id, assignment.generation)),
+                        error_code: "worker_start_failed",
+                        error_message: initial_error,
+                    },
+                )
+                .await
+                .map_err(route_batch_storage_error)?,
+            Err(error) if item.attempts < MAX_ROUTE_BATCH_ATTEMPTS => {
+                tracing::warn!(code = error.code, message = %error.message, "failed Take cleanup will retry");
+                finish_route_batch_retry(
+                    routes,
+                    &item,
+                    Some((assignment.id, assignment.generation)),
+                    "start_cleanup_pending",
+                    initial_error,
+                    5,
+                )
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(code = error.code, message = %error.message, "failed Take cleanup requires manual recovery");
+                routes
+                    .finish_batch_item(
+                        &item,
+                        RouteBatchItemCompletion::Failed {
+                            assignment: Some((assignment.id, assignment.generation)),
+                            error_code: "start_cleanup_failed",
+                            error_message: "Take failed and cleanup could not be confirmed. The output remains reserved; manual recovery is required.",
+                        },
+                    )
+                    .await
+                    .map_err(route_batch_storage_error)?;
+            }
+        }
+        return Ok(true);
+    }
+
     match start_assignment_for(
         pool.clone(),
         Arc::clone(dispatcher),
@@ -472,14 +533,29 @@ async fn process_claimed_route_batch_item(
             .map_err(route_batch_storage_error)?,
         Err(error) => {
             tracing::warn!(code = error.code, message = %error.message, "route batch worker start failed");
-            finish_route_batch_error(
-                routes,
-                &item,
-                Some((assignment.id, assignment.generation)),
-                error.code,
-                &error.message,
-            )
-            .await?;
+            if is_retryable_route_error(error.code) && item.attempts < MAX_ROUTE_BATCH_ATTEMPTS {
+                finish_route_batch_error(
+                    routes,
+                    &item,
+                    Some((assignment.id, assignment.generation)),
+                    error.code,
+                    &error.message,
+                )
+                .await?;
+            } else {
+                finish_route_batch_retry(
+                    routes,
+                    &item,
+                    Some((assignment.id, assignment.generation)),
+                    "start_cleanup_pending",
+                    &format!(
+                        "Take failed: {}. Review the input and output settings before retrying.",
+                        error.message
+                    ),
+                    1,
+                )
+                .await?;
+            }
         }
     }
     Ok(true)
@@ -492,8 +568,10 @@ async fn process_unroute_item(
     item: &RouteBatchWorkItem,
 ) -> PortResult<()> {
     let assignments = sqlx::query_as::<_, (Uuid, i64)>(
-        "SELECT assignment_id, generation FROM route_stop_targets WHERE operation_id = $1 ORDER BY assignment_id",
-    ).bind(item.operation_id).fetch_all(pool).await.map_err(|error| PortError {
+        "SELECT target.assignment_id, target.generation FROM route_stop_targets target \
+         JOIN pipeline_assignments assignment ON assignment.id = target.assignment_id \
+         WHERE target.operation_id = $1 AND assignment.destination_id = $2 ORDER BY target.assignment_id",
+    ).bind(item.operation_id).bind(item.destination_id).fetch_all(pool).await.map_err(|error| PortError {
         code: "database_error", message: error.to_string(),
     })?;
     let mut last = None;
@@ -1409,17 +1487,21 @@ fn route_batch_storage_error(error: RouteWriteError) -> PortError {
 struct WorkerControlState {
     authenticator: Arc<dyn WorkerAuthenticator>,
     dispatcher: Option<Arc<WorkerCommandDispatcher>>,
+    preview_broker: Option<Arc<preview::PreviewBroker>>,
 }
 
 fn worker_control_router(
     authenticator: Arc<dyn WorkerAuthenticator>,
     dispatcher: Option<Arc<WorkerCommandDispatcher>>,
+    preview_broker: Option<Arc<preview::PreviewBroker>>,
 ) -> Router {
     Router::new()
         .route(WORKER_CONTROL_ROUTE, get(worker_control))
+        .route("/api/v1/workers/control/preview/{preview_id}", get(preview::worker_preview))
         .layer(Extension(WorkerControlState {
             authenticator,
             dispatcher,
+            preview_broker,
         }))
 }
 
@@ -1428,17 +1510,33 @@ async fn worker_control(
     Extension(state): Extension<WorkerControlState>,
     websocket: WebSocketUpgrade,
 ) -> Response {
+    let (worker_id, bearer_token) = match authenticate_worker(&headers, &state).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    let authenticator = state.authenticator.clone();
+    let dispatcher = state.dispatcher.clone();
+    websocket
+        .max_message_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
+        .max_frame_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
+        .on_upgrade(move |socket| {
+            handle_worker_control(socket, worker_id, dispatcher, authenticator, bearer_token)
+        })
+        .into_response()
+}
+
+async fn authenticate_worker(headers: &HeaderMap, state: &WorkerControlState) -> Result<(Uuid, String), Response> {
     if !headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.eq_ignore_ascii_case("https"))
         .unwrap_or(false)
     {
-        return worker_control_error(
+        return Err(worker_control_error(
             StatusCode::UPGRADE_REQUIRED,
             "secure_worker_connection_required",
             "worker control requires TLS at the trusted ingress",
-        );
+        ));
     }
 
     let Some(worker_id) = headers
@@ -1447,18 +1545,18 @@ async fn worker_control(
         .and_then(|value| Uuid::parse_str(value).ok())
         .filter(|worker_id| !worker_id.is_nil())
     else {
-        return worker_control_error(
+        return Err(worker_control_error(
             StatusCode::UNAUTHORIZED,
             "worker_authentication_failed",
             "worker identity or credential was rejected",
-        );
+        ));
     };
     let Some(bearer_token) = bearer_token(&headers) else {
-        return worker_control_error(
+        return Err(worker_control_error(
             StatusCode::UNAUTHORIZED,
             "worker_authentication_failed",
             "worker identity or credential was rejected",
-        );
+        ));
     };
 
     if let Err(error) = state
@@ -1479,19 +1577,9 @@ async fn worker_control(
                 "worker credentials could not be verified",
             )
         };
-        return worker_control_error(status, code, message);
+        return Err(worker_control_error(status, code, message));
     }
-
-    let bearer_token = bearer_token.to_owned();
-    let authenticator = state.authenticator.clone();
-    let dispatcher = state.dispatcher.clone();
-    websocket
-        .max_message_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
-        .max_frame_size(MAX_WORKER_CONTROL_MESSAGE_SIZE)
-        .on_upgrade(move |socket| {
-            handle_worker_control(socket, worker_id, dispatcher, authenticator, bearer_token)
-        })
-        .into_response()
+    Ok((worker_id, bearer_token.to_owned()))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1541,7 +1629,7 @@ async fn handle_worker_control(
     }
 
     let session = match &dispatcher {
-        Some(dispatcher) => match dispatcher.start_session(worker_id).await {
+        Some(dispatcher) => match dispatcher.start_session(worker_id, hello.process_incarnation).await {
             Ok(session) => Some(session),
             Err(error) => {
                 tracing::error!(%worker_id, code = error.code, message = %error.message, "failed to register worker control session lease");
@@ -1555,6 +1643,7 @@ async fn handle_worker_control(
         kind: arc_shared::WorkerSessionMessageKind::Welcome,
         protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
         worker_id,
+        session_id: session.as_ref().map(|session| session.session_id),
     };
     match serde_json::to_string(&welcome) {
         Ok(message) => {
@@ -1898,7 +1987,15 @@ struct PresetRevisionRequest {
 #[serde(rename_all = "camelCase")]
 struct ExecutePresetRequest {
     expected_revision: i64,
-    routes: Vec<SetDesiredRouteRequest>,
+    routes: Vec<ExecutePresetRouteRequest>,
+}
+
+#[derive(Deserialize)]
+struct ExecutePresetRouteRequest {
+    #[serde(flatten)]
+    route: SetDesiredRouteRequest,
+    #[serde(default)]
+    action: RouteAction,
 }
 
 #[derive(Deserialize)]
@@ -1988,6 +2085,7 @@ fn desired_changes(routes: Vec<SetDesiredRouteRequest>) -> Vec<DesiredRouteChang
             destination_id: route.destination_id,
             expected_route_revision: route.expected_route_revision,
             confirm_replace: route.confirm_replace,
+            action: RouteAction::Start,
         })
         .collect()
 }
@@ -2003,7 +2101,17 @@ async fn execute_preset(
     PgRoutes::new(pool)
         .execute_preset(
             key,
-            desired_changes(request.routes),
+            request
+                .routes
+                .into_iter()
+                .map(|change| DesiredRouteChange {
+                    source_id: change.route.source_id,
+                    destination_id: change.route.destination_id,
+                    expected_route_revision: change.route.expected_route_revision,
+                    confirm_replace: change.route.confirm_replace,
+                    action: change.action,
+                })
+                .collect(),
             id,
             request.expected_revision,
         )
@@ -2299,10 +2407,50 @@ async fn cancel_assignment(
             "generation must be a positive assignment generation",
         ));
     }
-    PgAssignments::new(pool)
+    let assignments = PgAssignments::new(pool.clone());
+    let snapshot = assignments
+        .get_by_id(assignment_id)
+        .await
+        .map_err(ApiError::assignment)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "assignment_not_found",
+            message: "The requested assignment does not exist".to_owned(),
+        })?;
+    let mut guard = pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::database("lock assignment", error))?;
+    if let Some(route) = &snapshot.assignment.route {
+        lock_destination(&mut guard, route.destination_id)
+            .await
+            .map_err(|error| ApiError::database("lock assignment destination", error))?;
+        let cleanup_required: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM route_batch_items \
+             WHERE pipeline_id = $1 AND \
+             ((state IN ('pending', 'processing') AND attempts > 0) \
+              OR error_code = 'start_cleanup_failed'))",
+        )
+        .bind(snapshot.assignment.pipeline_id)
+        .fetch_one(&mut *guard)
+        .await
+        .map_err(|error| ApiError::database("check assignment cleanup", error))?;
+        if cleanup_required {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                code: "assignment_cleanup_required",
+                message: "The route operation must confirm cleanup before this assignment can be cancelled".to_owned(),
+            });
+        }
+    }
+    assignments
         .cancel_unstarted(assignment_id, request.generation)
         .await
         .map_err(ApiError::assignment)?;
+    guard
+        .commit()
+        .await
+        .map_err(|error| ApiError::database("unlock assignment destination", error))?;
     Ok(Json(CancelAssignmentResponse {
         assignment_id,
         generation: request.generation,
@@ -2656,6 +2804,11 @@ impl ApiError {
                 code: "resource_enabled",
                 message: "Enabled sources and destinations cannot be edited".to_owned(),
             },
+            ResourceUpdateError::InUse => Self {
+                status: StatusCode::CONFLICT,
+                code: "resource_in_use",
+                message: "Stop previewing this input before editing it".to_owned(),
+            },
             ResourceUpdateError::Database(error) => Self::database("update resource", error),
         }
     }
@@ -2941,6 +3094,57 @@ mod tests {
         router_with_worker_authenticator, router_with_worker_dispatcher, WorkerCommandDispatcher,
     };
 
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn fenced_worker_sessions_reject_legacy_and_wrong_incarnations() {
+        let pool = connect_postgres(&env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let worker_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workers \
+             (id, stable_name, platform, architecture, version, state, last_heartbeat) \
+             VALUES ($1, $2, 'linux', 'x86_64', 'test', 'ready', clock_timestamp())",
+        )
+        .bind(worker_id)
+        .bind(format!("session-fence-{worker_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dispatcher = WorkerCommandDispatcher::new_with_lease_pool(
+            Arc::new(PgAssignmentGenerationStore::new(pool.clone())),
+            pool.clone(),
+        );
+        let legacy = dispatcher.start_session(worker_id, None).await.unwrap();
+        dispatcher.discard_session(legacy).await;
+        let incarnation = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO preview_worker_process_fences \
+             (worker_id, incarnation_id, process_identity) VALUES ($1, $2, '{}'::jsonb)",
+        )
+        .bind(worker_id)
+        .bind(incarnation)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(dispatcher.start_session(worker_id, None).await.is_err());
+        assert!(dispatcher
+            .start_session(worker_id, Some(Uuid::new_v4()))
+            .await
+            .is_err());
+        let current = dispatcher
+            .start_session(worker_id, Some(incarnation))
+            .await
+            .unwrap();
+        assert!(dispatcher.start_session(worker_id, None).await.is_err());
+        assert!(dispatcher
+            .is_current_session(worker_id, current.session_id)
+            .await
+            .unwrap());
+        dispatcher.discard_session(current).await;
+    }
+
     struct TestWorkerAuthenticator {
         worker_id: Uuid,
         token: &'static str,
@@ -3151,6 +3355,7 @@ mod tests {
             kind: arc_shared::WorkerSessionMessageKind::Hello,
             protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
             worker_id,
+            process_incarnation: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -3177,6 +3382,256 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_preview_control_correlates_completion_and_retains_route_session() {
+        let worker_id = Uuid::new_v4();
+        let preview_id = Uuid::new_v4();
+        let (address, server, dispatcher, _) = start_worker_dispatch_server(worker_id).await;
+        let (mut socket, _) = connect_async(worker_websocket_request(
+            address, worker_id, "worker-secret", "https",
+        )).await.unwrap();
+        let hello = arc_shared::WorkerSessionHello {
+            kind: arc_shared::WorkerSessionMessageKind::Hello,
+            protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
+            worker_id,
+            process_incarnation: None,
+        };
+        socket.send(ClientMessage::Text(serde_json::to_string(&hello).unwrap().into())).await.unwrap();
+        assert!(matches!(socket.next().await.unwrap().unwrap(), ClientMessage::Text(_)));
+        let session = dispatcher.preview_session(worker_id).await.unwrap();
+        let control = arc_worker::WorkerPreviewControl::PreviewStart {
+            protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
+            worker_id,
+            preview_id,
+            identity: arc_application::PipelineSourceIdentity {
+                source_id: Uuid::new_v4(), source_revision: 1,
+            },
+            source: SourceMediaProfile::AlsaL16 { device: "test".to_owned() },
+            reserved_source: false,
+        };
+        let completion = session.start(control, preview_id).unwrap();
+        let ClientMessage::Text(start) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected preview start");
+        };
+        let start: arc_worker::WorkerPreviewControl = serde_json::from_str(start.as_str()).unwrap();
+        assert!(matches!(start, arc_worker::WorkerPreviewControl::PreviewStart { preview_id: id, .. } if id == preview_id));
+        let event = arc_worker::WorkerPreviewFinished {
+            kind: arc_worker::WorkerPreviewEventKind::PreviewFinished,
+            protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
+            worker_id,
+            preview_id,
+            error_code: Some("preview_unsupported".to_owned()),
+            error_message: Some("unsupported source".to_owned()),
+            cleanup_confirmed: false,
+        };
+        socket.send(ClientMessage::Text(serde_json::to_string(&event).unwrap().into())).await.unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+            .await.unwrap().unwrap().unwrap();
+        assert_eq!(event.error_code.as_deref(), Some("preview_unsupported"));
+        socket.send(ClientMessage::Ping(vec![1].into())).await.unwrap();
+        assert_eq!(socket.next().await.unwrap().unwrap(), ClientMessage::Pong(vec![1].into()));
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn preview_relay_authenticates_streams_and_closes_after_session_revocation() {
+        test_preview_relay(false, false, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn preview_relay_closes_when_worker_session_is_replaced() {
+        test_preview_relay(true, false, false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL and ARC_API_ENABLE_FENCED_PREVIEW=true"]
+    async fn fenced_preview_relay_covers_idle_and_running_inputs() {
+        assert_eq!(env::var("ARC_API_ENABLE_FENCED_PREVIEW").unwrap(), "true");
+        test_preview_relay(false, true, false).await;
+        test_preview_relay(true, true, false).await;
+        test_preview_relay(false, true, true).await;
+    }
+
+    async fn test_preview_relay(replace_worker: bool, reserved: bool, browser_stop: bool) {
+        use arc_application::{AudioPreview, MediaPipeline, PipelineObservation, PipelineSourceIdentity, PipelineSpecification};
+        use arc_infrastructure::capacity_reservations::PgCapacityReservations;
+        use arc_worker::PreviewSessionFinalizer;
+        use sha2::{Digest, Sha256};
+        use sqlx::PgPool;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TestAudio { sent: bool, closed: Arc<AtomicBool> }
+        #[async_trait::async_trait]
+        impl AudioPreview for TestAudio {
+            async fn recv(&mut self) -> PortResult<Vec<u8>> {
+                if self.sent { std::future::pending().await } else {
+                    self.sent = true;
+                    Ok(vec![1, 2, 3, 4])
+                }
+            }
+            async fn close(&mut self) -> PortResult<()> {
+                self.closed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        struct TestMedia(Arc<AtomicBool>);
+        #[async_trait::async_trait]
+        impl MediaPipeline for TestMedia {
+            async fn prepare(&self, _: &PipelineSpecification) -> PortResult<()> { Ok(()) }
+            async fn start(&self, _: Uuid, _: i64) -> PortResult<()> { Ok(()) }
+            async fn stop(&self, _: Uuid, _: i64) -> PortResult<()> { Ok(()) }
+            async fn observe(&self, _: Uuid) -> PortResult<PipelineObservation> {
+                Err(PortError { code: "test_unsupported", message: "not used".to_owned() })
+            }
+            async fn start_active_preview(
+                self: Arc<Self>, _: PipelineSourceIdentity, _: &SourceMediaProfile,
+            ) -> PortResult<Box<dyn AudioPreview>> {
+                Ok(Box::new(TestAudio { sent: false, closed: Arc::clone(&self.0) }))
+            }
+            async fn start_reserved_preview(
+                self: Arc<Self>, identity: PipelineSourceIdentity, source: &SourceMediaProfile,
+            ) -> PortResult<Box<dyn AudioPreview>> {
+                self.start_active_preview(identity, source).await
+            }
+        }
+        struct TestFinalizer(PgPool);
+        #[async_trait::async_trait]
+        impl PreviewSessionFinalizer for TestFinalizer {
+            async fn finish(&self, worker_id: Uuid, session_id: Uuid) -> PortResult<()> {
+                PgCapacityReservations::new(self.0.clone()).finish_preview_session(worker_id, session_id).await?;
+                Ok(())
+            }
+        }
+
+        const WORKER_TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+        let session_token = Uuid::new_v4().to_string();
+        let pool = connect_postgres(&env::var("DATABASE_URL").unwrap()).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let worker_id = Uuid::new_v4();
+        let source_id = Uuid::new_v4();
+        let destination_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let admin_session_id = Uuid::new_v4();
+        let incarnation = Uuid::new_v4();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO workers (id, stable_name, platform, architecture, version, state, last_heartbeat) VALUES ($1, $2, 'linux', 'x86_64', 'test', 'ready', now())")
+            .bind(worker_id).bind(worker_id.to_string()).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO sources (id, friendly_name, source_type, desired_state, current_revision) VALUES ($1, 'preview input', 'alsa_l16', 'enabled', 1)")
+            .bind(source_id).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO source_revisions (id, source_id, revision, lifecycle, configuration) VALUES ($1, $2, 1, 'validated', $3)")
+            .bind(Uuid::new_v4()).bind(source_id).bind(json!({"kind":"alsa_l16","device":"test"})).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO destinations (id, friendly_name, destination_type, desired_state, current_revision) VALUES ($1, 'preview output', 'rtp_l16', 'enabled', 1)")
+            .bind(destination_id).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO destination_revisions (id, destination_id, revision, lifecycle, configuration) VALUES ($1, $2, 1, 'validated', $3)")
+            .bind(Uuid::new_v4()).bind(destination_id).bind(json!({"kind":"rtp_l16","address":"127.0.0.1","port":5000,"payloadType":96})).execute(&mut *tx).await.unwrap();
+        if reserved {
+            let capabilities = WorkerCapabilities {
+                platform: Some(Platform::Linux), architecture: Some(Architecture::X86_64),
+                source_adapters: BTreeSet::from(["alsa_l16".to_owned()]),
+                audio_backends: BTreeSet::from(["alsa".to_owned()]),
+                ..WorkerCapabilities::default()
+            };
+            let capacity = WorkerCapacity {
+                total_capacity_units: 4, assigned_capacity_units: 0,
+                cpu_utilization_ratio: None, memory_utilization_ratio: None,
+                ingress_bits_per_second: None, egress_bits_per_second: None,
+            };
+            sqlx::query("UPDATE workers SET state = 'accepting', capabilities = $2, capacity = $3 WHERE id = $1")
+                .bind(worker_id).bind(serde_json::to_value(capabilities).unwrap()).bind(serde_json::to_value(capacity).unwrap())
+                .execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO preview_worker_process_fences (worker_id, incarnation_id, process_identity) VALUES ($1, $2, '{}')")
+                .bind(worker_id).bind(incarnation).execute(&mut *tx).await.unwrap();
+        }
+        if !reserved || replace_worker {
+            sqlx::query("INSERT INTO pipeline_assignments (id, resource_type, resource_id, worker_id, generation, desired_state, observed_state, source_id, source_revision, destination_id, destination_revision, media_path, route_configuration) VALUES ($1, 'pipeline', $2, $3, 1, 'running', 'running', $4, 1, $5, 1, 'alsa_l16_to_rtp_l16', '{}')")
+                .bind(Uuid::new_v4()).bind(Uuid::new_v4()).bind(worker_id).bind(source_id).bind(destination_id).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("INSERT INTO arc_admin_users (id, username, password_hash) VALUES ($1, $2, 'test')")
+            .bind(user_id).bind(user_id.to_string()).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO arc_admin_sessions (id, user_id, session_token_hash, csrf_token, expires_at) VALUES ($1, $2, $3, 'test', now() + interval '1 hour')")
+            .bind(admin_session_id).bind(user_id).bind(Sha256::digest(session_token.as_bytes()).to_vec()).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+
+        let store = Arc::new(TestAssignmentGenerationStore::default());
+        let dispatcher = Arc::new(WorkerCommandDispatcher::new_with_lease_pool(store.clone(), pool.clone()));
+        let app = super::router_with_database_worker_dispatcher_and_admin_auth(
+            pool.clone(), Arc::new(TestWorkerAuthenticator { worker_id, token: WORKER_TOKEN, available: true }),
+            dispatcher, super::AdminAuth::for_test(pool.clone()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let closed = Arc::new(AtomicBool::new(false));
+        let client = WorkerControlClient::new(
+            WorkerControlClientConfig {
+                endpoint: format!("ws://{address}/api/v1/workers/control"),
+                ca_certificates_file: None, worker_id, bearer_token: WORKER_TOKEN.to_owned(),
+                bearer_token_file: None, allow_insecure_loopback: true,
+            }, store, Arc::new(TestMedia(Arc::clone(&closed))),
+        ).unwrap();
+        let client = if reserved {
+            client.with_process_incarnation(incarnation).unwrap()
+                .with_preview_finalizer(Arc::new(TestFinalizer(pool.clone())))
+        } else {
+            client
+        };
+        let mut status = client.connection_status();
+        let worker = tokio::spawn(async move { client.run_session().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !*status.borrow() { status.changed().await.unwrap(); }
+        }).await.unwrap();
+        let url = format!("ws://{address}/api/v1/sources/{source_id}/preview");
+        let mut request = url.as_str().into_client_request().unwrap();
+        request.headers_mut().insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        request.headers_mut().insert("origin", HeaderValue::from_str(&format!("http://{address}")).unwrap());
+        request.headers_mut().insert("cookie", HeaderValue::from_str(&format!("arc_admin_session={session_token}")).unwrap());
+        let mut forged = request.clone();
+        forged.headers_mut().insert("origin", HeaderValue::from_static("http://attacker.invalid"));
+        let error = connect_async(forged).await.unwrap_err();
+        assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == StatusCode::FORBIDDEN));
+        let (mut browser, _) = connect_async(request).await.unwrap();
+        let audio = tokio::time::timeout(std::time::Duration::from_secs(5), browser.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(audio, ClientMessage::Binary(vec![1, 2, 3, 4].into()));
+        if browser_stop {
+            browser.send(ClientMessage::Close(None)).await.unwrap();
+        } else if replace_worker {
+            sqlx::query("UPDATE worker_control_sessions SET session_id = $1 WHERE worker_id = $2")
+                .bind(Uuid::new_v4()).bind(worker_id).execute(&pool).await.unwrap();
+        } else {
+            sqlx::query("UPDATE arc_admin_sessions SET revoked_at = clock_timestamp() WHERE id = $1")
+                .bind(admin_session_id).execute(&pool).await.unwrap();
+        }
+        let close = tokio::time::timeout(std::time::Duration::from_secs(4), browser.next()).await.unwrap().unwrap().unwrap();
+        if browser_stop {
+            assert!(matches!(close, ClientMessage::Close(_)));
+        } else if replace_worker {
+            assert!(matches!(close, ClientMessage::Close(Some(frame)) if frame.reason == "worker_session_ended"));
+        } else {
+            assert!(matches!(close, ClientMessage::Close(Some(frame)) if frame.reason == "preview_session_revoked"));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !closed.load(Ordering::SeqCst) { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+        }).await.unwrap();
+        if reserved {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM preview_capacity_reservations WHERE source_id = $1")
+                        .bind(source_id).fetch_one(&pool).await.unwrap();
+                    if active == 0 { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+        }
+        server.abort();
+        worker.abort();
+        let _ = worker.await;
+        sqlx::query("DELETE FROM worker_control_sessions WHERE worker_id = $1")
+            .bind(worker_id).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn worker_websocket_dispatch_completes_only_after_correlated_acknowledgement() {
         let worker_id = Uuid::new_v4();
         let pipeline_id = Uuid::new_v4();
@@ -3196,6 +3651,7 @@ mod tests {
             kind: arc_shared::WorkerSessionMessageKind::Hello,
             protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
             worker_id,
+            process_incarnation: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -3322,6 +3778,7 @@ mod tests {
             kind: arc_shared::WorkerSessionMessageKind::Hello,
             protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
             worker_id,
+            process_incarnation: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -3439,6 +3896,7 @@ mod tests {
             kind: arc_shared::WorkerSessionMessageKind::Hello,
             protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
             worker_id,
+            process_incarnation: None,
         };
         old_socket
             .send(ClientMessage::Text(
@@ -3624,6 +4082,7 @@ mod tests {
             kind: arc_shared::WorkerSessionMessageKind::Hello,
             protocol_version: arc_shared::WORKER_PROTOCOL_VERSION + 1,
             worker_id,
+            process_incarnation: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -3834,6 +4293,7 @@ mod tests {
                 vec![PresetRoute {
                     source_id: source.id,
                     destination_id: destination.id,
+                    action: super::RouteAction::Start,
                 }],
             )
             .await
@@ -4352,6 +4812,26 @@ mod tests {
         let operation: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
+        let mut explicit_start = execute.clone();
+        explicit_start["routes"][0]["action"] = serde_json::json!("start");
+        let response = app
+            .clone()
+            .oneshot(send(&exec_uri, &key, &explicit_start))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "explicit Start must replay legacy requests"
+        );
+        let stored: Value = sqlx::query_scalar(
+            "SELECT request FROM route_batch_operations WHERE idempotency_key = $1",
+        )
+        .bind(Uuid::parse_str(&key).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stored["routes"][0].get("action").is_none());
         let update = serde_json::json!({"name": name, "routes": [route], "expectedRevision": 1});
         let uri = format!("/api/v1/presets/{id}");
         let response = app
@@ -4479,6 +4959,177 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database; set DATABASE_URL and run ignored tests"]
+    async fn mixed_preset_actions_are_saved_revision_guarded_and_destination_wide() {
+        let pool = connect_postgres(&env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        let source = catalog::create_source(&pool, "Mixed source", "rtp_l16",
+            serde_json::json!({"kind": "rtp_l16", "bindAddress": "0.0.0.0", "port": 5000, "payloadType": 96}))
+            .await.unwrap();
+        catalog::validate_source_draft(&pool, source.id)
+            .await
+            .unwrap();
+        let anchor = catalog::create_source(
+            &pool,
+            "Unvalidated Unroute anchor",
+            "alsa_l16",
+            serde_json::json!({"kind": "alsa_l16", "device": "hw:1,0"}),
+        )
+        .await
+        .unwrap();
+        let mut outputs = Vec::new();
+        for index in 0..3 {
+            let output = catalog::create_destination(&pool, &format!("Mixed output {index}"), "rtp_l16",
+                serde_json::json!({"kind": "rtp_l16", "address": "127.0.0.1", "port": 5002 + index * 2, "payloadType": 96}))
+                .await.unwrap();
+            catalog::validate_destination_draft(&pool, output.id)
+                .await
+                .unwrap();
+            outputs.push(output.id);
+        }
+        let routes = PgRoutes::new(pool.clone());
+        routes
+            .set_desired_route(source.id, outputs[1], 0, false)
+            .await
+            .unwrap();
+        let app = router_with_database(pool.clone());
+        let saved_routes = serde_json::json!([
+            {"sourceId": source.id, "destinationId": outputs[0]},
+            {"sourceId": anchor.id, "destinationId": outputs[1], "action": "stop"},
+            {"sourceId": anchor.id, "destinationId": outputs[2], "action": "stop"}
+        ]);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/presets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": format!("mixed-{}", Uuid::new_v4()), "routes": saved_routes,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let preset: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let id = Uuid::parse_str(preset["id"].as_str().unwrap()).unwrap();
+        let listed = routes
+            .list_presets()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|saved| saved.id == id)
+            .unwrap();
+        assert_eq!(
+            listed
+                .routes
+                .iter()
+                .filter(|route| route.action == super::RouteAction::Stop)
+                .count(),
+            2
+        );
+        let uri = format!("/api/v1/presets/{id}/execute");
+        let execute = serde_json::json!({"expectedRevision": 1, "routes": [
+            {"sourceId": source.id, "destinationId": outputs[0], "expectedRouteRevision": 0},
+            {"sourceId": anchor.id, "destinationId": outputs[1], "expectedRouteRevision": 1, "action": "stop"},
+            {"sourceId": anchor.id, "destinationId": outputs[2], "expectedRouteRevision": 0, "action": "stop"}
+        ]});
+        let send = |body: &Value, key: Uuid| {
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .header("idempotency-key", key.to_string())
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let mut tampered = execute.clone();
+        tampered["routes"][1]["action"] = serde_json::json!("start");
+        assert_eq!(
+            app.clone()
+                .oneshot(send(&tampered, Uuid::new_v4()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        for index in 0..3 {
+            let mut stale = execute.clone();
+            stale["routes"][index]["expectedRouteRevision"] = serde_json::json!(9);
+            assert_eq!(
+                app.clone()
+                    .oneshot(send(&stale, Uuid::new_v4()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT
+            );
+            let unchanged = routes.list_current().await.unwrap();
+            assert!(!unchanged
+                .iter()
+                .any(|route| route.destination_id == outputs[0]
+                    || route.destination_id == outputs[2]));
+            assert_eq!(
+                unchanged
+                    .iter()
+                    .find(|route| route.destination_id == outputs[1])
+                    .unwrap()
+                    .revision,
+                1
+            );
+        }
+        let key = Uuid::new_v4();
+        let response = app.clone().oneshot(send(&execute, key)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let stopped = accepted["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["destinationId"] == outputs[1].to_string())
+            .unwrap();
+        assert_eq!(
+            stopped["sourceId"],
+            source.id.to_string(),
+            "Unroute removes the actual input, not its saved anchor"
+        );
+        assert_eq!(stopped["desiredState"], "removed");
+        let results = accepted["results"].as_array().unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .find(|item| item["destinationId"] == outputs[1].to_string())
+                .unwrap()["state"],
+            "pending",
+            "a desired route without confirmed Stop must not become an idle no-op"
+        );
+        let idle = results
+            .iter()
+            .find(|item| item["destinationId"] == outputs[2].to_string())
+            .unwrap();
+        assert_eq!(idle["state"], "succeeded");
+        assert_eq!(idle["action"], "stop");
+        routes.delete_preset(id, 1).await.unwrap();
+        let replay = app.oneshot(send(&execute, key)).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: Value =
+            serde_json::from_slice(&to_bytes(replay.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(replay["operationId"], accepted["operationId"]);
     }
 
     #[tokio::test]
@@ -4924,6 +5575,7 @@ mod tests {
             kind: arc_shared::WorkerSessionMessageKind::Hello,
             protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
             worker_id,
+            process_incarnation: None,
         };
         socket
             .send(ClientMessage::Text(
@@ -5055,6 +5707,7 @@ mod tests {
                 vec![arc_infrastructure::routes::PresetRoute {
                     source_id: source.id,
                     destination_id: destination.id,
+                    action: super::RouteAction::Start,
                 }],
             )
             .await
@@ -5156,6 +5809,252 @@ mod tests {
                     .expect("worker acknowledgement sends");
             }};
         }
+
+        let failed_output = catalog::create_destination(
+            &pool,
+            "Failed Take recovery destination",
+            destination_profile.adapter_id(),
+            serde_json::to_value(&destination_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let failed_output = catalog::validate_destination_draft(&pool, failed_output.id)
+            .await
+            .unwrap();
+        let failed_request = serde_json::json!({"routes": [{
+            "sourceId": source.id, "destinationId": failed_output.id,
+            "expectedRouteRevision": 0, "confirmReplace": false
+        }]});
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(failed_request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let failed_operation_id =
+            Uuid::parse_str(response["operationId"].as_str().unwrap()).unwrap();
+        let failed_start = next_worker_command!("failed Take reaches worker");
+        assert_eq!(failed_start["payload"]["kind"], "start");
+        acknowledge_worker_command!(
+            failed_start,
+            arc_shared::WorkerCommandOutcome::Failed,
+            Some("gstreamer_pipeline_start_failed"),
+            Some("injected start failure")
+        );
+        let cleanup = next_worker_command!("failed Take dispatches cleanup Stop");
+        assert_eq!(cleanup["payload"]["kind"], "stop");
+        assert_eq!(cleanup["assignmentId"], failed_start["assignmentId"]);
+        acknowledge_worker_command!(
+            cleanup,
+            arc_shared::WorkerCommandOutcome::Failed,
+            Some("cleanup_failed"),
+            Some("injected cleanup failure")
+        );
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let result = routes
+                    .get_route_batch_operation(failed_operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if result.results[0].error_code.as_deref() == Some("start_cleanup_pending")
+                    && result.results[0].state == "pending"
+                {
+                    break result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("unconfirmed Stop leaves cleanup pending");
+        let assignment_id = pending.results[0].assignment_id.unwrap();
+        let snapshot = PgAssignments::new(pool.clone())
+            .get_by_id(assignment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.desired_state, "planned");
+        assert_eq!(snapshot.observed_state, "not_started");
+        let reservation_state: String =
+            sqlx::query_scalar("SELECT state FROM worker_capacity_reservations WHERE id = $1")
+                .bind(snapshot.assignment.reservation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reservation_state, "reserved");
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/assignments/{assignment_id}/cancel"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"generation": snapshot.assignment.generation})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let blocked_retry = serde_json::json!({"routes": [{
+            "sourceId": source.id, "destinationId": failed_output.id,
+            "expectedRouteRevision": 1, "confirmReplace": false
+        }]});
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(blocked_retry.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        sqlx::query(
+            "UPDATE route_batch_items SET next_attempt_at = clock_timestamp() \
+             WHERE operation_id = $1 AND destination_id = $2",
+        )
+        .bind(failed_operation_id)
+        .bind(failed_output.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let retried_cleanup = next_worker_command!("failed Take cleanup retries");
+        assert_eq!(retried_cleanup["commandId"], cleanup["commandId"]);
+        acknowledge_worker_command!(
+            retried_cleanup,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let result = routes
+                    .get_route_batch_operation(failed_operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if result.state == "failed" {
+                    break result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("confirmed cleanup completes failed Take");
+        assert_eq!(
+            failed.results[0].error_code.as_deref(),
+            Some("worker_start_failed")
+        );
+        let snapshot = PgAssignments::new(pool.clone())
+            .get_by_id(assignment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.desired_state, "cancelled");
+        assert_eq!(snapshot.observed_state, "cancelled");
+        let reservation_state: String =
+            sqlx::query_scalar("SELECT state FROM worker_capacity_reservations WHERE id = $1")
+                .bind(snapshot.assignment.reservation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reservation_state, "released");
+        let retry = serde_json::json!({"routes": [{
+            "sourceId": source.id, "destinationId": failed_output.id,
+            "expectedRouteRevision": 1, "confirmReplace": false
+        }]});
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(retry.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let retry_start = next_worker_command!("a new Take is no longer blocked");
+        assert_eq!(retry_start["payload"]["kind"], "start");
+        assert_ne!(retry_start["assignmentId"], failed_start["assignmentId"]);
+        acknowledge_worker_command!(
+            retry_start,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let retry_assignment_id =
+            Uuid::parse_str(retry_start["assignmentId"].as_str().unwrap()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = PgAssignments::new(pool.clone())
+                    .get_by_id(retry_assignment_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if snapshot.observed_state == "running" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retried Take starts");
+        let unroute = serde_json::json!({
+            "destinationId": failed_output.id, "expectedRouteRevision": 1
+        });
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/unroute")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(unroute.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stop = next_worker_command!("retried Take is stopped");
+        acknowledge_worker_command!(
+            stop,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = PgAssignments::new(pool.clone())
+                    .get_by_id(retry_assignment_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if snapshot.observed_state == "stopped" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retried Take stops");
 
         let sibling = catalog::create_destination(
             &pool,
@@ -5366,6 +6265,7 @@ mod tests {
                 vec![arc_infrastructure::routes::PresetRoute {
                     source_id: replacement_source_ids[1],
                     destination_id: destination.id,
+                    action: super::RouteAction::Start,
                 }],
             )
             .await
@@ -6009,16 +6909,109 @@ mod tests {
             .unwrap();
         assert_eq!(route.desired_state, "removed");
         assert_eq!(route.observed_state, "running");
+        let main_route = routes
+            .list_current()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|route| route.destination_id == destination.id)
+            .unwrap();
         let response = router_with_database(pool.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/routes/unroute")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(
+                        serde_json::json!({"routes": [{
+                            "sourceId": route.source_id, "destinationId": destination.id,
+                            "expectedRouteRevision": main_route.revision, "confirmReplace": true,
+                        }]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let started: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let started_id = Uuid::parse_str(started["operationId"].as_str().unwrap()).unwrap();
+        let command = next_worker_command!("second output starts for multi-output saved Unroute");
+        assert_eq!(command["payload"]["kind"], "start");
+        let main_assignment = Uuid::parse_str(command["assignmentId"].as_str().unwrap()).unwrap();
+        acknowledge_worker_command!(
+            command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if routes
+                    .get_route_batch_operation(started_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state
+                    == "completed"
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("second output Start is recorded");
+        let main_route = routes
+            .list_current()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|route| route.destination_id == destination.id)
+            .unwrap();
+        let anchor = if route.source_id == source.id {
+            replacement_source_ids[0]
+        } else {
+            source.id
+        };
+        assert_ne!(anchor, route.source_id);
+        let stop_preset = routes
+            .save_preset(
+                None,
+                None,
+                format!("multi-stop-{}", Uuid::new_v4()),
+                vec![
+                    arc_infrastructure::routes::PresetRoute {
+                        source_id: anchor,
+                        destination_id: sibling.id,
+                        action: super::RouteAction::Stop,
+                    },
+                    arc_infrastructure::routes::PresetRoute {
+                        source_id: anchor,
+                        destination_id: destination.id,
+                        action: super::RouteAction::Stop,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/presets/{}/execute", stop_preset.id))
                     .header("content-type", "application/json")
                     .header("idempotency-key", Uuid::new_v4().to_string())
                     .body(Body::from(
                         serde_json::json!({
-                            "destinationId": sibling.id, "expectedRouteRevision": route.revision
+                            "expectedRevision": stop_preset.revision,
+                            "routes": [
+                                {"sourceId": anchor, "destinationId": sibling.id, "expectedRouteRevision": route.revision, "action": "stop"},
+                                {"sourceId": anchor, "destinationId": destination.id, "expectedRouteRevision": main_route.revision, "action": "stop"}
+                            ]
                         })
                         .to_string(),
                     ))
@@ -6031,7 +7024,9 @@ mod tests {
         let retry: Value = serde_json::from_slice(&body).unwrap();
         let sibling_stop_id = Uuid::parse_str(retry["operationId"].as_str().unwrap()).unwrap();
         let command = next_worker_command!("failed Stop can be retried");
-        assert_eq!(command["assignmentId"], sibling_assignment.to_string());
+        let first_assignment = Uuid::parse_str(command["assignmentId"].as_str().unwrap()).unwrap();
+        assert!([sibling_assignment, main_assignment].contains(&first_assignment));
+        assert_eq!(command["payload"]["kind"], "stop");
         let reservation_state: String =
             sqlx::query_scalar("SELECT state FROM worker_capacity_reservations WHERE id = $1")
                 .bind(sibling_reservation)
@@ -6041,6 +7036,36 @@ mod tests {
         assert_eq!(
             reservation_state, "reserved",
             "retry is not yet acknowledged"
+        );
+        acknowledge_worker_command!(
+            command,
+            arc_shared::WorkerCommandOutcome::Completed,
+            None,
+            None
+        );
+        let command = next_worker_command!("the other saved output receives its own Stop");
+        let second_assignment = Uuid::parse_str(command["assignmentId"].as_str().unwrap()).unwrap();
+        assert!([sibling_assignment, main_assignment].contains(&second_assignment));
+        assert_ne!(first_assignment, second_assignment);
+        assert_eq!(command["payload"]["kind"], "stop");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let operation = routes
+                    .get_route_batch_operation(sibling_stop_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if operation.results.iter().any(|item| {
+                    item.assignment_id == Some(first_assignment) && item.state == "succeeded"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "one output must complete without waiting for another output's Stop acknowledgement",
         );
         acknowledge_worker_command!(
             command,
@@ -6087,6 +7112,143 @@ mod tests {
             scheduler.inspect_placement(&capacity_probe).await.unwrap(),
             arc_domain::PlacementDecision::Selected { worker_id: selected } if selected == worker_id
         ));
+
+        let exhausted_output = catalog::create_destination(
+            &pool,
+            "Exhausted cleanup destination",
+            destination_profile.adapter_id(),
+            serde_json::to_value(&destination_profile).unwrap(),
+        )
+        .await
+        .unwrap();
+        let exhausted_output = catalog::validate_destination_draft(&pool, exhausted_output.id)
+            .await
+            .unwrap();
+        let request = serde_json::json!({"routes": [{
+            "sourceId": source.id, "destinationId": exhausted_output.id,
+            "expectedRouteRevision": 0, "confirmReplace": false
+        }]});
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/routes/batch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let exhausted_operation_id =
+            Uuid::parse_str(response["operationId"].as_str().unwrap()).unwrap();
+        let failed_start = next_worker_command!("exhaustion test Take reaches worker");
+        acknowledge_worker_command!(
+            failed_start,
+            arc_shared::WorkerCommandOutcome::Failed,
+            Some("gstreamer_pipeline_start_failed"),
+            Some("injected start failure")
+        );
+        let cleanup = next_worker_command!("exhaustion test cleanup reaches worker");
+        acknowledge_worker_command!(
+            cleanup,
+            arc_shared::WorkerCommandOutcome::Failed,
+            Some("cleanup_failed"),
+            Some("injected cleanup failure")
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let operation = routes
+                    .get_route_batch_operation(exhausted_operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if operation.results[0].error_code.as_deref() == Some("start_cleanup_pending")
+                    && operation.results[0].state == "pending"
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("failed cleanup remains pending");
+        sqlx::query(
+            "UPDATE route_batch_items SET attempts = $1, next_attempt_at = clock_timestamp() \
+             WHERE operation_id = $2 AND destination_id = $3",
+        )
+        .bind(super::MAX_ROUTE_BATCH_ATTEMPTS - 1)
+        .bind(exhausted_operation_id)
+        .bind(exhausted_output.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let last_cleanup = next_worker_command!("last cleanup attempt reaches worker");
+        assert_eq!(last_cleanup["commandId"], cleanup["commandId"]);
+        acknowledge_worker_command!(
+            last_cleanup,
+            arc_shared::WorkerCommandOutcome::Failed,
+            Some("cleanup_failed"),
+            Some("injected cleanup failure")
+        );
+        let exhausted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let operation = routes
+                    .get_route_batch_operation(exhausted_operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if operation.state == "failed" {
+                    break operation;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("exhausted cleanup fails explicitly");
+        assert_eq!(
+            exhausted.results[0].error_code.as_deref(),
+            Some("start_cleanup_failed")
+        );
+        assert!(exhausted.results[0]
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("manual recovery"));
+        let assignment_id = exhausted.results[0].assignment_id.unwrap();
+        let snapshot = PgAssignments::new(pool.clone())
+            .get_by_id(assignment_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.desired_state, "planned");
+        assert_eq!(snapshot.observed_state, "not_started");
+        let reservation_state: String =
+            sqlx::query_scalar("SELECT state FROM worker_capacity_reservations WHERE id = $1")
+                .bind(snapshot.assignment.reservation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reservation_state, "reserved");
+        let response = router_with_database(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/assignments/{assignment_id}/cancel"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"generation": snapshot.assignment.generation})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
 
         server.abort();
     }
@@ -7279,6 +8441,7 @@ mod tests {
             kind: arc_shared::WorkerSessionMessageKind::Hello,
             protocol_version: arc_shared::WORKER_PROTOCOL_VERSION,
             worker_id: assigned_worker_id,
+            process_incarnation: None,
         };
         socket
             .send(ClientMessage::Text(

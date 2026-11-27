@@ -5,6 +5,39 @@ and the operator UI. An opt-in `worker` profile adds the worker service. The
 API applies SQLx migrations before opening its HTTP listener. PostgreSQL data
 persists in the `postgres_data` named volume.
 
+## Saved Salvo action rollout and recovery
+
+Update the API and UI together for mixed Take/Unroute salvos, then refresh
+operator browser tabs before using them. Migration `0014` defaults existing
+saved routes to Take and adds persisted `start`/`stop` actions. Red selections
+disconnect the output regardless of their saved input anchor.
+
+Before upgrading an existing test stack, back up PostgreSQL and the exact
+images, build sources and Compose overlays in a private directory. Wait for
+active routing operations to finish. Restart only the API and UI; reload
+existing NGINX proxies after replacing the API so their upstream DNS is fresh.
+Check readiness, a new worker control session and a fresh heartbeat in a valid
+`ready` or `accepting` state. Compare route history, assignment IDs,
+generations/states and the command ledger before and after the rollout.
+
+An API rollback binary must embed every applied SQLx migration: the original
+13-migration API refuses to start after migration 14 (`VersionMissing(14)`),
+even though the column addition is schema-compatible. The test-host backup
+includes a separately built and readiness-tested baseline API with migration
+14 embedded. Downgrading action-unaware behavior is safe only when no saved
+Stop actions or active routing operations remain; otherwise recover forward.
+Do not delete migration history or restore an older live database to bypass
+these checks.
+
+The mixed-action rollout verified API/UI identities, migration 14, worker
+reconnection and unchanged route/assignment/command snapshots. Worker,
+database and ingress containers were not recreated, and no media commands
+were issued. Audio continuity was not measured during this update; this does
+not close external-endpoint or multi-instance/recovery acceptance gates.
+Desktop browser checks also verified visible blue/red/clear cycling and that
+returning to Salvo clears a mixed draft and restores Select Salvo. No live
+salvo Save, Take or Unroute was submitted for these checks.
+
 ## Isolated test-server readiness
 
 A Linux Docker/Compose host can run an isolated test stack before all phase
@@ -122,6 +155,51 @@ pre-bootstrap snapshot, not an ongoing backup policy. Protect subsequent dumps
 like credentials. The existing authenticated operator session survived the
 current host's subsequent API/UI update.
 
+## Resource validation and route compatibility
+
+`Active` means the saved configuration is approved for routing; it does not
+mean audio is flowing or verify endpoint reachability. New and edited
+configurations must be validated before routing. Profile constraints are also
+checked when a configuration is saved. Assignment Start/Stop manages resource
+enablement, which is not shown as a separate status in the resource list.
+The test-server UI was updated independently on 2026-11-27; existing browser
+tabs must be refreshed to display the new label. The API, worker, PostgreSQL
+and ingress containers were unchanged, and the assignment snapshot remained
+unchanged. Audio continuity was not measured.
+
+On 2026-11-27 a further UI-only rollout simplified crosspoint hover text to
+input and output names. The API, worker, PostgreSQL and ingress containers and
+assignment snapshot were unchanged. Audio continuity was not measured. Refresh
+an existing browser tab to load the updated UI. The prior UI image and rollback
+materials remain under `backup/ui-hover-20261127-32d118d3`.
+The crosspoint direction labels were enlarged and repositioned in a subsequent
+UI-only rollout. The worker, API, database, ingress and assignment snapshot
+were unchanged; audio continuity was not measured. Its rollback materials are
+retained under `backup/ui-matrix-labels-20261127-32d118d3`.
+The misleading Shift+F10 hint was removed in another UI-only rollout. The API,
+worker, database, ingress and assignment snapshot were unchanged; audio
+continuity was not measured. Rollback materials are retained under
+`backup/ui-shortcut-20261127-32d118d3`.
+
+An SRT listener binds a local worker address (or an appropriate wildcard),
+not the remote sender or receiver address. An SRT caller uses the remote
+listener's address. Both peers must use compatible mode and port settings.
+After a failed Take, ARC attempts to Stop the failed assignment before
+releasing its reservation. An unconfirmed Stop is retried and retains the
+reservation; exhausted cleanup requires manual recovery. Existing assignments
+from older versions can still occupy an output. If it is safe to disconnect,
+Unroute that output and wait for confirmation before trying another Take.
+Unroute can interrupt an existing connection. If Stop is not confirmed, do not
+manually delete the assignment or release its capacity; investigate worker
+connectivity and recovery instead.
+
+Route compatibility is checked separately. Supported paths are ALSA L16 to RTP
+L16, RTP L16 to RTP L16, RTP L24 to RTP L24, RTP MP2T to SRT MPEG-TS, and SRT
+MPEG-TS to SRT MPEG-TS. There is no automatic L16/L24 conversion or PCM-to-MPEG-TS
+encoding. In particular, an ALSA input cannot currently route directly to an
+SRT MPEG-TS output. The API rejects unsupported pairs with HTTP 422; the UI
+displays the server's explanation alongside that status.
+
 ## Linux dual-network media worker
 
 The test host now also runs a non-root media worker and worker-only TLS
@@ -181,6 +259,30 @@ workstation SSH tunnel at `http://127.0.0.1:4180/`; no LAN web listener was
 opened. Do not use the older `compose-preview up` helper after enabling media:
 it omits the worker credential overlay and can recreate the API without its
 authenticated worker dispatcher.
+
+Audio-preview process fencing and reserved-input preview are experimental.
+The test host has both enabled and browser preview is available. Earlier
+cleanup stalls disconnected worker control; the worker was restarted and
+stale reservations were recovered only after the old process exited. The
+deployed fix prevents a disconnected SRT destination from blocking shared
+sources: media is discarded while disconnected and resumes when the peer
+connects. Live ALSA and SRT previews produced audio and cleaned up, and an
+idle RTP preview closed cleanly. Browser meters showed nonzero levels for
+both active sources. Both RTP outputs carried nonzero audio after rollout.
+The SRT destination at `192.168.50.212:9005` returned UDP port-unreachable;
+its end-to-end route cannot be verified until the receiver is available.
+The API's
+`ARC_API_ENABLE_FENCED_PREVIEW=true` selects the experimental fenced relay;
+when unset or `false`, the existing active-route-only relay is retained. On
+Linux the opt-in worker configuration uses `ARC_WORKER_ENABLE_PREVIEW_FENCING=true`,
+`ARC_WORKER_PREVIEW_FENCE_LOCK`, `ARC_WORKER_PREVIEW_HOST_PROC`, and
+`ARC_WORKER_PREVIEW_HOST_ID`. All instances of a worker identity must share
+one persistent host-local lock inode, a unique uncloned host ID, and a root
+host procfs view. Initial enrollment additionally requires
+`ARC_WORKER_PREVIEW_FENCE_INITIAL_ENROLLMENT=true` only after confirming every
+legacy worker for that identity has stopped; remove that setting immediately
+after enrollment. Do not roll back to an unfenced worker without a separately
+verified recovery procedure.
 
 Before the transition, `backup/pre-media.dump`, `backup/pre-media.env` and
 the original helper were retained privately. The worker/ingress and updated

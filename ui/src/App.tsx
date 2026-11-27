@@ -35,6 +35,8 @@ import {
 } from "@mui/material";
 
 import { RoutingWorkspace } from "./RoutingWorkspace";
+import { usePreviewController } from "./PreviewController";
+import type { StereoLevels } from "./pcmPreview";
 import { createPipelineId } from "./routeStaging";
 import {
   ApiRequestError,
@@ -116,14 +118,55 @@ const sectionTitles: Record<Section, string> = {
   admin: "Admin Settings",
 };
 
-const sectionDescriptions: Record<Section, string> = {
-  workspace: "Route connections and signal flow for this workspace.",
+const sectionDescriptions: Partial<Record<Section, string>> = {
+  workspace: "Route connections and signal flow.",
   inputs: "Configure and validate audio sources.",
   outputs: "Configure and validate audio destinations.",
   gpio: "Configure GPIO devices and signal mappings.",
   salvos: "Save and take groups of crosspoint routes.",
-  admin: "Workspace appearance and service status.",
 };
+
+export function SectionHeading({ section }: { section: Section }) {
+  const description = sectionDescriptions[section];
+  return (
+    <Box>
+      <Typography variant="h4" component="h1" sx={{ fontWeight: 650 }}>
+        {sectionTitles[section]}
+      </Typography>
+      {description && (
+        <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+          {description}
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
+export function SidebarBrand({ themeMode }: { themeMode: "dark" | "light" }) {
+  return (
+    <Stack
+      direction="row"
+      spacing={1.25}
+      alignItems="center"
+      sx={{ minHeight: 88, px: 2, borderBottom: 1, borderColor: "divider" }}
+    >
+      <Box
+        component="img"
+        src={themeMode === "dark" ? "/ARC-Light-128.png" : "/ARC-Dark-128.png"}
+        alt=""
+        aria-hidden="true"
+        sx={{ width: 64, height: 64, objectFit: "contain", flexShrink: 0 }}
+      />
+      <Typography
+        variant="caption"
+        color="text.secondary"
+        sx={{ flex: 1, textAlign: "center", fontWeight: 700 }}
+      >
+        Audio Routing Controller
+      </Typography>
+    </Stack>
+  );
+}
 
 export function App() {
   const queryClient = useQueryClient();
@@ -445,6 +488,7 @@ function WorkspaceApp({
   onPasswordChanged: () => void;
 }) {
   const queryClient = useQueryClient();
+  const preview = usePreviewController(apiBaseUrl);
   const [section, setSection] = useState<Section>("workspace");
   const [themeMode, setThemeMode] = useState<"dark" | "light">("dark");
   const [sourceName, setSourceName] = useState("");
@@ -811,32 +855,7 @@ function WorkspaceApp({
             bgcolor: "background.paper",
           }}
         >
-          <Stack
-            direction="row"
-            spacing={1.25}
-            alignItems="center"
-            sx={{ minHeight: 88, px: 2, borderBottom: 1, borderColor: "divider" }}
-          >
-            <Box
-              component="img"
-              src={
-                themeMode === "dark"
-                  ? "/ARC-Light-128.png"
-                  : "/ARC-Dark-128.png"
-              }
-              alt=""
-              aria-hidden="true"
-              sx={{ width: 64, height: 64, objectFit: "contain", flexShrink: 0 }}
-            />
-            <Box>
-              <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-                ARC
-              </Typography>
-              <Typography variant="caption" color="text.secondary">
-                Audio Routing Controller
-              </Typography>
-            </Box>
-          </Stack>
+          <SidebarBrand themeMode={themeMode} />
 
           <Stack spacing={0.5} sx={{ px: 1.25, py: 2, flex: 1 }}>
             {navigation.map((item) => (
@@ -951,14 +970,7 @@ function WorkspaceApp({
                 justifyContent="space-between"
                 spacing={1}
               >
-                <Box>
-                  <Typography variant="h4" component="h1" sx={{ fontWeight: 650 }}>
-                    {sectionTitles[section]}
-                  </Typography>
-                  <Typography color="text.secondary" sx={{ mt: 0.5 }}>
-                    {sectionDescriptions[section]}
-                  </Typography>
-                </Box>
+                <SectionHeading section={section} />
                 {section === "inputs" && (
                   <Chip
                     size="small"
@@ -994,6 +1006,11 @@ function WorkspaceApp({
                   destinationError={
                     destinations.isError ? destinations.error.message : ""
                   }
+                  preview={{ name: preview.state.name, levels: preview.state.levels, busy: preview.state.phase !== "idle" }}
+                  onPreview={(id) => {
+                    const source = sources.data?.find((item) => item.id === id);
+                    if (source) preview.start(source.id, source.friendlyName);
+                  }}
                 />
               </Box>
 
@@ -1001,6 +1018,7 @@ function WorkspaceApp({
                 <RoutingWorkspace
                   apiBaseUrl={apiBaseUrl}
                   mode="salvos"
+                  active={section === "salvos"}
                   sources={sources.data ?? []}
                   destinations={destinations.data ?? []}
                   routes={routes.data ?? []}
@@ -1017,6 +1035,11 @@ function WorkspaceApp({
                   loading={sources.isLoading}
                   error={sources.isError ? sources.error.message : ""}
                   records={sources.data ?? []}
+                  previewBusy={preview.state.phase !== "idle"}
+                  onPreview={(id) => {
+                    const source = sources.data?.find((item) => item.id === id);
+                    if (source) preview.start(source.id, source.friendlyName);
+                  }}
                   saveError={
                     createSource.isError
                       ? createSource.error.message
@@ -1149,6 +1172,7 @@ function WorkspaceApp({
           </Box>
         </Box>
       </Box>
+      {preview.dialog}
     </ThemeProvider>
   );
 }
@@ -1216,6 +1240,8 @@ function WorkspaceView({
   routePlan,
   sourceError,
   destinationError,
+  onPreview,
+  preview,
 }: {
   sources: SourceRecord[];
   destinations: DestinationRecord[];
@@ -1238,6 +1264,8 @@ function WorkspaceView({
   >;
   sourceError: string;
   destinationError: string;
+  onPreview: (sourceId: string) => void;
+  preview: { name: string; levels: StereoLevels; busy: boolean };
 }) {
   const selectedSource = sources.find((source) => source.id === selectedSourceId);
   const selectedDestination = destinations.find(
@@ -1494,6 +1522,8 @@ function WorkspaceView({
         routesError={routesError}
         sourceError={sourceError}
         destinationError={destinationError}
+        onPreview={onPreview}
+        preview={preview}
         onSelect={(sourceId, destinationId) => {
           onSourceChange(sourceId);
           onDestinationChange(destinationId);
@@ -1911,6 +1941,8 @@ type ResourceWorkspaceProps =
       loading: boolean;
       error: string;
       records: SourceRecord[];
+      previewBusy: boolean;
+      onPreview: (sourceId: string) => void;
       onDelete: (record: SourceRecord | DestinationRecord) => Promise<void>;
       saveError: string;
       editingId?: string;
@@ -2019,10 +2051,13 @@ function ResourceWorkspace(props: ResourceWorkspaceProps) {
   return (
     <Stack spacing={2.5}>
       <Alert severity="info">
-        New and edited resources are disabled drafts. Validate them before use;
-        validation does not start media. Expand a row to edit, validate or delete
-        it. Enabled resources cannot be edited or deleted; referenced resources
-        cannot be deleted, including those retained in route history or salvos.
+        New and edited resources are drafts. Validate the saved configuration
+        before routing; this does not test the connection or start audio.
+        Active means the configuration is ready for routing, not that audio is
+        flowing. Expand a row to edit, validate or delete it. Resources in use
+        cannot be edited or deleted;
+        referenced resources cannot be deleted, including those retained in
+        route history or salvos.
       </Alert>
       <Accordion
         expanded={creating && !props.editingId}
@@ -2059,8 +2094,9 @@ function ResourceWorkspace(props: ResourceWorkspaceProps) {
             ) : props.records.length === 0 ? (
               <Typography color="text.secondary">No {props.kind}s configured yet.</Typography>
             ) : props.records.map((record) => (
+              <Stack key={record.id} direction="row" spacing={1} alignItems="flex-start">
               <Accordion
-                key={record.id}
+                sx={{ flex: 1, minWidth: 0 }}
                 disableGutters
                 expanded={props.editingId === record.id}
                 onChange={(_, expanded) => {
@@ -2102,6 +2138,11 @@ function ResourceWorkspace(props: ResourceWorkspaceProps) {
                   )}
                 </AccordionDetails>
               </Accordion>
+              {props.kind === "input" && (
+                <Button variant="outlined" sx={{ mt: 1 }} disabled={props.previewBusy} onClick={() => props.onPreview(record.id)}
+                  aria-label={`Preview input ${record.friendlyName}`}>Preview</Button>
+              )}
+              </Stack>
             ))}
           </Stack>
         </CardContent>
@@ -2182,8 +2223,15 @@ function SourceFields(
           <TextField
             disabled={props.disabled}
             label={
-              props.profileKind === "srt_mpeg_ts" ? "SRT host" : "Bind address"
+              props.profileKind === "srt_mpeg_ts"
+                ? (props.sourceMode === "listener" ? "Local listen address" : "Remote SRT host")
+                : "Bind address"
             }
+            helperText={props.profileKind === "srt_mpeg_ts"
+              ? (props.sourceMode === "listener"
+                ? "Use an address on the worker host, not the sender's address."
+                : "Use the address of the remote SRT listener.")
+              : undefined}
             value={
               props.profileKind === "srt_mpeg_ts"
                 ? props.sourceHost
@@ -2269,7 +2317,14 @@ function DestinationFields(
         </Typography>
       )}
       <TextField
-        label={props.profileKind === "srt_mpeg_ts" ? "Host" : "Address"}
+        label={props.profileKind === "srt_mpeg_ts"
+          ? (props.destinationMode === "listener" ? "Local listen address" : "Remote SRT host")
+          : "Address"}
+        helperText={props.profileKind === "srt_mpeg_ts"
+          ? (props.destinationMode === "listener"
+            ? "Use an address on the worker host, not the receiver's address."
+            : "Use the address of the remote SRT listener.")
+          : undefined}
         disabled={props.disabled}
         value={props.destinationAddress}
         onChange={(event) =>
@@ -2318,7 +2373,7 @@ function DestinationFields(
   );
 }
 
-function ResourceRow({
+export function ResourceRow({
   record,
 }: {
   record: SourceRecord | DestinationRecord;
@@ -2344,17 +2399,14 @@ function ResourceRow({
         <Stack direction="row" spacing={0.75} sx={{ mt: 0.75 }}>
           <Chip
             size="small"
-            label={record.desiredState === "disabled" ? "Disabled" : "Enabled"}
-            variant="outlined"
-          />
-          <Chip
-            size="small"
             label={
               record.lifecycle === "draft"
-                ? "Draft"
-                : `${record.lifecycle} · ${record.desiredState}`
+                ? "Draft - validation needed"
+                : record.lifecycle === "validated" || record.lifecycle === "active"
+                  ? "Active"
+                  : `Configuration ${record.lifecycle}`
             }
-            color={record.lifecycle === "draft" ? "default" : "success"}
+            color={record.lifecycle === "validated" || record.lifecycle === "active" ? "success" : "default"}
             variant="outlined"
           />
         </Stack>

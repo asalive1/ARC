@@ -1,4 +1,4 @@
-import { useEffect, useState, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Accordion, AccordionDetails, AccordionSummary, Alert, Button,
@@ -7,10 +7,12 @@ import {
 } from "@mui/material";
 
 import { CrosspointMatrix } from "./CrosspointMatrix";
+import { PreviewMeters } from "./PreviewMeters";
+import type { StereoLevels } from "./pcmPreview";
 import {
   ApiRequestError, deletePreset, executePreset, fetchPresets,
   getRouteBatchOperation, savePreset, setDesiredRoutesBatch, unrouteDestination,
-  type DestinationRecord, type RoutePreset, type RouteRecord,
+  type DestinationRecord, type RouteBatchItemResult, type RoutePreset, type RouteRecord,
   type SetDesiredRouteInput, type SourceRecord,
 } from "./api";
 import {
@@ -21,6 +23,7 @@ import {
 interface RoutingWorkspaceProps {
   apiBaseUrl: string;
   mode: "routes" | "salvos";
+  active?: boolean;
   sources: SourceRecord[];
   destinations: DestinationRecord[];
   routes: RouteRecord[];
@@ -29,6 +32,8 @@ interface RoutingWorkspaceProps {
   sourceError: string;
   destinationError: string;
   onSelect?: (sourceId: string, destinationId: string) => void;
+  onPreview?: (sourceId: string) => void;
+  preview?: { name: string; levels: StereoLevels; busy: boolean };
 }
 
 type RouteAction =
@@ -47,11 +52,27 @@ function requiresReplacement(route: RouteRecord | undefined, sourceId: string): 
         route.observedSourceId !== sourceId));
 }
 
+export function DestinationOutcome({ item, name }: {
+  item: RouteBatchItemResult;
+  name: string;
+}) {
+  return (
+    <Alert severity={item.state === "succeeded"
+      ? "success" : item.state === "failed" ? "error" : "info"}>
+      {name}{": "}{item.action === "stop" ? "Unroute" : "Take"}{" - "}{item.state}
+      {item.errorMessage ? ` - ${item.errorMessage}` : ""}
+      {item.errorCode === "destination_in_use" &&
+        " The output may still have a previous or failed assignment. If it is safe to disconnect, use Unroute and wait for confirmation before retrying Take."}
+    </Alert>
+  );
+}
+
 export function RoutingWorkspace({
-  apiBaseUrl, mode, sources, destinations, routes, routesLoading,
-  routesError, sourceError, destinationError, onSelect,
+  apiBaseUrl, mode, active = true, sources, destinations, routes, routesLoading,
+  routesError, sourceError, destinationError, onSelect, onPreview, preview,
 }: RoutingWorkspaceProps) {
   const queryClient = useQueryClient();
+  const draftSession = useRef(0);
   const [selections, setSelections] = useState<StagedRoute[]>([]);
   const [preset, setPreset] = useState<RoutePreset>();
   const [menu, setMenu] = useState<{
@@ -114,18 +135,17 @@ export function RoutingWorkspace({
   const busy = operation.isPending || isExecuting(result?.state) ||
     (operation.data !== undefined && status.isError) || unknownOutcome;
   const save = useMutation({
-    mutationFn: (update: boolean) => savePreset({
-      name: saveName.trim(),
-      routes: selections.map(({ sourceId, destinationId }) => ({ sourceId, destinationId })),
-      ...(update && preset ? { id: preset.id, expectedRevision: preset.revision } : {}),
-    }, apiBaseUrl),
-    onSuccess: async (saved) => {
+    mutationFn: (input: Parameters<typeof savePreset>[0]) => savePreset(input, apiBaseUrl),
+    onMutate: () => ({ session: draftSession.current }),
+    onSuccess: async (saved, _input, context) => {
       queryClient.setQueryData<RoutePreset[]>(["presets"], (current) => [
         ...(current ?? []).filter((item) => item.id !== saved.id),
         saved,
       ]);
-      setPreset(saved);
-      setSaveOpen(false);
+      if (context?.session === draftSession.current) {
+        setPreset(saved);
+        setSaveOpen(false);
+      }
       await queryClient.invalidateQueries({ queryKey: ["presets"] });
     },
     onError: async (error) => {
@@ -136,11 +156,15 @@ export function RoutingWorkspace({
   });
   const remove = useMutation({
     mutationFn: (saved: RoutePreset) => deletePreset(saved.id, saved.revision, apiBaseUrl),
-    onSuccess: async (_result, saved) => {
+    onMutate: () => ({ session: draftSession.current }),
+    onSuccess: async (_result, saved, context) => {
       queryClient.setQueryData<RoutePreset[]>(["presets"], (current) =>
         (current ?? []).filter((item) => item.id !== saved.id));
-      setPreset(undefined);
-      setDeleteOpen(false);
+      if (context?.session === draftSession.current) {
+        setPreset(undefined);
+        setSelections([]);
+        setDeleteOpen(false);
+      }
       await queryClient.invalidateQueries({ queryKey: ["presets"] });
     },
     onError: async (error) => {
@@ -149,13 +173,30 @@ export function RoutingWorkspace({
       }
     },
   });
+  useEffect(() => {
+    if (!salvos) return;
+    draftSession.current += 1;
+    setSelections([]);
+    setPreset(undefined);
+    setSaveName("");
+    setSaveOpen(false);
+    setDeleteOpen(false);
+    setConfirmation(null);
+    setMenu(null);
+    save.reset();
+    remove.reset();
+  }, [active, salvos, save.reset, remove.reset]);
+
   const controlsBusy = busy || save.isPending || remove.isPending;
   const routeStateUnavailable = routesLoading || !!routesError || !!sourceError || !!destinationError;
   const stale = hasStaleRouteSelection(selections, routes);
   const dirty = !preset || !matchesPresetRoutes(selections, preset.routes);
-  const invalidSelection = selections.some((selection) =>
-    sources.find((source) => source.id === selection.sourceId)?.lifecycle !== "validated" ||
-    destinations.find((destination) => destination.id === selection.destinationId)?.lifecycle !== "validated");
+  const invalidSelection = selections.some((selection) => {
+    const source = sources.find((source) => source.id === selection.sourceId);
+    const destination = destinations.find((destination) => destination.id === selection.destinationId);
+    return !source || !destination || (selection.action !== "stop" &&
+      (source.lifecycle !== "validated" || destination.lifecycle !== "validated"));
+  });
   const presetChanged = preset !== undefined && presets.isSuccess &&
     !presets.data.some((saved) => saved.id === preset.id && saved.revision === preset.revision);
   const presetOptions = [...(presets.data ?? [])];
@@ -169,6 +210,14 @@ export function RoutingWorkspace({
     setSelections(saved ? snapshotPresetRoutes(saved.routes, routes) : []);
     save.reset();
     remove.reset();
+  }
+
+  function saveDraft(update: boolean) {
+    save.mutate({
+      name: saveName.trim(),
+      routes: selections.map(({ sourceId, destinationId, action }) => ({ sourceId, destinationId, action })),
+      ...(update && preset ? { id: preset.id, expectedRevision: preset.revision } : {}),
+    });
   }
 
   function select(sourceId: string, destinationId: string) {
@@ -191,7 +240,7 @@ export function RoutingWorkspace({
   function take(changes: StagedRoute[], saved?: RoutePreset) {
     const input = changes.map((selection) => ({
       ...selection,
-      confirmReplace: requiresReplacement(
+      confirmReplace: selection.action !== "stop" && requiresReplacement(
         routes.find((route) => route.destinationId === selection.destinationId),
         selection.sourceId,
       ),
@@ -222,16 +271,22 @@ export function RoutingWorkspace({
       <Stack spacing={2}>
         <Typography variant="body2" color="text.secondary">
           {salvos
-            ? "Select crosspoints to build a salvo. Click a selected crosspoint again to remove it. Saving does not change live routes; Take executes the saved salvo."
-            : "Left-click to highlight a crosspoint. Right-click it for Take or Unroute (or press Shift+F10). Take starts that route; Unroute disconnects that output."}
+            ? "Click a crosspoint to cycle: blue to activate, red to unroute its output, then clear. Red disconnects the output regardless of its input. Save and name the selections, then Take the saved salvo. Returning to this screen starts a new empty draft."
+            : "Left-click to highlight a crosspoint. Right-click it for Take, Unroute, or Preview input. Take starts that route; Unroute disconnects that output."}
         </Typography>
+        {!salvos && preview && (
+          <Stack spacing={0.5}>
+            <Typography variant="caption">{preview.name ? `Preview: ${preview.name}` : "Audio preview"}</Typography>
+            <PreviewMeters levels={preview.levels} />
+          </Stack>
+        )}
         {salvos && (
           <Stack direction={{ xs: "column", md: "row" }} spacing={1} alignItems={{ md: "center" }}>
-            <TextField select label="Saved salvos" value={preset?.id ?? ""}
+            <TextField select label="Select Salvo" value={preset?.id ?? ""}
               onChange={(event) => choosePreset(event.target.value)}
               disabled={controlsBusy || routeStateUnavailable || presets.isLoading || presets.isError}
               sx={{ minWidth: 220, flex: 1 }}>
-              <MenuItem value="">New salvo</MenuItem>
+              <MenuItem value="">Select Salvo</MenuItem>
               {presetOptions.map((saved) => (
                 <MenuItem key={saved.id} value={saved.id}>{saved.name}</MenuItem>
               ))}
@@ -307,7 +362,7 @@ export function RoutingWorkspace({
         )}
         <CrosspointMatrix sources={sources} destinations={destinations}
           routes={routes} routesLoading={routesLoading} routesError={routesError}
-          selectedSourceId="" selectedDestinationId="" selections={selections}
+          selectedSourceId="" selectedDestinationId="" selections={selections} selectionOnly={salvos}
           onSelect={select} onContextMenu={salvos ? undefined : openMenu} />
         {(result?.results?.length ?? 0) > 0 && (
           <Accordion disableGutters>
@@ -315,11 +370,8 @@ export function RoutingWorkspace({
             <AccordionDetails>
               <Stack spacing={1}>
                 {result!.results!.map((item) => (
-                  <Alert key={item.destinationId} severity={item.state === "succeeded"
-                    ? "success" : item.state === "failed" ? "error" : "info"}>
-                    {destinations.find((destination) => destination.id === item.destinationId)?.friendlyName ?? item.destinationId}
-                    {": "}{item.state}{item.errorMessage ? ` - ${item.errorMessage}` : ""}
-                  </Alert>
+                  <DestinationOutcome key={item.destinationId} item={item}
+                    name={destinations.find((destination) => destination.id === item.destinationId)?.friendlyName ?? item.destinationId} />
                 ))}
               </Stack>
             </AccordionDetails>
@@ -328,6 +380,13 @@ export function RoutingWorkspace({
       </Stack>
       <Menu open={menu !== null} onClose={() => setMenu(null)}
         anchorReference="anchorPosition" anchorPosition={menu ? { top: menu.top, left: menu.left } : undefined}>
+        {onPreview && (
+          <MenuItem disabled={controlsBusy || preview?.busy} onClick={() => {
+            if (!menu) return;
+            onPreview(menu.selection.sourceId);
+            setMenu(null);
+          }}>Preview input</MenuItem>
+        )}
         <MenuItem disabled={controlsBusy || !menuCanTake}
           onClick={() => menu && take([menu.selection])}>Take</MenuItem>
         <MenuItem disabled={controlsBusy || !menuCanUnroute}
@@ -363,17 +422,17 @@ export function RoutingWorkspace({
             value={saveName} disabled={save.isPending}
             onChange={(event) => setSaveName(event.target.value)}
             slotProps={{ htmlInput: { maxLength: 100 } }} />
-          <DialogContentText>{selections.length} selected route(s). Live routes will not change.</DialogContentText>
+          <DialogContentText>{selections.length} selected action(s). Live routes will not change.</DialogContentText>
           {save.isError && <Alert severity="error">Unable to save salvo: {save.error.message}</Alert>}
         </DialogContent>
         <DialogActions>
           <Button disabled={save.isPending} onClick={() => setSaveOpen(false)}>Cancel</Button>
           <Button variant={preset ? "text" : "contained"}
-            disabled={save.isPending || !saveName.trim()} onClick={() => save.mutate(false)}>
+            disabled={save.isPending || !saveName.trim()} onClick={() => saveDraft(false)}>
             Save as new
           </Button>
           {preset && <Button variant="contained" disabled={save.isPending || !saveName.trim()}
-            onClick={() => save.mutate(true)}>Update salvo</Button>}
+            onClick={() => saveDraft(true)}>Update salvo</Button>}
         </DialogActions>
       </Dialog>
       <Dialog open={deleteOpen} onClose={() => !remove.isPending && setDeleteOpen(false)}>

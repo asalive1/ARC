@@ -13,6 +13,27 @@ COPY crates ./crates
 COPY database ./database
 RUN cargo build --locked --release --package arc-worker --bin arc-worker --features gstreamer-runtime
 
+FROM debian:bookworm-slim AS ffmpeg-lgpl
+
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends build-essential ca-certificates pkg-config xz-utils \
+    && apt-get source ffmpeg \
+    && source_dir="$(find . -maxdepth 1 -type d -name 'ffmpeg-*' -print -quit)" \
+    && test -n "$source_dir" \
+    && mkdir -p /out/usr/local/share/doc/arc-ffmpeg \
+    && tar -cJf /out/usr/local/share/doc/arc-ffmpeg/source.tar.xz -C "$source_dir" . \
+    && cd "$source_dir" \
+    && ./configure --prefix=/usr/local --disable-everything --enable-decoder=aac \
+        --enable-parser=aac --enable-shared --disable-static --disable-network \
+        --disable-programs --disable-doc --disable-debug --disable-autodetect \
+        --disable-x86asm --disable-gpl --disable-nonfree --disable-version3 \
+    && make -j"$(nproc)" \
+    && make install DESTDIR=/out \
+    && cp COPYING.LGPLv2.1 /out/usr/local/share/doc/arc-ffmpeg/ \
+    && head -n 1 debian/changelog > /out/usr/local/share/doc/arc-ffmpeg/debian-source-version.txt \
+    && cp ffbuild/config.log /out/usr/local/share/doc/arc-ffmpeg/
+
 FROM debian:bookworm-slim AS gst-required-plugins
 
 RUN apt-get update \
@@ -20,11 +41,19 @@ RUN apt-get update \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-base \
-    && mkdir -p /out \
-    && for plugin in libgstapp.so libgstaudioconvert.so libgstsrt.so libgstudp.so libgstrtp.so libgstrtpmanager.so; do \
+        gstreamer1.0-libav \
+    && mkdir -p /out/plugins /out/lib /out/doc \
+    && cp /usr/share/doc/gstreamer1.0-libav/copyright /out/doc/gst-libav-copyright \
+    && dpkg-query -W -f='${Package} ${Version}\n' gstreamer1.0-libav > /out/doc/gst-libav-version.txt \
+    && for plugin in libgstapp.so libgstaudioconvert.so libgstaudioresample.so libgstsrt.so libgstudp.so libgstrtp.so libgstrtpmanager.so libgstmpegtsdemux.so libgstopus.so libgstmpg123.so libgstaudioparsers.so libgstlibav.so; do \
         source="$(find /usr/lib -type f -path "*/gstreamer-1.0/${plugin}" -print -quit)"; \
         test -n "$source"; \
-        cp "$source" "/out/${plugin}"; \
+        cp "$source" "/out/plugins/${plugin}"; \
+    done \
+    && for library in libgstmpegts-1.0.so.0 libgstcodecparsers-1.0.so.0; do \
+        source="$(find /usr/lib -name "$library" -print -quit)"; \
+        test -n "$source"; \
+        cp -L "$source" "/out/lib/${library}"; \
     done \
     && rm -rf /var/lib/apt/lists/*
 
@@ -35,11 +64,18 @@ RUN apt-get update \
         ca-certificates \
         gstreamer1.0-alsa \
         libgstreamer-plugins-base1.0-0 \
+        libmpg123-0 \
+        libopus0 \
         libsrt1.5-gnutls \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /workspace/target/release/arc-worker /usr/local/bin/arc-worker
-COPY --from=gst-required-plugins /out/ /usr/local/lib/gstreamer-1.0/
+COPY --from=ffmpeg-lgpl /out/usr/local/lib/ /usr/local/lib/
+COPY --from=ffmpeg-lgpl /out/usr/local/share/doc/arc-ffmpeg/ /usr/local/share/doc/arc-ffmpeg/
+COPY --from=gst-required-plugins /out/doc/ /usr/local/share/doc/arc-ffmpeg/
+COPY --from=gst-required-plugins /out/plugins/ /usr/local/lib/gstreamer-1.0/
+COPY --from=gst-required-plugins /out/lib/ /usr/local/lib/
+RUN ldconfig
 ENV GST_REGISTRY=/tmp/gst-registry.bin \
     GST_PLUGIN_PATH_1_0=/usr/local/lib/gstreamer-1.0
 USER 10001:10001

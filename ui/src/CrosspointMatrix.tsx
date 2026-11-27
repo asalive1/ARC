@@ -3,6 +3,7 @@ import { Alert, Box, Button, Tooltip, Typography } from "@mui/material";
 
 import type {
   DestinationRecord,
+  PresetRoute,
   RouteRecord,
   SourceRecord,
 } from "./api";
@@ -84,7 +85,8 @@ interface CrosspointMatrixProps {
   routesError: string;
   selectedSourceId: string;
   selectedDestinationId: string;
-  selections?: { sourceId: string; destinationId: string }[];
+  selections?: PresetRoute[];
+  selectionOnly?: boolean;
   onSelect: (sourceId: string, destinationId: string) => void;
   onContextMenu?: (
     event: ReactMouseEvent<HTMLButtonElement>,
@@ -102,6 +104,7 @@ export function CrosspointMatrix({
   selectedSourceId,
   selectedDestinationId,
   selections,
+  selectionOnly = false,
   onSelect,
   onContextMenu,
 }: CrosspointMatrixProps) {
@@ -115,10 +118,11 @@ export function CrosspointMatrix({
   const visibleSources = sources.slice(0, MAX_PORTS);
   const visibleDestinations = destinations.slice(0, MAX_PORTS);
   const hasPorts = visibleSources.length > 0 && visibleDestinations.length > 0;
+  const displayedRoutes = selectionOnly ? [] : routes;
   const routesByDestination = new Map(
-    routes.map((route) => [route.destinationId, route]),
+    displayedRoutes.map((route) => [route.destinationId, route]),
   );
-  const desiredRouteCount = routes.filter(
+  const desiredRouteCount = displayedRoutes.filter(
     (route) => route.desiredState === "desired",
   ).length;
   const totalWidth =
@@ -245,16 +249,18 @@ export function CrosspointMatrix({
                 position: "sticky",
                 left: 0,
                 zIndex: 3,
-                display: "flex",
-                alignItems: "flex-end",
-                p: 1,
                 bgcolor: "background.paper",
                 borderRight: 1,
                 borderColor: "divider",
               }}
             >
-              <Typography variant="caption" color="text.secondary">
-                INPUT ↓ / OUTPUT →
+              <Typography variant="caption" color="text.secondary"
+                sx={{ position: "absolute", top: 8, right: 8, fontSize: "1.5rem", lineHeight: 1.2 }}>
+                OUTPUT →
+              </Typography>
+              <Typography variant="caption" color="text.secondary"
+                sx={{ position: "absolute", bottom: 8, left: 8, fontSize: "1.5rem", lineHeight: 1.2 }}>
+                INPUT ↓
               </Typography>
             </Box>
             <Box aria-hidden="true" />
@@ -310,7 +316,7 @@ export function CrosspointMatrix({
             .map((source, visibleIndex) => {
               const rowIndex = rowRange.start + visibleIndex;
               const desiredOutputCount = getDesiredOutputCount(
-                routes,
+                displayedRoutes,
                 source.id,
               );
               return (
@@ -375,14 +381,16 @@ export function CrosspointMatrix({
                   {visibleDestinations
                     .slice(columnRange.start, columnRange.end)
                     .map((destination, visibleIndex) => {
-                      const selected = selections
-                        ? selections.some(
+                      const selection = selections?.find(
                             (selection) =>
                               selection.sourceId === source.id &&
                               selection.destinationId === destination.id,
-                          )
+                          );
+                      const selected = selections
+                        ? selection !== undefined
                         : source.id === selectedSourceId &&
                           destination.id === selectedDestinationId;
+                      const unroute = selected && selection?.action === "stop";
                       const destinationRoute = routesByDestination.get(
                         destination.id,
                       );
@@ -400,7 +408,10 @@ export function CrosspointMatrix({
                       const routeDescription = destinationRoute
                         ? `Desired route revision ${destinationRoute.revision} is ${destinationRoute.desiredState}. Observed ${destinationRoute.observedState}${observedSource ? ` from ${observedSource.friendlyName}` : ""}.`
                         : "There is no saved route for this output.";
-                      const cellDescription = [
+                      const cellDescription = selectionOnly
+                        ? unroute ? "Selected to unroute this output, regardless of its input."
+                          : selected ? "Selected to activate this route." : "Not selected for this salvo."
+                        : [
                         desired ? "Desired route." : "",
                         observed ? "Worker-observed route is running." : "",
                         destinationRoute?.desiredState === "desired" &&
@@ -425,7 +436,7 @@ export function CrosspointMatrix({
                             height: ROW_HEIGHT,
                           }}
                         >
-                          <Tooltip disableInteractive title={`${source.friendlyName} → ${destination.friendlyName}. ${cellDescription}`}>
+                          <Tooltip disableInteractive title={`${source.friendlyName}:${destination.friendlyName}`}>
                             <Button
                               aria-label={`Select ${source.friendlyName} to ${destination.friendlyName}. ${cellDescription}`}
                               aria-pressed={selected}
@@ -455,7 +466,7 @@ export function CrosspointMatrix({
                               size="small"
                               color={
                                 selected
-                                  ? "primary"
+                                  ? unroute ? "error" : "primary"
                                   : observed
                                     ? "success"
                                     : desired
@@ -514,10 +525,10 @@ export function CrosspointMatrix({
           ? "Saved route status unavailable."
           : routesLoading
             ? "Loading saved route status."
-            : `${desiredRouteCount} saved desired routes.`}{" "}
-        Blue marks the selected crosspoint, green the observed running route,
-        and amber a desired route not yet observed running. An input may feed
-        multiple outputs, with an independent route outcome for each output.
+            : selectionOnly ? "" : `${desiredRouteCount} saved desired routes.`}{" "}
+        {selectionOnly
+          ? "Blue activates a route; red disconnects that output regardless of its input. Unselected outputs are unchanged. Live routes are not shown."
+          : "Blue marks the selected crosspoint, green the observed running route, and amber a desired route not yet observed running. An input may feed multiple outputs, with an independent route outcome for each output."}
       </Typography>
       {routesError && (
         <Alert severity="error" sx={{ mt: 1 }}>

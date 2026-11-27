@@ -289,6 +289,8 @@ impl PgPipelinePlanner {
                 &requirements,
                 max_heartbeat_age,
                 Some((route_config.source_id, route_config.source_revision)),
+                false,
+                false,
             )
             .await?
             {
@@ -396,6 +398,8 @@ impl PgPipelinePlanner {
             &estimate.requirements,
             max_heartbeat_age,
             Some((route.source_id, route.source_revision)),
+            false,
+            false,
         )
         .await?
         {

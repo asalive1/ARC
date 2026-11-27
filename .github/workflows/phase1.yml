@@ -42,7 +42,12 @@ jobs:
       - name: API PostgreSQL and live media tests
         env:
           DATABASE_URL: postgres://arc:arc-test-only@127.0.0.1:5432/arc
-        run: cargo test --locked -p arc-api -- --ignored --test-threads=1
+        run: cargo test --locked -p arc-api -- --ignored --test-threads=1 --skip tests::fenced_preview_relay_covers_idle_and_running_inputs
+      - name: Fenced preview PostgreSQL tests
+        env:
+          DATABASE_URL: postgres://arc:arc-test-only@127.0.0.1:5432/arc
+          ARC_API_ENABLE_FENCED_PREVIEW: "true"
+        run: cargo test --locked -p arc-api tests::fenced_preview_relay_covers_idle_and_running_inputs -- --ignored --exact --test-threads=1
 
   ui:
     runs-on: ubuntu-latest
